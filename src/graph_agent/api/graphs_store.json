@@ -1,247 +1,247 @@
 {
-  "graphs": [
-    {
-      "graph_id": "tool-schema-repair",
-      "name": "Tool Schema Repair Example",
-      "description": "Demonstrates a model -> tool -> repair -> model loop using the shared graph envelope contract.",
-      "version": "1.0",
-      "start_node_id": "start",
-      "nodes": [
-        {
-          "id": "start",
-          "kind": "input",
-          "category": "start",
-          "label": "Start Input",
-          "provider_id": "core.input",
-          "provider_label": "Core Input Node",
-          "description": "Captures the starting payload for a graph run.",
-          "position": {
-            "x": 40,
-            "y": 135
-          },
-          "config": {
-            "input_binding": {
-              "type": "input_payload"
+    "graphs": [
+      {
+        "graph_id": "tool-schema-repair",
+        "name": "Tool Schema Repair Example",
+        "description": "Demonstrates a model -> tool -> repair -> model loop using the shared graph envelope contract.",
+        "version": "1.0",
+        "start_node_id": "start",
+        "nodes": [
+          {
+            "id": "start",
+            "kind": "input",
+            "category": "start",
+            "label": "Start Input",
+            "provider_id": "core.input",
+            "provider_label": "Core Input Node",
+            "description": "Captures the starting payload for a graph run.",
+            "position": {
+              "x": 40,
+              "y": 135
+            },
+            "config": {
+              "input_binding": {
+                "type": "input_payload"
+              }
             }
-          }
-        },
-        {
-          "id": "propose_tool",
-          "kind": "model",
-          "category": "api",
-          "label": "Propose Tool Payload",
-          "provider_id": "core.api",
-          "provider_label": "API Call Node",
-          "description": "Creates the first tool payload attempt and routes it to the tool node.",
-          "model_provider_name": "mock",
-          "prompt_name": "schema_proposal",
-          "position": {
-            "x": 440,
-            "y": 135
           },
-          "config": {
-            "provider_name": "mock",
-            "model": "mock-default",
+          {
+            "id": "propose_tool",
+            "kind": "model",
+            "category": "api",
+            "label": "Propose Tool Payload",
+            "provider_id": "core.api",
+            "provider_label": "API Call Node",
+            "description": "Creates the first tool payload attempt and routes it to the tool node.",
+            "model_provider_name": "mock",
             "prompt_name": "schema_proposal",
-            "mode": "schema_proposal",
-            "system_prompt": "You are designing input for a tool call.\nGiven a user request, produce a JSON object for the requested tool.\nReturn only fields required by the schema and prefer the smallest valid payload.",
-            "user_message_template": "Request: {user_request}\\nAvailable tools: {available_tools}",
-            "response_mode": "tool_call",
-            "preferred_tool_name": "search_catalog",
-            "allowed_tool_names": [
-              "search_catalog"
-            ],
-            "tool_target_node_ids": [
-              "run_tool"
-            ],
-            "metadata_bindings": {
-              "user_request": {
-                "type": "latest_payload",
-                "source": "start"
+            "position": {
+              "x": 440,
+              "y": 135
+            },
+            "config": {
+              "provider_name": "mock",
+              "model": "mock-default",
+              "prompt_name": "schema_proposal",
+              "mode": "schema_proposal",
+              "system_prompt": "You are designing input for a tool call.\nGiven a user request, produce a JSON object for the requested tool.\nReturn only fields required by the schema and prefer the smallest valid payload.",
+              "user_message_template": "Request: {user_request}\\nAvailable tools: {available_tools}",
+              "response_mode": "tool_call",
+              "preferred_tool_name": "search_catalog",
+              "allowed_tool_names": [
+                "search_catalog"
+              ],
+              "tool_target_node_ids": [
+                "run_tool"
+              ],
+              "metadata_bindings": {
+                "user_request": {
+                  "type": "latest_payload",
+                  "source": "start"
+                }
               }
             }
-          }
-        },
-        {
-          "id": "run_tool",
-          "kind": "tool",
-          "category": "tool",
-          "label": "Run Tool",
-          "provider_id": "tool.registry",
-          "provider_label": "Registry Tool Node",
-          "description": "Validates and runs the selected tool.",
-          "tool_name": "search_catalog",
-          "position": {
-            "x": 840,
-            "y": 135
           },
-          "config": {
+          {
+            "id": "run_tool",
+            "kind": "tool",
+            "category": "tool",
+            "label": "Run Tool",
+            "provider_id": "tool.registry",
+            "provider_label": "Registry Tool Node",
+            "description": "Validates and runs the selected tool.",
             "tool_name": "search_catalog",
-            "input_binding": {
-              "type": "first_available_envelope",
-              "sources": [
-                "repair_tool",
-                "propose_tool"
-              ]
+            "position": {
+              "x": 840,
+              "y": 135
+            },
+            "config": {
+              "tool_name": "search_catalog",
+              "input_binding": {
+                "type": "first_available_envelope",
+                "sources": [
+                  "repair_tool",
+                  "propose_tool"
+                ]
+              }
             }
-          }
-        },
-        {
-          "id": "repair_tool",
-          "kind": "model",
-          "category": "api",
-          "label": "Repair Tool Payload",
-          "provider_id": "core.api",
-          "provider_label": "API Call Node",
-          "description": "Repairs the tool payload after validation failure.",
-          "model_provider_name": "mock",
-          "prompt_name": "schema_repair",
-          "position": {
-            "x": 1240,
-            "y": 40
           },
-          "config": {
-            "provider_name": "mock",
-            "model": "mock-default",
+          {
+            "id": "repair_tool",
+            "kind": "model",
+            "category": "api",
+            "label": "Repair Tool Payload",
+            "provider_id": "core.api",
+            "provider_label": "API Call Node",
+            "description": "Repairs the tool payload after validation failure.",
+            "model_provider_name": "mock",
             "prompt_name": "schema_repair",
-            "mode": "schema_repair",
-            "system_prompt": "The previous tool payload failed validation.\nRepair the tool input using the original request and the validation error details.\nReturn a corrected JSON object and avoid repeating the same mistake.",
-            "user_message_template": "Request: {user_request}\\nValidation error: {tool_error}\\nAvailable tools: {available_tools}",
-            "response_mode": "tool_call",
-            "preferred_tool_name": "search_catalog",
-            "allowed_tool_names": [
-              "search_catalog"
-            ],
-            "tool_target_node_ids": [
-              "run_tool"
-            ],
-            "metadata_bindings": {
-              "user_request": {
-                "type": "latest_payload",
-                "source": "start"
-              },
-              "tool_error": {
-                "type": "latest_error",
-                "source": "run_tool"
+            "position": {
+              "x": 1240,
+              "y": 40
+            },
+            "config": {
+              "provider_name": "mock",
+              "model": "mock-default",
+              "prompt_name": "schema_repair",
+              "mode": "schema_repair",
+              "system_prompt": "The previous tool payload failed validation.\nRepair the tool input using the original request and the validation error details.\nReturn a corrected JSON object and avoid repeating the same mistake.",
+              "user_message_template": "Request: {user_request}\\nValidation error: {tool_error}\\nAvailable tools: {available_tools}",
+              "response_mode": "tool_call",
+              "preferred_tool_name": "search_catalog",
+              "allowed_tool_names": [
+                "search_catalog"
+              ],
+              "tool_target_node_ids": [
+                "run_tool"
+              ],
+              "metadata_bindings": {
+                "user_request": {
+                  "type": "latest_payload",
+                  "source": "start"
+                },
+                "tool_error": {
+                  "type": "latest_error",
+                  "source": "run_tool"
+                }
               }
             }
-          }
-        },
-        {
-          "id": "compose_response",
-          "kind": "model",
-          "category": "api",
-          "label": "Compose Final Response",
-          "provider_id": "core.api",
-          "provider_label": "API Call Node",
-          "description": "Builds the response shown to the user.",
-          "model_provider_name": "mock",
-          "prompt_name": "final_response",
-          "position": {
-            "x": 1240,
-            "y": 250
           },
-          "config": {
-            "provider_name": "mock",
-            "model": "mock-default",
+          {
+            "id": "compose_response",
+            "kind": "model",
+            "category": "api",
+            "label": "Compose Final Response",
+            "provider_id": "core.api",
+            "provider_label": "API Call Node",
+            "description": "Builds the response shown to the user.",
+            "model_provider_name": "mock",
             "prompt_name": "final_response",
-            "mode": "final_response",
-            "system_prompt": "Given the original request, the intermediate tool results, and the graph history,\nproduce a concise final response for the user.",
-            "user_message_template": "Request: {user_request}\\nTool result: {tool_result}",
-            "response_mode": "message",
-            "metadata_bindings": {
-              "user_request": {
-                "type": "latest_payload",
-                "source": "start"
-              },
-              "tool_result": {
-                "type": "latest_payload",
-                "source": "run_tool"
+            "position": {
+              "x": 1240,
+              "y": 250
+            },
+            "config": {
+              "provider_name": "mock",
+              "model": "mock-default",
+              "prompt_name": "final_response",
+              "mode": "final_response",
+              "system_prompt": "Given the original request, the intermediate tool results, and the graph history,\nproduce a concise final response for the user.",
+              "user_message_template": "Request: {user_request}\\nTool result: {tool_result}",
+              "response_mode": "message",
+              "metadata_bindings": {
+                "user_request": {
+                  "type": "latest_payload",
+                  "source": "start"
+                },
+                "tool_result": {
+                  "type": "latest_payload",
+                  "source": "run_tool"
+                }
+              }
+            }
+          },
+          {
+            "id": "finish",
+            "kind": "output",
+            "category": "end",
+            "label": "Output Response",
+            "provider_id": "core.output",
+            "provider_label": "Core Output Node",
+            "description": "Returns the final response payload.",
+            "position": {
+              "x": 1640,
+              "y": 250
+            },
+            "config": {
+              "source_binding": {
+                "type": "latest_envelope",
+                "source": "compose_response"
               }
             }
           }
-        },
-        {
-          "id": "finish",
-          "kind": "output",
-          "category": "end",
-          "label": "Output Response",
-          "provider_id": "core.output",
-          "provider_label": "Core Output Node",
-          "description": "Returns the final response payload.",
-          "position": {
-            "x": 1640,
-            "y": 250
+        ],
+        "edges": [
+          {
+            "id": "edge-start-propose",
+            "source_id": "start",
+            "target_id": "propose_tool",
+            "label": "begin",
+            "kind": "standard",
+            "priority": 100,
+            "condition": null
           },
-          "config": {
-            "source_binding": {
-              "type": "latest_envelope",
-              "source": "compose_response"
+          {
+            "id": "edge-propose-run",
+            "source_id": "propose_tool",
+            "target_id": "run_tool",
+            "label": "try tool",
+            "kind": "standard",
+            "priority": 100,
+            "condition": null
+          },
+          {
+            "id": "edge-run-repair",
+            "source_id": "run_tool",
+            "target_id": "repair_tool",
+            "label": "repair invalid schema",
+            "kind": "conditional",
+            "priority": 10,
+            "condition": {
+              "id": "tool_validation_failed",
+              "label": "Tool validation failed",
+              "type": "result_status_equals",
+              "value": "validation_error"
             }
+          },
+          {
+            "id": "edge-run-compose",
+            "source_id": "run_tool",
+            "target_id": "compose_response",
+            "label": "tool succeeded",
+            "kind": "standard",
+            "priority": 100,
+            "condition": null
+          },
+          {
+            "id": "edge-repair-run",
+            "source_id": "repair_tool",
+            "target_id": "run_tool",
+            "label": "retry tool",
+            "kind": "standard",
+            "priority": 100,
+            "condition": null
+          },
+          {
+            "id": "edge-compose-finish",
+            "source_id": "compose_response",
+            "target_id": "finish",
+            "label": "finalize",
+            "kind": "standard",
+            "priority": 100,
+            "condition": null
           }
-        }
-      ],
-      "edges": [
-        {
-          "id": "edge-start-propose",
-          "source_id": "start",
-          "target_id": "propose_tool",
-          "label": "begin",
-          "kind": "standard",
-          "priority": 100,
-          "condition": null
-        },
-        {
-          "id": "edge-propose-run",
-          "source_id": "propose_tool",
-          "target_id": "run_tool",
-          "label": "try tool",
-          "kind": "standard",
-          "priority": 100,
-          "condition": null
-        },
-        {
-          "id": "edge-run-repair",
-          "source_id": "run_tool",
-          "target_id": "repair_tool",
-          "label": "repair invalid schema",
-          "kind": "conditional",
-          "priority": 10,
-          "condition": {
-            "id": "tool_validation_failed",
-            "label": "Tool validation failed",
-            "type": "result_status_equals",
-            "value": "validation_error"
-          }
-        },
-        {
-          "id": "edge-run-compose",
-          "source_id": "run_tool",
-          "target_id": "compose_response",
-          "label": "tool succeeded",
-          "kind": "standard",
-          "priority": 100,
-          "condition": null
-        },
-        {
-          "id": "edge-repair-run",
-          "source_id": "repair_tool",
-          "target_id": "run_tool",
-          "label": "retry tool",
-          "kind": "standard",
-          "priority": 100,
-          "condition": null
-        },
-        {
-          "id": "edge-compose-finish",
-          "source_id": "compose_response",
-          "target_id": "finish",
-          "label": "finalize",
-          "kind": "standard",
-          "priority": 100,
-          "condition": null
-        }
-      ]
-    }
-  ]
-}
+        ]
+      }
+    ]
+  }

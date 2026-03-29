@@ -189,6 +189,21 @@ class DataDrivenGraphTests(unittest.TestCase):
             store.delete_graph("editable-agent")
             remaining_ids = {graph["graph_id"] for graph in store.list_graphs()}
             self.assertNotIn("editable-agent", remaining_ids)
+            self.assertIn("tool-schema-repair", remaining_ids)
+
+    def test_graph_store_keeps_built_in_graphs_and_uses_local_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = GraphStore(self.services, path=Path(directory) / "graphs.json")
+
+            sample = store.get_graph("tool-schema-repair")
+            sample["name"] = "Local Sample Override"
+
+            updated = store.update_graph("tool-schema-repair", sample)
+            self.assertEqual(updated["name"], "Local Sample Override")
+            self.assertEqual(store.get_graph("tool-schema-repair")["name"], "Local Sample Override")
+
+            store.delete_graph("tool-schema-repair")
+            self.assertEqual(store.get_graph("tool-schema-repair")["name"], "Tool Schema Repair Example")
 
 
 if __name__ == "__main__":

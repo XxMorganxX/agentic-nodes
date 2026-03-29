@@ -75,6 +75,8 @@ def delete_graph(graph_id: str) -> dict[str, str]:
         manager.delete_graph(graph_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Unknown graph '{graph_id}'.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"deleted": graph_id}
 
 

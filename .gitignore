@@ -10,15 +10,23 @@ Thumbs.db
 # Python artifacts
 __pycache__/
 *.py[cod]
+*.egg
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+build/
 .venv/
 venv/
 
 # Environment files
 .env
 .env.local
+
+# Local graph store
+.graph-agent/
 
 # Frontend artifacts
 frontend/node_modules/
