@@ -1,0 +1,29 @@
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Editor artifacts
+*.swp
+*.swo
+*~
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Environment files
+.env
+.env.local
+
+# Frontend artifacts
+frontend/node_modules/
+frontend/.vite/
+frontend/dist/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*

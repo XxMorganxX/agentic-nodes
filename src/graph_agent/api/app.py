@@ -1,0 +1,128 @@
+from __future__ import annotations
+
+import json
+from queue import Empty
+from typing import Any
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from graph_agent.api.manager import GraphRunManager
+
+
+class RunRequest(BaseModel):
+    input: Any
+
+
+class GraphPayload(BaseModel):
+    graph_id: str
+    name: str
+    description: str = ""
+    version: str = "1.0"
+    start_node_id: str
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+
+
+app = FastAPI(title="Graph Agent API", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+manager = GraphRunManager()
+
+
+@app.get("/api/graphs")
+def list_graphs() -> dict[str, Any]:
+    return {"graphs": manager.list_graphs()}
+
+
+@app.get("/api/graphs/{graph_id}")
+def get_graph(graph_id: str) -> dict[str, Any]:
+    try:
+        return manager.get_graph(graph_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown graph '{graph_id}'.") from exc
+
+
+@app.post("/api/graphs")
+def create_graph(graph: GraphPayload) -> dict[str, Any]:
+    try:
+        return manager.create_graph(graph.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/graphs/{graph_id}")
+def update_graph(graph_id: str, graph: GraphPayload) -> dict[str, Any]:
+    try:
+        return manager.update_graph(graph_id, graph.model_dump())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown graph '{graph_id}'.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/graphs/{graph_id}")
+def delete_graph(graph_id: str) -> dict[str, str]:
+    try:
+        manager.delete_graph(graph_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown graph '{graph_id}'.") from exc
+    return {"deleted": graph_id}
+
+
+@app.get("/api/editor/catalog")
+def get_editor_catalog() -> dict[str, Any]:
+    return manager.get_catalog()
+
+
+@app.post("/api/graphs/{graph_id}/runs")
+def start_run(graph_id: str, request: RunRequest) -> dict[str, str]:
+    try:
+        run_id = manager.start_run(graph_id, request.input)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown graph '{graph_id}'.") from exc
+    return {"run_id": run_id}
+
+
+@app.get("/api/runs/{run_id}")
+def get_run(run_id: str) -> dict[str, Any]:
+    try:
+        return manager.get_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown run '{run_id}'.") from exc
+
+
+@app.get("/api/runs/{run_id}/events")
+def stream_run_events(run_id: str) -> StreamingResponse:
+    try:
+        backlog, queue = manager.subscribe(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown run '{run_id}'.") from exc
+
+    def event_stream():
+        try:
+            for event in backlog:
+                yield f"data: {json.dumps(event)}\n\n"
+
+            while True:
+                try:
+                    item = queue.get(timeout=15)
+                except Empty:
+                    yield ": keep-alive\n\n"
+                    continue
+
+                if item is None:
+                    break
+                yield f"data: {item}\n\n"
+        finally:
+            manager.unsubscribe(run_id, queue)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
