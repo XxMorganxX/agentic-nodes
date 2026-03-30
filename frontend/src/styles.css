@@ -1175,6 +1175,15 @@ pre {
   pointer-events: auto;
 }
 
+.graph-canvas.is-connecting .graph-node-card-actions,
+.graph-canvas.is-routing-wire .graph-node-card-actions {
+  max-height: 0 !important;
+  margin-top: 0 !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transition: none !important;
+}
+
 .graph-node-chip {
   display: inline-flex;
   align-items: center;
@@ -1699,6 +1708,11 @@ pre {
 
 .graph-edge-hitbox {
   cursor: pointer;
+}
+
+.graph-canvas.is-dragging-node .react-flow__edge-path,
+.graph-canvas.is-dragging-junction .react-flow__edge-path {
+  filter: none !important;
 }
 
 .graph-edge.graph-edge--conditional .react-flow__edge-path {

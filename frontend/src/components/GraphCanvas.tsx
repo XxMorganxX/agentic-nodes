@@ -134,7 +134,7 @@ const NODE_WIDTH = 280;
 const NODE_HEIGHT = 150;
 const NODE_REGION_HEIGHT = 168;
 const JUNCTION_NODE_SIZE = 24;
-const MIN_POINTER_PAN_DAMPING = 0.08;
+const MIN_POINTER_PAN_DAMPING = 0.15;
 const VIEWPORT_SYNC_EPSILON = 0.25;
 const EDGE_STROKE_WIDTH = 3.6;
 const SELECTED_EDGE_STROKE_WIDTH = 4.3;
@@ -445,6 +445,7 @@ export function GraphCanvas({
   const [quickAddMinimized, setQuickAddMinimized] = useState(false);
   const [junctionDrag, setJunctionDrag] = useState<JunctionDragState | null>(null);
   const [isNodeDragActive, setIsNodeDragActive] = useState(false);
+  const [dragRenderTick, setDragRenderTick] = useState(0);
   const [pendingPlacement, setPendingPlacement] = useState<PlacementState | null>(null);
   const [draftConnection, setDraftConnection] = useState<DraftConnectionState | null>(null);
   const [draftConnectionSnapTargetNodeId, setDraftConnectionSnapTargetNodeId] = useState<string | null>(null);
@@ -460,6 +461,9 @@ export function GraphCanvas({
   const nodeDataCacheRef = useRef(new Map<string, GraphCanvasRuntimeNodeData>());
   const dragFrameRef = useRef<number | null>(null);
   const pendingDragGraphRef = useRef<GraphDefinition | null>(null);
+  const dragPositionMapRef = useRef<Map<string, GraphPosition> | null>(null);
+  const nodeDragRafRef = useRef<number | null>(null);
+  const cachedEdgesRef = useRef<FlowEdge<GraphCanvasEdgeData>[]>([]);
   const draftPointerFrameRef = useRef<number | null>(null);
   const pendingDraftPointerPositionRef = useRef<GraphPosition | null>(null);
   const pointerPanStateRef = useRef<{
@@ -595,17 +599,17 @@ export function GraphCanvas({
       const visibleHeight = bounds.height / viewport.zoom;
       const centerX = (bounds.width * 0.5 - viewport.x) / viewport.zoom;
       const centerY = (bounds.height * 0.5 - viewport.y) / viewport.zoom;
-      const paddingX = Math.max(180, visibleWidth * 0.18);
-      const paddingY = Math.max(140, visibleHeight * 0.18);
+      const paddingX = Math.max(100, visibleWidth * 0.15);
+      const paddingY = Math.max(80, visibleHeight * 0.15);
       const outsideX = Math.max(nodeRegionBounds.minX - paddingX - centerX, 0, centerX - (nodeRegionBounds.maxX + paddingX));
       const outsideY = Math.max(nodeRegionBounds.minY - paddingY - centerY, 0, centerY - (nodeRegionBounds.maxY + paddingY));
       const distance = Math.hypot(outsideX, outsideY);
       if (distance === 0) {
         return 1;
       }
-      const falloffDistance = Math.max(180, Math.min(360, Math.max(visibleWidth, visibleHeight) * 0.22));
+      const falloffDistance = Math.max(100, Math.min(220, Math.max(visibleWidth, visibleHeight) * 0.14));
       const normalizedDistance = distance / falloffDistance;
-      return MIN_POINTER_PAN_DAMPING + (1 - MIN_POINTER_PAN_DAMPING) * Math.exp(-(normalizedDistance * normalizedDistance));
+      return MIN_POINTER_PAN_DAMPING + (1 - MIN_POINTER_PAN_DAMPING) * Math.exp(-1.9 * normalizedDistance * normalizedDistance);
     },
     [nodeRegionBounds],
   );
@@ -1153,7 +1157,7 @@ export function GraphCanvas({
 
   const handleJunctionPointerDown = useCallback(
     (nodeId: string, clientPosition: { x: number; y: number }) => {
-      if (!graph || pendingPlacement || draftConnection) {
+      if (!graph || pendingPlacement || draftConnectionRef.current) {
         return;
       }
       const node = graph.nodes.find((candidate) => candidate.id === nodeId);
@@ -1174,7 +1178,7 @@ export function GraphCanvas({
         },
       });
     },
-    [draftConnection, getFlowPositionFromScreen, graph, onSelectionChange, pendingPlacement],
+    [getFlowPositionFromScreen, graph, onSelectionChange, pendingPlacement],
   );
 
   const extendDraftConnectionAt = useCallback(
@@ -1276,7 +1280,23 @@ export function GraphCanvas({
     [onGraphDrag],
   );
 
+  const scheduleDragRender = useCallback(() => {
+    if (nodeDragRafRef.current !== null) return;
+    nodeDragRafRef.current = requestAnimationFrame(() => {
+      nodeDragRafRef.current = null;
+      setDragRenderTick((t) => t + 1);
+    });
+  }, []);
+
+  const cancelPendingNodeDragFrame = useCallback(() => {
+    if (nodeDragRafRef.current !== null) {
+      cancelAnimationFrame(nodeDragRafRef.current);
+      nodeDragRafRef.current = null;
+    }
+  }, []);
+
   useEffect(() => cancelPendingDragFrame, [cancelPendingDragFrame]);
+  useEffect(() => cancelPendingNodeDragFrame, [cancelPendingNodeDragFrame]);
   useEffect(() => cancelPendingDraftPointerFrame, [cancelPendingDraftPointerFrame]);
   const updateNodePositionInGraph = useCallback((baseGraph: GraphDefinition, nodeId: string, position: GraphPosition) => {
     let didChange = false;
@@ -1776,7 +1796,7 @@ export function GraphCanvas({
       return {
         id: node.id,
         type: "graphNode",
-        position: node.position,
+        position: dragPositionMapRef.current?.get(node.id) ?? node.position,
         selected: node.id === selectedNodeId,
         sourcePosition: "right" as Position,
         targetPosition: "left" as Position,
@@ -1786,11 +1806,15 @@ export function GraphCanvas({
     });
     nodeDataCacheRef.current = nextNodeDataCache;
     return nextNodes;
-  }, [catalog, draftConnection?.sourceNodeId, draftConnectionSnapTargetNodeId, graph, handleJunctionPointerDown, handleNodeHandlePointerDown, handleOpenProviderDetails, handleOpenToolDetails, handleToggleTooltip, isConnecting, runState, selectedNodeId, tooltipNodeId]);
+  }, [catalog, dragRenderTick, draftConnection?.sourceNodeId, draftConnectionSnapTargetNodeId, graph, handleJunctionPointerDown, handleNodeHandlePointerDown, handleOpenProviderDetails, handleOpenToolDetails, handleToggleTooltip, isConnecting, runState, selectedNodeId, tooltipNodeId]);
 
   const edges = useMemo<FlowEdge<GraphCanvasEdgeData>[]>(() => {
     if (!graph) {
+      cachedEdgesRef.current = [];
       return [];
+    }
+    if ((isNodeDragActive || junctionDrag) && cachedEdgesRef.current.length > 0) {
+      return cachedEdgesRef.current;
     }
     const nodeLookup = new Map(graph.nodes.map((node) => [node.id, node]));
     const siblingEdgesByTarget = new Map<string, GraphEdge[]>();
@@ -1949,7 +1973,7 @@ export function GraphCanvas({
         )
       : new Map<string, { x: number; y: number }>();
 
-    return edgeLayouts.map(({ labelPlacement, labelText: _labelText, pathSamples: _pathSamples, data, ...edge }) => {
+    const result = edgeLayouts.map(({ labelPlacement, labelText: _labelText, pathSamples: _pathSamples, data, ...edge }) => {
       const labelShift = labelShifts.get(edge.id);
       return {
         ...edge,
@@ -1960,6 +1984,8 @@ export function GraphCanvas({
         },
       };
     });
+    cachedEdgesRef.current = result;
+    return result;
   }, [getEdgeRouteSignature, getSourceAnchorPosition, getTargetAnchorPosition, graph, isNodeDragActive, junctionDrag, selectedEdgeId]);
 
   const onNodesChange = useCallback(
@@ -1967,26 +1993,62 @@ export function GraphCanvas({
       if (!graph) {
         return;
       }
-      let nextGraph = graph;
-      let hasStructuralChange = false;
-      let isDragging = false;
-      let dragEnded = false;
-      let nextIsNodeDragActive = isNodeDragActive;
-      let didSeeDragState = false;
 
-      changes.forEach((change) => {
+      let isDragMove = false;
+      let dragEnded = false;
+      let hasNonDragChanges = false;
+
+      for (const change of changes) {
         if (change.type === "position" && change.position) {
           const dragging = (change as { dragging?: boolean }).dragging;
           if (dragging === true) {
-            isDragging = true;
-            nextIsNodeDragActive = true;
-            didSeeDragState = true;
-          }
-          if (dragging === false) {
+            isDragMove = true;
+            if (!dragPositionMapRef.current) {
+              dragPositionMapRef.current = new Map();
+            }
+            dragPositionMapRef.current.set(change.id, change.position);
+          } else if (dragging === false) {
             dragEnded = true;
-            nextIsNodeDragActive = false;
-            didSeeDragState = true;
+            dragPositionMapRef.current?.set(change.id, change.position);
+          } else {
+            hasNonDragChanges = true;
           }
+        } else if (change.type === "select" && change.selected) {
+          onSelectionChange(change.id, null);
+        } else if (change.type !== "select") {
+          hasNonDragChanges = true;
+        }
+      }
+
+      if (isDragMove && !dragEnded && !hasNonDragChanges) {
+        if (!isNodeDragActive) {
+          setIsNodeDragActive(true);
+          setDragRenderTick((t) => t + 1);
+        } else {
+          scheduleDragRender();
+        }
+        return;
+      }
+
+      if (dragEnded && isNodeDragActive) {
+        setIsNodeDragActive(false);
+      }
+
+      let nextGraph = graph;
+      const dragPositions = dragPositionMapRef.current;
+      if (dragPositions && dragPositions.size > 0) {
+        nextGraph = {
+          ...nextGraph,
+          nodes: nextGraph.nodes.map((node) => {
+            const pos = dragPositions.get(node.id);
+            return pos ? { ...node, position: pos } : node;
+          }),
+        };
+      }
+      dragPositionMapRef.current = null;
+
+      for (const change of changes) {
+        if (change.type === "position" && change.position && (change as { dragging?: boolean }).dragging === undefined) {
           nextGraph = {
             ...nextGraph,
             nodes: nextGraph.nodes.map((node) =>
@@ -1995,7 +2057,6 @@ export function GraphCanvas({
           };
         }
         if (change.type === "remove") {
-          hasStructuralChange = true;
           nextGraph = {
             ...nextGraph,
             nodes: nextGraph.nodes.filter((node) => node.id !== change.id),
@@ -2006,23 +2067,13 @@ export function GraphCanvas({
             onSelectionChange(null, null);
           }
         }
-        if (change.type === "select" && change.selected) {
-          onSelectionChange(change.id, null);
-        }
-      });
-
-      if (didSeeDragState && nextIsNodeDragActive !== isNodeDragActive) {
-        setIsNodeDragActive(nextIsNodeDragActive);
       }
 
-      if (hasStructuralChange || dragEnded || !isDragging) {
-        cancelPendingDragFrame();
-        onGraphChange(nextGraph);
-      } else {
-        scheduleDragGraphUpdate(nextGraph);
-      }
+      cancelPendingNodeDragFrame();
+      cancelPendingDragFrame();
+      onGraphChange(nextGraph);
     },
-    [cancelPendingDragFrame, graph, isNodeDragActive, onGraphChange, onSelectionChange, scheduleDragGraphUpdate, selectedNodeId],
+    [cancelPendingDragFrame, cancelPendingNodeDragFrame, graph, isNodeDragActive, onGraphChange, onSelectionChange, scheduleDragRender, selectedNodeId],
   );
 
   const onEdgesChange = useCallback(
@@ -2223,7 +2274,7 @@ export function GraphCanvas({
       <div className="graph-workspace">
         <div
           ref={canvasRef}
-          className={`graph-canvas${drawerOpen ? " graph-canvas--drawer-open" : ""}${isProviderDragActive || isSavedNodeDragActive ? " is-drop-target" : ""}${isConnecting ? " is-connecting" : ""}${pendingPlacement ? " is-placing-node" : ""}${draftConnection ? " is-routing-wire" : ""}${junctionDrag ? " is-dragging-junction" : ""}`}
+          className={`graph-canvas${drawerOpen ? " graph-canvas--drawer-open" : ""}${isProviderDragActive || isSavedNodeDragActive ? " is-drop-target" : ""}${isConnecting ? " is-connecting" : ""}${pendingPlacement ? " is-placing-node" : ""}${draftConnection ? " is-routing-wire" : ""}${junctionDrag ? " is-dragging-junction" : ""}${isNodeDragActive ? " is-dragging-node" : ""}`}
           onDrop={onDrop}
           onDragOver={onDragOver}
           onDragLeave={onDragLeave}
