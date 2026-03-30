@@ -444,6 +444,7 @@ export function GraphCanvas({
   const [showHotkeys, setShowHotkeys] = useState(false);
   const [quickAddMinimized, setQuickAddMinimized] = useState(false);
   const [junctionDrag, setJunctionDrag] = useState<JunctionDragState | null>(null);
+  const [isNodeDragActive, setIsNodeDragActive] = useState(false);
   const [pendingPlacement, setPendingPlacement] = useState<PlacementState | null>(null);
   const [draftConnection, setDraftConnection] = useState<DraftConnectionState | null>(null);
   const [draftConnectionSnapTargetNodeId, setDraftConnectionSnapTargetNodeId] = useState<string | null>(null);
@@ -1792,8 +1793,15 @@ export function GraphCanvas({
       return [];
     }
     const nodeLookup = new Map(graph.nodes.map((node) => [node.id, node]));
+    const siblingEdgesByTarget = new Map<string, GraphEdge[]>();
     const routeSignatureGroups = new Map<string, GraphEdge[]>();
     graph.edges.forEach((edge) => {
+      const siblingEdges = siblingEdgesByTarget.get(edge.target_id);
+      if (siblingEdges) {
+        siblingEdges.push(edge);
+      } else {
+        siblingEdgesByTarget.set(edge.target_id, [edge]);
+      }
       const sourceNode = nodeLookup.get(edge.source_id);
       const signature = getEdgeRouteSignature(edge, sourceNode);
       if (!signature) {
@@ -1806,6 +1814,22 @@ export function GraphCanvas({
         routeSignatureGroups.set(signature, [edge]);
       }
     });
+    siblingEdgesByTarget.forEach((siblingEdges) => {
+      siblingEdges.sort((left, right) => {
+        const leftSource = nodeLookup.get(left.source_id);
+        const rightSource = nodeLookup.get(right.source_id);
+        const verticalDelta = (leftSource?.position.y ?? 0) - (rightSource?.position.y ?? 0);
+        if (verticalDelta !== 0) {
+          return verticalDelta;
+        }
+        const horizontalDelta = (leftSource?.position.x ?? 0) - (rightSource?.position.x ?? 0);
+        if (horizontalDelta !== 0) {
+          return horizontalDelta;
+        }
+        return left.id.localeCompare(right.id);
+      });
+    });
+    const shouldResolveLabelCollisions = !isNodeDragActive && !junctionDrag;
 
     const edgeLayouts = graph.edges.map((edge) => {
       const sourceNode = nodeLookup.get(edge.source_id);
@@ -1817,27 +1841,13 @@ export function GraphCanvas({
       const targetAnchor = getTargetAnchorPosition(edge.target_id);
       const routeSignature = getEdgeRouteSignature(edge, sourceNode);
       const overlappingEdges = routeSignature ? routeSignatureGroups.get(routeSignature) ?? [edge] : [edge];
+      const siblingEdges = siblingEdgesByTarget.get(edge.target_id) ?? [edge];
       const toolEdgeTone =
         sourceNode?.kind === "tool"
           ? sourceHandleId === TOOL_FAILURE_HANDLE_ID
             ? TOOL_EDGE_TONES.failure
             : TOOL_EDGE_TONES.success
           : null;
-      const siblingEdges = graph.edges
-        .filter((candidate) => candidate.target_id === edge.target_id)
-        .sort((left, right) => {
-          const leftSource = nodeLookup.get(left.source_id);
-          const rightSource = nodeLookup.get(right.source_id);
-          const verticalDelta = (leftSource?.position.y ?? 0) - (rightSource?.position.y ?? 0);
-          if (verticalDelta !== 0) {
-            return verticalDelta;
-          }
-          const horizontalDelta = (leftSource?.position.x ?? 0) - (rightSource?.position.x ?? 0);
-          if (horizontalDelta !== 0) {
-            return horizontalDelta;
-          }
-          return left.id.localeCompare(right.id);
-        });
       const siblingIndex = siblingEdges.findIndex((candidate) => candidate.id === edge.id);
       const overlappingIndex = overlappingEdges.findIndex((candidate) => candidate.id === edge.id);
       const siblingLaneOffset = (siblingIndex - (siblingEdges.length - 1) / 2) * EDGE_SIBLING_SPACING;
@@ -1882,7 +1892,10 @@ export function GraphCanvas({
                 height: EDGE_LABEL_HEIGHT,
               }
             : null,
-        pathSamples: edgeGeometry ? sampleEdgePathPoints(edge.id, edgeGeometry.edgePath, routeShiftX, routeShiftY) : [],
+        pathSamples:
+          shouldResolveLabelCollisions && edgeGeometry
+            ? sampleEdgePathPoints(edge.id, edgeGeometry.edgePath, routeShiftX, routeShiftY)
+            : [],
         type: "graphEdge",
         source: edge.source_id,
         target: edge.target_id,
@@ -1917,22 +1930,24 @@ export function GraphCanvas({
       };
     });
 
-    const labelShifts = resolveEdgeLabelShifts(
-      edgeLayouts.flatMap((edge) =>
-        edge.labelPlacement
-          ? [
-              {
-                edgeId: edge.id,
-                center: edge.labelPlacement.center,
-                tangent: edge.labelPlacement.tangent,
-                width: edge.labelPlacement.width,
-                height: edge.labelPlacement.height,
-              },
-            ]
-          : [],
-      ),
-      edgeLayouts.flatMap((edge) => edge.pathSamples),
-    );
+    const labelShifts = shouldResolveLabelCollisions
+      ? resolveEdgeLabelShifts(
+          edgeLayouts.flatMap((edge) =>
+            edge.labelPlacement
+              ? [
+                  {
+                    edgeId: edge.id,
+                    center: edge.labelPlacement.center,
+                    tangent: edge.labelPlacement.tangent,
+                    width: edge.labelPlacement.width,
+                    height: edge.labelPlacement.height,
+                  },
+                ]
+              : [],
+          ),
+          edgeLayouts.flatMap((edge) => edge.pathSamples),
+        )
+      : new Map<string, { x: number; y: number }>();
 
     return edgeLayouts.map(({ labelPlacement, labelText: _labelText, pathSamples: _pathSamples, data, ...edge }) => {
       const labelShift = labelShifts.get(edge.id);
@@ -1945,7 +1960,7 @@ export function GraphCanvas({
         },
       };
     });
-  }, [getEdgeRouteSignature, getSourceAnchorPosition, getTargetAnchorPosition, graph, selectedEdgeId]);
+  }, [getEdgeRouteSignature, getSourceAnchorPosition, getTargetAnchorPosition, graph, isNodeDragActive, junctionDrag, selectedEdgeId]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -1956,15 +1971,21 @@ export function GraphCanvas({
       let hasStructuralChange = false;
       let isDragging = false;
       let dragEnded = false;
+      let nextIsNodeDragActive = isNodeDragActive;
+      let didSeeDragState = false;
 
       changes.forEach((change) => {
         if (change.type === "position" && change.position) {
           const dragging = (change as { dragging?: boolean }).dragging;
           if (dragging === true) {
             isDragging = true;
+            nextIsNodeDragActive = true;
+            didSeeDragState = true;
           }
           if (dragging === false) {
             dragEnded = true;
+            nextIsNodeDragActive = false;
+            didSeeDragState = true;
           }
           nextGraph = {
             ...nextGraph,
@@ -1990,6 +2011,10 @@ export function GraphCanvas({
         }
       });
 
+      if (didSeeDragState && nextIsNodeDragActive !== isNodeDragActive) {
+        setIsNodeDragActive(nextIsNodeDragActive);
+      }
+
       if (hasStructuralChange || dragEnded || !isDragging) {
         cancelPendingDragFrame();
         onGraphChange(nextGraph);
@@ -1997,7 +2022,7 @@ export function GraphCanvas({
         scheduleDragGraphUpdate(nextGraph);
       }
     },
-    [cancelPendingDragFrame, graph, onGraphChange, onSelectionChange, scheduleDragGraphUpdate, selectedNodeId],
+    [cancelPendingDragFrame, graph, isNodeDragActive, onGraphChange, onSelectionChange, scheduleDragGraphUpdate, selectedNodeId],
   );
 
   const onEdgesChange = useCallback(

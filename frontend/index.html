@@ -4,6 +4,23 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Graph Agent Visualizer</title>
+    <script>
+      // Must run before Vite's client module to suppress benign ResizeObserver errors
+      window.addEventListener("error", function (e) {
+        if (e.message && e.message.includes("ResizeObserver loop")) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
+      }, true);
+      window.addEventListener("unhandledrejection", function (e) {
+        var r = e.reason;
+        var msg = typeof r === "string" ? r : r && r.message ? r.message : "";
+        if (msg.includes("ResizeObserver loop")) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
+      }, true);
+    </script>
   </head>
   <body>
     <div id="root"></div>
