@@ -817,14 +817,14 @@ export function GraphCanvas({
     );
   }, [getNodeDimensions, graph]);
 
-  const getPointerPanDamping = useCallback(
+  const getPointerPanOutsideDistance = useCallback(
     (viewport: ViewportState) => {
       if (!nodeRegionBounds) {
-        return 1;
+        return 0;
       }
       const bounds = canvasRef.current?.getBoundingClientRect();
       if (!bounds || viewport.zoom <= 0) {
-        return 1;
+        return 0;
       }
       const visibleWidth = bounds.width / viewport.zoom;
       const visibleHeight = bounds.height / viewport.zoom;
@@ -834,15 +834,29 @@ export function GraphCanvas({
       const paddingY = Math.max(80, visibleHeight * 0.15);
       const outsideX = Math.max(nodeRegionBounds.minX - paddingX - centerX, 0, centerX - (nodeRegionBounds.maxX + paddingX));
       const outsideY = Math.max(nodeRegionBounds.minY - paddingY - centerY, 0, centerY - (nodeRegionBounds.maxY + paddingY));
-      const distance = Math.hypot(outsideX, outsideY);
-      if (distance === 0) {
-        return 1;
-      }
-      const falloffDistance = Math.max(100, Math.min(220, Math.max(visibleWidth, visibleHeight) * 0.14));
-      const normalizedDistance = distance / falloffDistance;
-      return MIN_POINTER_PAN_DAMPING + (1 - MIN_POINTER_PAN_DAMPING) * Math.exp(-1.9 * normalizedDistance * normalizedDistance);
+      return Math.hypot(outsideX, outsideY);
     },
     [nodeRegionBounds],
+  );
+
+  const getPointerPanDamping = useCallback(
+    (previousViewport: ViewportState, nextViewport: ViewportState) => {
+      const previousDistance = getPointerPanOutsideDistance(previousViewport);
+      const nextDistance = getPointerPanOutsideDistance(nextViewport);
+      if (nextDistance <= previousDistance + 0.01) {
+        return 1;
+      }
+      const bounds = canvasRef.current?.getBoundingClientRect();
+      if (!bounds || nextViewport.zoom <= 0) {
+        return 1;
+      }
+      const visibleWidth = bounds.width / nextViewport.zoom;
+      const visibleHeight = bounds.height / nextViewport.zoom;
+      const falloffDistance = Math.max(100, Math.min(220, Math.max(visibleWidth, visibleHeight) * 0.14));
+      const normalizedDistance = nextDistance / falloffDistance;
+      return MIN_POINTER_PAN_DAMPING + (1 - MIN_POINTER_PAN_DAMPING) * Math.exp(-1.9 * normalizedDistance * normalizedDistance);
+    },
+    [getPointerPanOutsideDistance],
   );
 
   const handleViewportMove = useCallback(
@@ -879,7 +893,7 @@ export function GraphCanvas({
         return;
       }
 
-      const damping = getPointerPanDamping(previousAppliedViewport);
+      const damping = getPointerPanDamping(previousAppliedViewport, viewport);
       if (damping >= 0.999) {
         panState.lastAppliedViewport = viewport;
         return;

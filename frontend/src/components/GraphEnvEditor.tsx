@@ -10,6 +10,11 @@ type GraphEnvEditorProps = {
 
 const GRAPH_ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const STANDARD_GRAPH_ENV_KEYS: ReadonlySet<string> = new Set(STANDARD_GRAPH_ENV_FIELDS.map((field) => field.key));
+const SENSITIVE_ENV_KEY_PATTERN = /(password|passwd|passphrase|secret|token|api[_-]?key|private[_-]?key|credential)/i;
+
+function isSensitiveEnvKey(key: string): boolean {
+  return SENSITIVE_ENV_KEY_PATTERN.test(key);
+}
 
 function updateGraphEnvVars(
   graph: GraphDocument,
@@ -24,6 +29,8 @@ function updateGraphEnvVars(
 export function GraphEnvEditor({ graph, onGraphChange }: GraphEnvEditorProps) {
   const [newEnvKey, setNewEnvKey] = useState("");
   const [newEnvValue, setNewEnvValue] = useState("");
+  const [revealedEnvKeys, setRevealedEnvKeys] = useState<Record<string, boolean>>({});
+  const [newEnvValueVisible, setNewEnvValueVisible] = useState(false);
 
   const envVars = useMemo(() => getGraphEnvVars(graph), [graph]);
   const customEnvEntries = useMemo(
@@ -31,6 +38,7 @@ export function GraphEnvEditor({ graph, onGraphChange }: GraphEnvEditorProps) {
     [envVars],
   );
   const trimmedNewEnvKey = newEnvKey.trim();
+  const newEnvValueInputVisible = newEnvValueVisible || !isSensitiveEnvKey(trimmedNewEnvKey);
   const newEnvKeyError =
     trimmedNewEnvKey.length === 0
       ? null
@@ -63,9 +71,12 @@ export function GraphEnvEditor({ graph, onGraphChange }: GraphEnvEditorProps) {
       ))}
       {customEnvEntries.map(([key, value]) => (
         <div key={key} className="env-tile">
-          <label className="env-tile-label"><code>{`{${key}}`}</code></label>
+          <label className="env-tile-label">
+            <code>{`{${key}}`}</code>
+          </label>
           <div className="env-tile-value-row">
             <input
+              type={(revealedEnvKeys[key] ?? !isSensitiveEnvKey(key)) ? "text" : "password"}
               value={value}
               onChange={(event) =>
                 onGraphChange(
@@ -76,6 +87,20 @@ export function GraphEnvEditor({ graph, onGraphChange }: GraphEnvEditorProps) {
                 )
               }
             />
+            <button
+              type="button"
+              className="secondary-button env-tile-visibility-toggle"
+              onClick={() =>
+                setRevealedEnvKeys((currentValue) => ({
+                  ...currentValue,
+                  [key]: !(currentValue[key] ?? !isSensitiveEnvKey(key)),
+                }))
+              }
+              aria-label={`${(revealedEnvKeys[key] ?? !isSensitiveEnvKey(key)) ? "Hide" : "Show"} value for ${key}`}
+              aria-pressed={revealedEnvKeys[key] ?? !isSensitiveEnvKey(key)}
+            >
+              {(revealedEnvKeys[key] ?? !isSensitiveEnvKey(key)) ? "Hide" : "Show"}
+            </button>
             <button
               type="button"
               className="secondary-button env-tile-remove"
@@ -102,10 +127,20 @@ export function GraphEnvEditor({ graph, onGraphChange }: GraphEnvEditorProps) {
             onChange={(event) => setNewEnvKey(event.target.value)}
           />
           <input
+            type={newEnvValueInputVisible ? "text" : "password"}
             value={newEnvValue}
             placeholder="value"
             onChange={(event) => setNewEnvValue(event.target.value)}
           />
+          <button
+            type="button"
+            className="secondary-button env-tile-visibility-toggle"
+            onClick={() => setNewEnvValueVisible((currentValue) => !currentValue)}
+            aria-label={`${newEnvValueInputVisible ? "Hide" : "Show"} new environment variable value`}
+            aria-pressed={newEnvValueInputVisible}
+          >
+            {newEnvValueInputVisible ? "Hide" : "Show"}
+          </button>
         </div>
         <button
           type="button"
@@ -122,6 +157,7 @@ export function GraphEnvEditor({ graph, onGraphChange }: GraphEnvEditorProps) {
             );
             setNewEnvKey("");
             setNewEnvValue("");
+            setNewEnvValueVisible(false);
           }}
           disabled={!trimmedNewEnvKey || Boolean(newEnvKeyError)}
         >
