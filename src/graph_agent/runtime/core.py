@@ -24,6 +24,10 @@ def utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
+API_TOOL_CALL_HANDLE_ID = "api-tool-call"
+API_MESSAGE_HANDLE_ID = "api-message"
+
+
 def _json_safe(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -187,6 +191,24 @@ class Condition:
             value=payload.get("value"),
             path=payload.get("path"),
         )
+
+
+def _is_tool_call_contract_condition(condition: Condition | None) -> bool:
+    return bool(
+        condition is not None
+        and condition.condition_type == "result_payload_path_equals"
+        and condition.path == "metadata.contract"
+        and condition.value == "tool_call_envelope"
+    )
+
+
+def _is_message_contract_condition(condition: Condition | None) -> bool:
+    return bool(
+        condition is not None
+        and condition.condition_type == "result_payload_path_equals"
+        and condition.path == "metadata.contract"
+        and condition.value == "message_envelope"
+    )
 
 
 @dataclass
@@ -723,21 +745,59 @@ class DataNode(BaseNode):
 
     def execute(self, context: NodeContext) -> NodeExecutionResult:
         source_value = context.resolve_binding(self.config.get("input_binding"))
+        display_value = source_value
+        source_envelope: MessageEnvelope | None = None
+        if isinstance(display_value, Mapping) and "metadata" in display_value:
+            try:
+                source_envelope = MessageEnvelope.from_dict(display_value)
+            except Exception:  # noqa: BLE001
+                source_envelope = None
         if isinstance(source_value, Mapping) and "payload" in source_value:
             source_value = source_value.get("payload")
-        mode = self.config.get("mode", "passthrough")
+        display_only = bool(self.config.get("show_input_envelope", False))
+        mode = "passthrough" if bool(self.config.get("lock_passthrough", False)) else self.config.get("mode", "passthrough")
         if mode == "template":
             payload = context.render_template(str(self.config.get("template", "{input_payload}")), {"source": source_value})
         else:
             payload = source_value
+        artifacts: dict[str, Any] = {}
+        if display_only:
+            artifacts["display_envelope"] = display_value
+        metadata = {
+            "contract": "data_envelope",
+            "node_kind": self.kind,
+            "display_only": display_only,
+        }
+        errors: list[dict[str, Any]] = []
+        tool_calls: list[dict[str, Any]] = []
+        schema_version = "1.0"
+        if display_only and source_envelope is not None:
+            schema_version = source_envelope.schema_version
+            artifacts = {**source_envelope.artifacts, **artifacts}
+            errors = list(source_envelope.errors)
+            tool_calls = list(source_envelope.tool_calls)
+            metadata = {
+                **dict(source_envelope.metadata),
+                "contract": str(source_envelope.metadata.get("contract", "data_envelope")),
+                "node_kind": self.kind,
+                "display_only": True,
+                "display_provider_id": self.provider_id,
+            }
         envelope = MessageEnvelope(
-            schema_version="1.0",
+            schema_version=schema_version,
             from_node_id=self.id,
             from_category=self.category.value,
             payload=payload,
-            metadata={"contract": "data_envelope", "node_kind": self.kind},
+            artifacts=artifacts,
+            errors=errors,
+            tool_calls=tool_calls,
+            metadata=metadata,
         )
-        return NodeExecutionResult(status="success", output=envelope.to_dict(), summary="Data node completed.")
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary="Display node captured the upstream envelope." if display_only else "Data node completed.",
+        )
 
 
 class ProviderNode(BaseNode):
@@ -921,42 +981,48 @@ class ModelNode(BaseNode):
         )
         response = provider.generate(request)
         output = response.structured_output if response.structured_output is not None else response.content
+        normalized_tool_calls = [
+            {
+                "tool_name": tool_call.tool_name,
+                "arguments": tool_call.arguments,
+                "provider_tool_id": tool_call.provider_tool_id,
+                "metadata": dict(tool_call.metadata),
+            }
+            for tool_call in response.tool_calls
+        ]
+        if response_mode == "tool_call" and not normalized_tool_calls and response.structured_output is not None:
+            available_tool_names = [str(tool.get("name", "")).strip() for tool in available_tool_payloads if str(tool.get("name", "")).strip()]
+            target_tool = self.config.get("preferred_tool_name") or (available_tool_names[0] if available_tool_names else None)
+            if target_tool:
+                normalized_tool_calls = [
+                    {
+                        "tool_name": target_tool,
+                        "arguments": response.structured_output,
+                        "provider_tool_id": None,
+                        "metadata": {"fallback": True},
+                    }
+                ]
+        emit_tool_call_envelope = response_mode == "tool_call" or (response_mode == "auto" and bool(normalized_tool_calls))
+        envelope_artifacts: dict[str, Any] = {}
+        if emit_tool_call_envelope and response.content:
+            envelope_artifacts["assistant_message"] = response.content
         envelope = MessageEnvelope(
             schema_version="1.0",
             from_node_id=self.id,
             from_category=self.category.value,
-            payload=output if response_mode != "tool_call" else None,
+            payload=None if emit_tool_call_envelope else output,
+            artifacts=envelope_artifacts,
             metadata={
-                "contract": "tool_call_envelope" if response_mode == "tool_call" else "message_envelope",
+                "contract": "tool_call_envelope" if emit_tool_call_envelope else "message_envelope",
                 "node_kind": self.kind,
                 "provider": provider.name,
                 "prompt_name": self.prompt_name,
+                "response_mode": response_mode,
                 "tool_call_count": len(response.tool_calls),
                 **response.metadata,
             },
         )
-        if response_mode == "tool_call":
-            normalized_tool_calls = [
-                {
-                    "tool_name": tool_call.tool_name,
-                    "arguments": tool_call.arguments,
-                    "provider_tool_id": tool_call.provider_tool_id,
-                    "metadata": dict(tool_call.metadata),
-                }
-                for tool_call in response.tool_calls
-            ]
-            if not normalized_tool_calls and response.structured_output is not None:
-                available_tool_names = [str(tool.get("name", "")).strip() for tool in available_tool_payloads if str(tool.get("name", "")).strip()]
-                target_tool = self.config.get("preferred_tool_name") or (available_tool_names[0] if available_tool_names else None)
-                if target_tool:
-                    normalized_tool_calls = [
-                        {
-                            "tool_name": target_tool,
-                            "arguments": response.structured_output,
-                            "provider_tool_id": None,
-                            "metadata": {"fallback": True},
-                        }
-                    ]
+        if emit_tool_call_envelope:
             envelope.tool_calls = normalized_tool_calls
         return NodeExecutionResult(
             status="success",
@@ -1470,6 +1536,10 @@ class GraphDefinition:
                         raise GraphValidationError(str(exc)) from exc
                 mcp_context_tool_names: list[str] = []
                 response_mode = str(node.config.get("response_mode", "message"))
+                if response_mode not in {"message", "tool_call", "auto"}:
+                    raise GraphValidationError(
+                        f"Model node '{node.id}' uses unsupported response mode '{response_mode}'."
+                    )
                 candidate_context_nodes: list[McpContextProviderNode] = []
                 seen_context_node_ids: set[str] = set()
                 tool_target_node_ids = node.config.get("tool_target_node_ids", [])
@@ -1524,6 +1594,41 @@ class GraphDefinition:
                     raise GraphValidationError(
                         f"Model node '{node.id}' prefers tool '{preferred_tool_name}', but it is not exposed to the node."
                     )
+                model_outgoing_edges = [edge for edge in self.get_outgoing_edges(node.id) if edge.kind != "binding"]
+                api_tool_call_edges = [edge for edge in model_outgoing_edges if edge.source_handle_id == API_TOOL_CALL_HANDLE_ID]
+                api_message_edges = [edge for edge in model_outgoing_edges if edge.source_handle_id == API_MESSAGE_HANDLE_ID]
+                if len(api_tool_call_edges) > 1:
+                    raise GraphValidationError(
+                        f"Model node '{node.id}' can only declare one api-tool-call route."
+                    )
+                if len(api_message_edges) > 1:
+                    raise GraphValidationError(
+                        f"Model node '{node.id}' can only declare one api-message route."
+                    )
+                for edge in model_outgoing_edges:
+                    target_node = self.nodes.get(edge.target_id)
+                    if target_node is None:
+                        continue
+                    if edge.source_handle_id == API_TOOL_CALL_HANDLE_ID:
+                        if target_node.category != NodeCategory.TOOL and not (
+                            target_node.category == NodeCategory.DATA and target_node.provider_id == "core.data_display"
+                        ):
+                            raise GraphValidationError(
+                                f"Model node '{node.id}' tool-call output must route to a tool node, but '{target_node.id}' is '{target_node.category.value}'."
+                            )
+                        if edge.kind != "conditional" or not _is_tool_call_contract_condition(edge.condition):
+                            raise GraphValidationError(
+                                f"Model node '{node.id}' tool-call output edge '{edge.id}' must match tool_call_envelope."
+                            )
+                    if edge.source_handle_id == API_MESSAGE_HANDLE_ID:
+                        if target_node.category not in {NodeCategory.API, NodeCategory.DATA, NodeCategory.END}:
+                            raise GraphValidationError(
+                                f"Model node '{node.id}' message output must route to api, data, or end nodes, but '{target_node.id}' is '{target_node.category.value}'."
+                            )
+                        if edge.kind != "conditional" or not _is_message_contract_condition(edge.condition):
+                            raise GraphValidationError(
+                                f"Model node '{node.id}' message output edge '{edge.id}' must match message_envelope."
+                            )
             if node.kind == "tool":
                 try:
                     services.tool_registry.require_invocable(str(node.config.get("tool_name", "")))
@@ -1579,25 +1684,65 @@ class GraphDefinition:
                             raise GraphValidationError(
                                 f"MCP tool executor '{node.id}' references missing source node '{source_id}'."
                             )
-                        if isinstance(source_node, ModelNode) and str(source_node.config.get("response_mode", "message")) != "tool_call":
-                            raise GraphValidationError(
-                                f"MCP tool executor '{node.id}' must bind to a tool_call model output, but '{source_id}' uses response mode '{source_node.config.get('response_mode', 'message')}'."
-                            )
+                        if isinstance(source_node, ModelNode):
+                            source_response_mode = str(source_node.config.get("response_mode", "message"))
+                            if source_response_mode == "message":
+                                raise GraphValidationError(
+                                    f"MCP tool executor '{node.id}' must bind to a tool_call model output, but '{source_id}' uses response mode '{source_response_mode}'."
+                                )
                 else:
                     incoming_edges = self.get_incoming_edges(node.id)
                     if not incoming_edges:
                         raise GraphValidationError(
                             f"MCP tool executor '{node.id}' must have an incoming edge or an explicit input_binding."
                         )
-                    incoming_sources = [self.nodes.get(edge.source_id) for edge in incoming_edges if self.nodes.get(edge.source_id) is not None]
-                    if incoming_sources and all(
-                        isinstance(source_node, ModelNode)
-                        and str(source_node.config.get("response_mode", "message")) != "tool_call"
-                        for source_node in incoming_sources
-                    ):
+                    valid_tool_call_routes = 0
+                    for edge in incoming_edges:
+                        source_node = self.nodes.get(edge.source_id)
+                        if source_node is None:
+                            continue
+                        if not isinstance(source_node, ModelNode):
+                            valid_tool_call_routes += 1
+                            continue
+                        source_response_mode = str(source_node.config.get("response_mode", "message"))
+                        if edge.source_handle_id == API_MESSAGE_HANDLE_ID:
+                            continue
+                        if edge.source_handle_id == API_TOOL_CALL_HANDLE_ID:
+                            valid_tool_call_routes += 1
+                            continue
+                        if source_response_mode == "tool_call":
+                            valid_tool_call_routes += 1
+                            continue
+                        if source_response_mode == "auto" and _is_tool_call_contract_condition(edge.condition):
+                            valid_tool_call_routes += 1
+                            continue
+                    if valid_tool_call_routes == 0:
                         raise GraphValidationError(
                             f"MCP tool executor '{node.id}' must receive a tool_call envelope from at least one upstream model node."
                         )
+                    for edge in incoming_edges:
+                        source_node = self.nodes.get(edge.source_id)
+                        if not isinstance(source_node, ModelNode):
+                            continue
+                        source_response_mode = str(source_node.config.get("response_mode", "message"))
+                        if edge.source_handle_id == API_MESSAGE_HANDLE_ID:
+                            raise GraphValidationError(
+                                f"MCP tool executor '{node.id}' cannot receive api-message output from model node '{source_node.id}'."
+                            )
+                        if edge.source_handle_id == API_TOOL_CALL_HANDLE_ID:
+                            if edge.kind != "conditional" or not _is_tool_call_contract_condition(edge.condition):
+                                raise GraphValidationError(
+                                    f"MCP tool executor '{node.id}' must use a tool_call_envelope condition on api-tool-call edge '{edge.id}'."
+                                )
+                            continue
+                        if source_response_mode == "message":
+                            raise GraphValidationError(
+                                f"MCP tool executor '{node.id}' cannot receive direct message-mode output from model node '{source_node.id}'."
+                            )
+                        if source_response_mode == "auto" and not _is_tool_call_contract_condition(edge.condition):
+                            raise GraphValidationError(
+                                f"MCP tool executor '{node.id}' must use a tool_call_envelope condition on edges from auto-mode model node '{source_node.id}'."
+                            )
 
     def _resolve_provider_binding(self, node: BaseNode) -> ProviderNode | None:
         binding_node_id = str(node.config.get("provider_binding_node_id", "")).strip()

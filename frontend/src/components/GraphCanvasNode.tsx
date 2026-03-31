@@ -4,9 +4,12 @@ import { Handle, Position } from "reactflow";
 import type { NodeProps } from "reactflow";
 
 import {
+  API_MESSAGE_HANDLE_ID,
+  API_TOOL_CALL_HANDLE_ID,
   API_TOOL_CONTEXT_HANDLE_ID,
   getApiToolContextTargetAnchorRatio,
   getToolSourceHandleAnchorRatio,
+  isApiModelNode,
   isMcpContextProviderNode,
   isRoutableToolNode,
   isWireJunctionNode,
@@ -77,7 +80,27 @@ function GraphCanvasNodeComponent({
   const isWireJunction = isWireJunctionNode(node);
   const isRoutableTool = isRoutableToolNode(node);
   const isContextProviderNode = isMcpContextProviderNode(node);
-  const isModelNode = node.kind === "model";
+  const isModelNode = isApiModelNode(node);
+  const isDisplayNode = node.provider_id === "core.data_display";
+  const nodeOutput = runState?.node_outputs?.[node.id];
+  const displayEnvelope =
+    isDisplayNode &&
+    nodeOutput &&
+    typeof nodeOutput === "object" &&
+    nodeOutput !== null &&
+    "artifacts" in nodeOutput &&
+    typeof nodeOutput.artifacts === "object" &&
+    nodeOutput.artifacts !== null &&
+    "display_envelope" in nodeOutput.artifacts
+      ? nodeOutput.artifacts.display_envelope
+      : nodeOutput;
+  const displayText = isDisplayNode
+    ? status === "active"
+      ? "Running..."
+      : displayEnvelope !== undefined
+        ? JSON.stringify(displayEnvelope, null, 2)
+        : "Run the graph to inspect the incoming envelope here."
+    : null;
   let tooltip: NodeTooltipData = FALLBACK_TOOLTIP;
   if (tooltipVisible && !preview && !isWireJunction) {
     try {
@@ -102,6 +125,12 @@ function GraphCanvasNodeComponent({
   const contextSourceHandleStyle = {
     top: `${getToolSourceHandleAnchorRatio(TOOL_CONTEXT_HANDLE_ID) * 100}%`,
   } satisfies CSSProperties;
+  const apiToolCallHandleStyle = {
+    top: `${getToolSourceHandleAnchorRatio(API_TOOL_CALL_HANDLE_ID) * 100}%`,
+  } satisfies CSSProperties;
+  const apiMessageHandleStyle = {
+    top: `${getToolSourceHandleAnchorRatio(API_MESSAGE_HANDLE_ID) * 100}%`,
+  } satisfies CSSProperties;
   const primaryTargetHandleStyle = {
     top: `${getApiToolContextTargetAnchorRatio(null) * 100}%`,
   } satisfies CSSProperties;
@@ -117,6 +146,10 @@ function GraphCanvasNodeComponent({
     isContextProviderNode ? "graph-node-card--tool-context-provider" : ""
   } ${
     isModelNode ? "graph-node-card--model-inputs" : ""
+  } ${
+    isModelNode ? "graph-node-card--model-outputs" : ""
+  } ${
+    isDisplayNode ? "graph-node-card--display-node" : ""
   } ${selected ? "is-selected" : ""} ${tooltipVisible ? "is-tooltip-visible" : ""} ${preview ? "is-preview" : ""} ${
     isConnectionMagnetized ? "is-connection-magnetized" : ""
   }`;
@@ -212,6 +245,12 @@ function GraphCanvasNodeComponent({
           <span className="graph-node-chip">{node.category}</span>
           <span className="graph-node-meta-text">{node.kind}</span>
         </div>
+        {isDisplayNode ? (
+          <div className="graph-node-inline-display">
+            <div className="graph-node-inline-display-header">Run Envelope</div>
+            <pre className="graph-node-inline-display-body">{displayText}</pre>
+          </div>
+        ) : null}
         {!preview && (node.kind === "tool" || node.kind === "mcp_context_provider" || node.kind === "model") ? (
           <div className="graph-node-card-actions">
             <button
@@ -311,7 +350,31 @@ function GraphCanvasNodeComponent({
           />
         </>
       ) : null}
-      {showSourceHandle && !isRoutableTool && !isContextProviderNode ? (
+      {showSourceHandle && isModelNode ? (
+        <>
+          <div className="graph-node-output-port graph-node-output-port--tool-call" style={apiToolCallHandleStyle} aria-hidden="true">
+            <span className="graph-node-output-port-label">Tool Call</span>
+          </div>
+          <Handle
+            id={API_TOOL_CALL_HANDLE_ID}
+            type="source"
+            position={Position.Right}
+            className="graph-node-handle graph-node-handle-source graph-node-handle-source--tool-call"
+            style={apiToolCallHandleStyle}
+          />
+          <div className="graph-node-output-port graph-node-output-port--message" style={apiMessageHandleStyle} aria-hidden="true">
+            <span className="graph-node-output-port-label">Message</span>
+          </div>
+          <Handle
+            id={API_MESSAGE_HANDLE_ID}
+            type="source"
+            position={Position.Right}
+            className="graph-node-handle graph-node-handle-source graph-node-handle-source--message"
+            style={apiMessageHandleStyle}
+          />
+        </>
+      ) : null}
+      {showSourceHandle && !isRoutableTool && !isContextProviderNode && !isModelNode ? (
         <Handle
           type="source"
           position={Position.Right}

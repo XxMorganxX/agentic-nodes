@@ -205,6 +205,95 @@ class DataDrivenGraphTests(unittest.TestCase):
             store.delete_graph("tool-schema-repair")
             self.assertEqual(store.get_graph("tool-schema-repair")["name"], "Tool Schema Repair Example")
 
+    def test_envelope_display_node_shows_input_envelope_and_preserves_payload(self) -> None:
+        payload: dict[str, Any] = {
+            "graph_id": "display-envelope-agent",
+            "name": "Display Envelope Agent",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "description": "",
+                    "position": {"x": 0, "y": 0},
+                    "config": {"input_binding": {"type": "input_payload"}},
+                },
+                {
+                    "id": "display",
+                    "kind": "data",
+                    "category": "data",
+                    "label": "Display Envelope",
+                    "provider_id": "core.data_display",
+                    "provider_label": "Envelope Display Node",
+                    "description": "",
+                    "position": {"x": 240, "y": 0},
+                    "config": {
+                        "mode": "template",
+                        "template": "This should be ignored.",
+                        "show_input_envelope": True,
+                        "lock_passthrough": True,
+                    },
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "description": "",
+                    "position": {"x": 480, "y": 0},
+                    "config": {"source_binding": {"type": "latest_payload", "source": "display"}},
+                },
+            ],
+            "edges": [
+                {
+                    "id": "edge-start-display",
+                    "source_id": "start",
+                    "target_id": "display",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                    "condition": None,
+                },
+                {
+                    "id": "edge-display-finish",
+                    "source_id": "display",
+                    "target_id": "finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                    "condition": None,
+                },
+            ],
+        }
+
+        graph = GraphDefinition.from_dict(payload)
+        graph.validate_against_services(self.services)
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        state = runtime.run(graph, "hello envelope")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output, "hello envelope")
+        display_output = state.node_outputs["display"]
+        assert isinstance(display_output, dict)
+        self.assertEqual(display_output["payload"], "hello envelope")
+        self.assertEqual(display_output["artifacts"]["display_envelope"]["payload"], "hello envelope")
+        self.assertEqual(display_output["artifacts"]["display_envelope"]["metadata"]["contract"], "message_envelope")
+        self.assertEqual(display_output["metadata"]["contract"], "message_envelope")
+        self.assertTrue(display_output["metadata"]["display_only"])
+
 
 if __name__ == "__main__":
     unittest.main()

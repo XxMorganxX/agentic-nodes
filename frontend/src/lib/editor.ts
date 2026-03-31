@@ -23,6 +23,22 @@ function uniqueNodeId(graph: GraphDefinition, base: string): string {
   return candidate;
 }
 
+function uniquePromptName(graph: GraphDefinition, base: string): string {
+  const existingPromptNames = new Set(
+    graph.nodes
+      .map((node) => (typeof node.prompt_name === "string" ? node.prompt_name.trim() : ""))
+      .filter((promptName) => promptName.length > 0),
+  );
+  const trimmedBase = base.trim() || "prompt";
+  let candidate = trimmedBase;
+  let suffix = 1;
+  while (existingPromptNames.has(candidate)) {
+    candidate = `${trimmedBase}-${suffix}`;
+    suffix += 1;
+  }
+  return candidate;
+}
+
 export function providerModelName(provider: NodeProviderDefinition): string {
   const explicitName = typeof provider.model_provider_name === "string" ? provider.model_provider_name.trim() : "";
   if (explicitName) {
@@ -71,7 +87,7 @@ function defaultModelConfig(promptName: string, catalog: EditorCatalog | null): 
     mode: promptName,
     system_prompt: "You are a model node in an editable graph.",
     user_message_template: "{input_payload}",
-    response_mode: "message",
+    response_mode: "auto",
     allowed_tool_names: [],
     model: typeof defaultConfig.model === "string" ? defaultConfig.model : "mock-default",
   };
@@ -251,6 +267,32 @@ export function createNodeFromSaved(
   };
 }
 
+export function duplicateGraphNode(
+  graph: GraphDefinition,
+  node: GraphNode,
+  options: { position?: GraphPosition } = {},
+): GraphNode {
+  const id = uniqueNodeId(graph, node.label);
+  const nextConfig = JSON.parse(JSON.stringify(node.config ?? {})) as GraphNode["config"];
+  const nextNode: GraphNode = {
+    ...node,
+    id,
+    position: options.position ?? { ...node.position },
+    config: nextConfig,
+  };
+
+  if (node.kind === "model") {
+    const promptName = uniquePromptName(graph, String(node.prompt_name ?? `${node.label}-prompt`));
+    nextNode.prompt_name = promptName;
+    nextNode.config = {
+      ...nextConfig,
+      prompt_name: promptName,
+    };
+  }
+
+  return nextNode;
+}
+
 export function createWireJunctionNode(graph: GraphDefinition, position: GraphPosition): GraphNode {
   const id = uniqueNodeId(graph, "wire-junction");
   return {
@@ -281,10 +323,16 @@ export function isMcpContextProviderNode(node: GraphNode | null | undefined): bo
   return Boolean(node && node.kind === "mcp_context_provider");
 }
 
+export function isApiModelNode(node: GraphNode | null | undefined): boolean {
+  return Boolean(node && node.kind === "model");
+}
+
 export const TOOL_SUCCESS_HANDLE_ID = "tool-success";
 export const TOOL_FAILURE_HANDLE_ID = "tool-failure";
 export const TOOL_CONTEXT_HANDLE_ID = "tool-context";
 export const API_TOOL_CONTEXT_HANDLE_ID = "api-tool-context";
+export const API_TOOL_CALL_HANDLE_ID = "api-tool-call";
+export const API_MESSAGE_HANDLE_ID = "api-message";
 
 export function defaultToolFailureCondition(edgeId: string): GraphEdge["condition"] {
   return {
@@ -296,8 +344,52 @@ export function defaultToolFailureCondition(edgeId: string): GraphEdge["conditio
   };
 }
 
+export function defaultApiToolCallCondition(edgeId: string): GraphEdge["condition"] {
+  return {
+    id: `${edgeId}-condition`,
+    label: "Tool call output",
+    type: "result_payload_path_equals",
+    value: "tool_call_envelope",
+    path: "metadata.contract",
+  };
+}
+
+export function defaultApiMessageCondition(edgeId: string): GraphEdge["condition"] {
+  return {
+    id: `${edgeId}-condition`,
+    label: "Message output",
+    type: "result_payload_path_equals",
+    value: "message_envelope",
+    path: "metadata.contract",
+  };
+}
+
+export function isApiOutputHandleId(handleId: string | null | undefined): boolean {
+  return handleId === API_TOOL_CALL_HANDLE_ID || handleId === API_MESSAGE_HANDLE_ID;
+}
+
 export function inferToolEdgeSourceHandle(edge: GraphEdge, sourceNode: GraphNode | null | undefined): string | null {
   if (!sourceNode) {
+    return edge.source_handle_id ?? null;
+  }
+  if (isApiModelNode(sourceNode)) {
+    if (edge.source_handle_id === API_TOOL_CALL_HANDLE_ID || edge.source_handle_id === API_MESSAGE_HANDLE_ID) {
+      return edge.source_handle_id;
+    }
+    if (
+      edge.condition?.type === "result_payload_path_equals" &&
+      edge.condition.path === "metadata.contract" &&
+      edge.condition.value === "tool_call_envelope"
+    ) {
+      return API_TOOL_CALL_HANDLE_ID;
+    }
+    if (
+      edge.condition?.type === "result_payload_path_equals" &&
+      edge.condition.path === "metadata.contract" &&
+      edge.condition.value === "message_envelope"
+    ) {
+      return API_MESSAGE_HANDLE_ID;
+    }
     return edge.source_handle_id ?? null;
   }
   if (isMcpContextProviderNode(sourceNode)) {
@@ -316,6 +408,12 @@ export function inferToolEdgeSourceHandle(edge: GraphEdge, sourceNode: GraphNode
 }
 
 export function getToolSourceHandleAnchorRatio(handleId: string | null | undefined): number {
+  if (handleId === API_TOOL_CALL_HANDLE_ID) {
+    return 0.4;
+  }
+  if (handleId === API_MESSAGE_HANDLE_ID) {
+    return 0.68;
+  }
   if (handleId === TOOL_CONTEXT_HANDLE_ID) {
     return 0.86;
   }
@@ -361,9 +459,21 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
     }),
     edges: graph.edges.map((edge) => ({
       ...edge,
+      source_handle_id: edge.source_handle_id ?? null,
       target_handle_id: edge.target_handle_id ?? null,
       waypoints: edge.waypoints?.map((waypoint) => ({ ...waypoint })),
-      condition: edge.kind === "conditional" ? edge.condition ?? defaultConditionalCondition(edge.id) : null,
+      kind:
+        edge.source_handle_id === API_TOOL_CALL_HANDLE_ID || edge.source_handle_id === API_MESSAGE_HANDLE_ID
+          ? "conditional"
+          : edge.kind,
+      condition:
+        edge.source_handle_id === API_TOOL_CALL_HANDLE_ID
+          ? edge.condition ?? defaultApiToolCallCondition(edge.id)
+          : edge.source_handle_id === API_MESSAGE_HANDLE_ID
+            ? edge.condition ?? defaultApiMessageCondition(edge.id)
+            : edge.kind === "conditional"
+              ? edge.condition ?? defaultConditionalCondition(edge.id)
+              : null,
     })),
   };
 }

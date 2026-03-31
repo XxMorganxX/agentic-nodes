@@ -628,7 +628,12 @@ export function GraphInspector({
                 >
                   <option value="message">message</option>
                   <option value="tool_call">tool_call</option>
+                  <option value="auto">auto</option>
                 </select>
+                <small>
+                  API nodes now expose separate Tool Call and Message outputs on the canvas. `auto` is the recommended
+                  compatibility mode for split routing, while `message` and `tool_call` force a single envelope type.
+                </small>
               </label>
               <div className="checkbox-grid">
                 <strong>Direct Registry Tools</strong>
@@ -810,40 +815,50 @@ export function GraphInspector({
           ) : null}
           {selectedNode.kind === "data" ? (
             <>
-              <label>
-                Data Mode
-                <select
-                  value={String(selectedNode.config.mode ?? "passthrough")}
-                  onChange={(event) =>
-                    onGraphChange(
-                      updateNode(graph, selectedNode.id, (node) => ({
-                        ...node,
-                        config: { ...node.config, mode: event.target.value },
-                      })),
-                    )
-                  }
-                >
-                  <option value="passthrough">passthrough</option>
-                  <option value="template">template</option>
-                </select>
-              </label>
-              {String(selectedNode.config.mode ?? "passthrough") === "template" ? (
-                <label>
-                  Template
-                  <textarea
-                    rows={4}
-                    value={String(selectedNode.config.template ?? "{input_payload}")}
-                    onChange={(event) =>
-                      onGraphChange(
-                        updateNode(graph, selectedNode.id, (node) => ({
-                          ...node,
-                          config: { ...node.config, template: event.target.value },
-                        })),
-                      )
-                    }
-                  />
-                </label>
-              ) : null}
+              {selectedNode.provider_id === "core.data_display" ? (
+                <div className="inspector-meta">
+                  <span>Display mode: visualizer envelope inspection</span>
+                  <span>Behavior: passes the original payload through unchanged</span>
+                  <span>Visualizer: shows the full incoming envelope under node output details</span>
+                </div>
+              ) : (
+                <>
+                  <label>
+                    Data Mode
+                    <select
+                      value={String(selectedNode.config.mode ?? "passthrough")}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: { ...node.config, mode: event.target.value },
+                          })),
+                        )
+                      }
+                    >
+                      <option value="passthrough">passthrough</option>
+                      <option value="template">template</option>
+                    </select>
+                  </label>
+                  {String(selectedNode.config.mode ?? "passthrough") === "template" ? (
+                    <label>
+                      Template
+                      <textarea
+                        rows={4}
+                        value={String(selectedNode.config.template ?? "{input_payload}")}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: { ...node.config, template: event.target.value },
+                            })),
+                          )
+                        }
+                      />
+                    </label>
+                  ) : null}
+                </>
+              )}
             </>
           ) : null}
           {onSaveNode ? (

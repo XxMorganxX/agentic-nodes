@@ -16,7 +16,11 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from graph_agent.api.manager import GraphRunManager
-from graph_agent.examples.tool_schema_repair import build_example_graph_payload, build_example_services
+from graph_agent.examples.tool_schema_repair import (
+    build_auto_branching_graph_payload,
+    build_example_graph_payload,
+    build_example_services,
+)
 from graph_agent.providers.base import ModelMessage, ModelRequest, ModelToolCall, ModelToolDefinition
 from graph_agent.providers.base import ModelProvider, ModelResponse, ProviderPreflightResult
 from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
@@ -283,7 +287,81 @@ class McpDispatchProvider(ModelProvider):
         return ProviderPreflightResult(status="available", ok=True, message="ok")
 
 
+class AutoMessageProvider(ModelProvider):
+    name = "auto_message"
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        return ModelResponse(
+            content="A direct reply is enough.",
+            structured_output={"message": "A direct reply is enough."},
+            metadata={"variant": "message"},
+        )
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+
+class AutoToolCallProvider(ModelProvider):
+    name = "auto_tool_call"
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        return ModelResponse(
+            content="",
+            structured_output={"location": "Austin"},
+            tool_calls=[
+                ModelToolCall(
+                    tool_name="weather_current",
+                    arguments={"location": "Austin"},
+                    provider_tool_id="auto-tool-1",
+                    metadata={"variant": "tool_call"},
+                )
+            ],
+            metadata={"variant": "tool_call"},
+        )
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+
+class AutoMixedProvider(ModelProvider):
+    name = "auto_mixed"
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        return ModelResponse(
+            content="Checking the live weather tool now.",
+            structured_output={"location": "Austin"},
+            tool_calls=[
+                ModelToolCall(
+                    tool_name="weather_current",
+                    arguments={"location": "Austin"},
+                    provider_tool_id="auto-mixed-1",
+                    metadata={"variant": "mixed"},
+                )
+            ],
+            metadata={"variant": "mixed"},
+        )
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+
 class ModelProviderTests(unittest.TestCase):
+    def _build_auto_branch_graph(self, provider_name: str, provider: ModelProvider | None = None) -> tuple[Any, GraphRuntime, dict[str, Any]]:
+        services = build_example_services()
+        if provider is not None:
+            services.model_providers[provider_name] = provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = build_auto_branching_graph_payload()
+        for node in graph_payload["nodes"]:
+            if node["id"] == "model":
+                node["model_provider_name"] = provider_name
+                node["config"]["provider_name"] = provider_name
+        return services, runtime, graph_payload
+
     def test_openai_provider_normalizes_tool_calls_for_tool_call_nodes(self) -> None:
         provider = StubOpenAIProvider()
         request = ModelRequest(
@@ -1012,6 +1090,180 @@ class ModelProviderTests(unittest.TestCase):
                     assert isinstance(payload, dict)
                     self.assertEqual(payload["resolved_location"], "Testville")
                     self.assertEqual(payload["condition"], "Partly cloudy")
+            finally:
+                manager.stop_background_services()
+
+    def test_auto_mode_emits_message_envelope_for_message_only_responses(self) -> None:
+        services, runtime, graph_payload = self._build_auto_branch_graph("auto_message", AutoMessageProvider())
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "say hi"}, run_id="run-auto-message")
+                    self.assertEqual(state.status, "completed")
+                    self.assertEqual(state.final_output, {"message": "A direct reply is enough."})
+                    model_output = state.node_outputs["model"]
+                    assert isinstance(model_output, dict)
+                    self.assertEqual(model_output["metadata"]["contract"], "message_envelope")
+                    self.assertEqual(model_output["payload"], {"message": "A direct reply is enough."})
+                    self.assertEqual(model_output["tool_calls"], [])
+            finally:
+                manager.stop_background_services()
+
+    def test_auto_mode_routes_tool_call_responses_to_mcp_executor(self) -> None:
+        services, runtime, graph_payload = self._build_auto_branch_graph("auto_tool_call", AutoToolCallProvider())
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-auto-tool-call")
+                    self.assertEqual(state.status, "completed")
+                    payload = state.final_output
+                    assert isinstance(payload, dict)
+                    self.assertEqual(payload["resolved_location"], "Testville")
+                    self.assertEqual(payload["condition"], "Partly cloudy")
+                    model_output = state.node_outputs["model"]
+                    assert isinstance(model_output, dict)
+                    self.assertEqual(model_output["metadata"]["contract"], "tool_call_envelope")
+                    self.assertEqual(model_output["payload"], None)
+                    self.assertEqual(model_output["tool_calls"][0]["tool_name"], "weather_current")
+                    tool_call_edge = next(edge for edge in graph_payload["edges"] if edge["id"] == "edge-model-executor")
+                    self.assertEqual(tool_call_edge["source_handle_id"], "api-tool-call")
+            finally:
+                manager.stop_background_services()
+
+    def test_auto_mode_prefers_tool_call_routing_when_message_and_tool_call_are_both_present(self) -> None:
+        services, runtime, graph_payload = self._build_auto_branch_graph("auto_mixed", AutoMixedProvider())
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-auto-mixed")
+                    self.assertEqual(state.status, "completed")
+                    payload = state.final_output
+                    assert isinstance(payload, dict)
+                    self.assertEqual(payload["resolved_location"], "Testville")
+                    model_output = state.node_outputs["model"]
+                    assert isinstance(model_output, dict)
+                    self.assertEqual(model_output["metadata"]["contract"], "tool_call_envelope")
+                    self.assertEqual(model_output["artifacts"]["assistant_message"], "Checking the live weather tool now.")
+                    self.assertEqual(model_output["tool_calls"][0]["tool_name"], "weather_current")
+            finally:
+                manager.stop_background_services()
+
+    def test_mcp_executor_validation_rejects_auto_mode_sources_without_tool_call_condition(self) -> None:
+        services, _runtime, graph_payload = self._build_auto_branch_graph("mock")
+        for edge in graph_payload["edges"]:
+            if edge["id"] == "edge-model-executor":
+                edge["kind"] = "standard"
+                edge["condition"] = None
+
+        with self.assertRaises(GraphValidationError):
+            GraphDefinition.from_dict(graph_payload).validate_against_services(services)
+
+    def test_mcp_executor_validation_rejects_api_message_output_routes(self) -> None:
+        services, _runtime, graph_payload = self._build_auto_branch_graph("mock")
+        for edge in graph_payload["edges"]:
+            if edge["id"] == "edge-model-finish":
+                edge["target_id"] = "executor"
+
+        with self.assertRaises(GraphValidationError):
+            GraphDefinition.from_dict(graph_payload).validate_against_services(services)
+
+    def test_legacy_auto_branch_graphs_without_api_output_handles_still_run(self) -> None:
+        services, runtime, graph_payload = self._build_auto_branch_graph("auto_tool_call", AutoToolCallProvider())
+        for edge in graph_payload["edges"]:
+            if edge["source_id"] == "model":
+                edge["source_handle_id"] = None
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-legacy-auto-tool-call")
+                    self.assertEqual(state.status, "completed")
+                    payload = state.final_output
+                    assert isinstance(payload, dict)
+                    self.assertEqual(payload["resolved_location"], "Testville")
+                    self.assertEqual(payload["condition"], "Partly cloudy")
+            finally:
+                manager.stop_background_services()
+
+    def test_display_node_preserves_tool_call_contract_for_downstream_executor(self) -> None:
+        services, runtime, graph_payload = self._build_auto_branch_graph("auto_tool_call", AutoToolCallProvider())
+        graph_payload["nodes"].insert(
+            4,
+            {
+                "id": "display",
+                "kind": "data",
+                "category": "data",
+                "label": "Display Envelope",
+                "provider_id": "core.data_display",
+                "provider_label": "Envelope Display Node",
+                "config": {
+                    "mode": "passthrough",
+                    "show_input_envelope": True,
+                    "lock_passthrough": True,
+                },
+                "position": {"x": 900, "y": 120},
+            },
+        )
+        for edge in graph_payload["edges"]:
+            if edge["id"] == "edge-model-executor":
+                edge["target_id"] = "display"
+            if edge["id"] == "edge-model-finish":
+                edge["priority"] = 30
+        graph_payload["edges"].append(
+            {
+                "id": "edge-display-executor",
+                "source_id": "display",
+                "target_id": "executor",
+                "label": "forward tool call",
+                "kind": "standard",
+                "priority": 100,
+                "condition": None,
+            }
+        )
+
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-display-tool-call")
+                    self.assertEqual(state.status, "completed")
+                    payload = state.final_output
+                    assert isinstance(payload, dict)
+                    self.assertEqual(payload["resolved_location"], "Testville")
+                    self.assertEqual(payload["condition"], "Partly cloudy")
+                    display_output = state.node_outputs["display"]
+                    assert isinstance(display_output, dict)
+                    self.assertEqual(display_output["metadata"]["contract"], "tool_call_envelope")
+                    self.assertEqual(display_output["tool_calls"][0]["tool_name"], "weather_current")
+                    self.assertEqual(display_output["artifacts"]["display_envelope"]["metadata"]["contract"], "tool_call_envelope")
             finally:
                 manager.stop_background_services()
 

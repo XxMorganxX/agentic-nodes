@@ -336,6 +336,13 @@ function appendOutputSections(sections: AgentRunMilestoneDataSection[], output: 
     sections.push({ label: "Output errors", value: output.errors });
     added = true;
   }
+  if (isRecord(output.artifacts) && "display_envelope" in output.artifacts) {
+    sections.push({ label: "Display envelope", value: output.artifacts.display_envelope });
+    added = true;
+  } else if ("artifacts" in output && output.artifacts !== undefined && !isRecord(output.artifacts)) {
+    sections.push({ label: "Output artifacts", value: output.artifacts });
+    added = true;
+  }
   if ("metadata" in output && output.metadata !== undefined) {
     sections.push({ label: "Output metadata", value: output.metadata });
     added = true;

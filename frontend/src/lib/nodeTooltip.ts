@@ -53,6 +53,16 @@ function formatList(values: string[]): string {
   return values.length > 0 ? values.join(", ") : "None";
 }
 
+function describeResponseMode(value: string | null | undefined): string {
+  if (value === "tool_call") {
+    return "tool_call (always emit tool-call envelope)";
+  }
+  if (value === "auto") {
+    return "auto (emit tool-call or message envelope)";
+  }
+  return "message (always emit message envelope)";
+}
+
 function truncate(value: string, limit = 96): string {
   if (value.length <= limit) {
     return value;
@@ -328,7 +338,9 @@ export function buildNodeTooltip(
             { label: "Provider", value: asString(node.config.provider_name) ?? node.model_provider_name ?? "Not set" },
             { label: "Model", value: asString(node.config.model) ?? "Default" },
             { label: "Prompt", value: asString(node.config.prompt_name) ?? node.prompt_name ?? "Not set" },
-            { label: "Response", value: asString(node.config.response_mode) ?? "message" },
+            { label: "Response", value: describeResponseMode(asString(node.config.response_mode)) },
+            { label: "Tool Call Output", value: "Routes structured tool-call envelopes to tool nodes" },
+            { label: "Message Output", value: "Routes normal assistant/message envelopes to api, data, or end nodes" },
             { label: "Allowed Tools", value: allowedTools.length > 0 ? formatList(allowedTools) : "None" },
             { label: "Preferred Tool", value: preferredTool ?? "None" },
           ],
@@ -340,6 +352,7 @@ export function buildNodeTooltip(
   }
 
   if (node.kind === "data") {
+    const isDisplayNode = node.provider_id === "core.data_display";
     return {
       title: node.label,
       eyebrow: `${node.category} / ${node.kind}`,
@@ -348,8 +361,8 @@ export function buildNodeTooltip(
         {
           title: "Configuration",
           rows: [
-            { label: "Mode", value: asString(node.config.mode) ?? "passthrough" },
-            { label: "Template", value: truncate(asString(node.config.template) ?? "{input_payload}") },
+            { label: "Mode", value: isDisplayNode ? "display envelope passthrough" : (asString(node.config.mode) ?? "passthrough") },
+            { label: "Template", value: isDisplayNode ? "Disabled for display-only provider" : truncate(asString(node.config.template) ?? "{input_payload}") },
           ],
         },
         ...baseSections,

@@ -427,92 +427,98 @@ export default function App() {
     <main className="app-shell">
       <div ref={executionBoxRef} className="hero-section">
         <div className="hero-mosaic">
-          <div className="mosaic-tile panel mosaic-title">
-            <h1>Graph Agent Studio</h1>
-            <p>{isEnvironment ? "Compose a test environment with isolated agents and drill into each run." : "Drag nodes into the canvas, wire edges, and launch your agent."}</p>
-            <div className="mosaic-title-actions">
-              <button type="button" className="secondary-button" onClick={handleCreateGraph}>
-                New Agent
-              </button>
-              <button type="button" className="secondary-button" onClick={() => void saveCurrentGraph()} disabled={!draftGraph || isSaving}>
-                {isSaving ? "Saving..." : "Save"}
-              </button>
-              <button type="button" className="secondary-button" onClick={history.undo} disabled={!history.canUndo} title="Undo (⌘Z)">
-                Undo
-              </button>
-              <button type="button" className="secondary-button" onClick={history.redo} disabled={!history.canRedo} title="Redo (⌘⇧Z)">
-                Redo
-              </button>
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => canvasGraph && handleCanvasGraphChange(layoutGraphLR(canvasGraph))}
-                disabled={!canvasGraph || canvasGraph.nodes.length === 0}
-              >
-                Auto Layout
-              </button>
-              <button type="button" className="danger-button" onClick={() => void handleDeleteGraph()} disabled={!draftGraph}>
-                Delete
-              </button>
+          <div className="hero-main-column">
+            <div className="hero-main-row">
+              <div className="mosaic-tile panel mosaic-title">
+                <h1>Graph Agent Studio</h1>
+                <p>{isEnvironment ? "Compose a test environment with isolated agents and drill into each run." : "Drag nodes into the canvas, wire edges, and launch your agent."}</p>
+                <div className="mosaic-title-actions">
+                  <button type="button" className="secondary-button" onClick={handleCreateGraph}>
+                    New Agent
+                  </button>
+                  <button type="button" className="secondary-button" onClick={() => void saveCurrentGraph()} disabled={!draftGraph || isSaving}>
+                    {isSaving ? "Saving..." : "Save"}
+                  </button>
+                  <button type="button" className="secondary-button" onClick={history.undo} disabled={!history.canUndo} title="Undo (⌘Z)">
+                    Undo
+                  </button>
+                  <button type="button" className="secondary-button" onClick={history.redo} disabled={!history.canRedo} title="Redo (⌘⇧Z)">
+                    Redo
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => canvasGraph && handleCanvasGraphChange(layoutGraphLR(canvasGraph))}
+                    disabled={!canvasGraph || canvasGraph.nodes.length === 0}
+                  >
+                    Auto Layout
+                  </button>
+                  <button type="button" className="danger-button" onClick={() => void handleDeleteGraph()} disabled={!draftGraph}>
+                    Delete
+                  </button>
+                </div>
+              </div>
+
+              <div className="mosaic-tile panel mosaic-graph">
+                <label>
+                  Graph
+                  <select
+                    value={selectedGraphId || "__draft__"}
+                    onChange={(event) => {
+                      if (event.target.value === "__draft__") {
+                        handleCreateGraph();
+                        return;
+                      }
+                      setSelectedGraphId(event.target.value);
+                    }}
+                  >
+                    {!selectedGraphId ? <option value="__draft__">Unsaved Draft</option> : null}
+                    {graphs.map((graph) => (
+                      <option key={graph.graph_id} value={graph.graph_id}>
+                        {graph.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            <div className="mosaic-tile panel mosaic-execution">
+              <label className="mosaic-execution-input">
+                Input
+                <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={10} />
+              </label>
+              <div className="mosaic-execution-run">
+                <button type="button" onClick={() => void handleRun()} disabled={!draftGraph || isRunning || isSaving}>
+                  {isRunning ? "Running..." : isEnvironment ? "Run Environment" : "Run Graph"}
+                </button>
+                {selectedRunId ? <code>Run ID: {selectedRunId}</code> : <p>Ready to launch the selected graph.</p>}
+                {error ? <p className="error-text">{error}</p> : null}
+              </div>
             </div>
           </div>
 
-          <div className="mosaic-tile panel mosaic-graph">
-            <label>
-              Graph
-              <select
-                value={selectedGraphId || "__draft__"}
-                onChange={(event) => {
-                  if (event.target.value === "__draft__") {
-                    handleCreateGraph();
-                    return;
-                  }
-                  setSelectedGraphId(event.target.value);
-                }}
-              >
-                {!selectedGraphId ? <option value="__draft__">Unsaved Draft</option> : null}
-                {graphs.map((graph) => (
-                  <option key={graph.graph_id} value={graph.graph_id}>
-                    {graph.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-
-          <div className="mosaic-tile panel mosaic-execution">
-            <label className="mosaic-execution-input">
-              Input
-              <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={10} />
-            </label>
-            <div className="mosaic-execution-run">
-              <button type="button" onClick={() => void handleRun()} disabled={!draftGraph || isRunning || isSaving}>
-                {isRunning ? "Running..." : isEnvironment ? "Run Environment" : "Run Graph"}
-              </button>
-              {selectedRunId ? <code>Run ID: {selectedRunId}</code> : <p>Ready to launch the selected graph.</p>}
-              {error ? <p className="error-text">{error}</p> : null}
+          <div className="hero-side-column">
+            <div className="mosaic-tile panel mosaic-env">
+              <h2>Environment</h2>
+              <GraphEnvEditor graph={draftGraph} onGraphChange={setDraftGraph} />
             </div>
-          </div>
 
-          <div className="mosaic-tile panel mosaic-env">
-            <h2>Environment</h2>
-            <GraphEnvEditor graph={draftGraph} onGraphChange={setDraftGraph} />
+            {(catalog?.mcp_servers?.length ?? 0) > 0 ? (
+              <div className="mosaic-tile panel mosaic-mcp">
+                <McpServerPanel
+                  catalog={catalog}
+                  onBootMcpServer={(serverId) => void runMcpAction(`boot:${serverId}`, () => bootMcpServer(serverId))}
+                  onStopMcpServer={(serverId) => void runMcpAction(`stop:${serverId}`, () => stopMcpServer(serverId))}
+                  onRefreshMcpServer={(serverId) => void runMcpAction(`refresh:${serverId}`, () => refreshMcpServer(serverId))}
+                  onToggleMcpTool={(toolName, enabled) => void runMcpAction(`tool:${toolName}`, () => setMcpToolEnabled(toolName, enabled))}
+                  mcpPendingKey={mcpPendingKey}
+                  title="Project MCP"
+                  description="Manage project-level MCP servers. Tool and model nodes can consume these tools, but they do not own the server lifecycle."
+                />
+              </div>
+            ) : null}
           </div>
-
-          {(catalog?.mcp_servers?.length ?? 0) > 0 ? (
-            <div className="mosaic-tile panel mosaic-mcp">
-              <McpServerPanel
-                catalog={catalog}
-                onBootMcpServer={(serverId) => void runMcpAction(`boot:${serverId}`, () => bootMcpServer(serverId))}
-                onStopMcpServer={(serverId) => void runMcpAction(`stop:${serverId}`, () => stopMcpServer(serverId))}
-                onRefreshMcpServer={(serverId) => void runMcpAction(`refresh:${serverId}`, () => refreshMcpServer(serverId))}
-                onToggleMcpTool={(toolName, enabled) => void runMcpAction(`tool:${toolName}`, () => setMcpToolEnabled(toolName, enabled))}
-                mcpPendingKey={mcpPendingKey}
-                title="Project MCP"
-                description="Manage project-level MCP servers. Tool and model nodes can consume these tools, but they do not own the server lifecycle."
-              />
-            </div>
-          ) : null}
         </div>
 
         {environmentRunSummary ? <EnvironmentRunSummary summary={environmentRunSummary} /> : null}

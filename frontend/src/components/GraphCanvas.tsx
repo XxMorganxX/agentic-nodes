@@ -22,16 +22,23 @@ import { ProviderSummary } from "./ProviderSummary";
 import { ProviderDetailsModal } from "./ProviderDetailsModal";
 import { ToolDetailsModal } from "./ToolDetailsModal";
 import {
+  API_MESSAGE_HANDLE_ID,
+  API_TOOL_CALL_HANDLE_ID,
   API_TOOL_CONTEXT_HANDLE_ID,
   canConnectNodes,
   createNodeFromProvider,
   createNodeFromSaved,
   createWireJunctionNode,
+  defaultApiMessageCondition,
+  defaultApiToolCallCondition,
   defaultConditionalCondition,
   defaultToolFailureCondition,
+  duplicateGraphNode,
   getApiToolContextTargetAnchorRatio,
   getToolSourceHandleAnchorRatio,
   inferToolEdgeSourceHandle,
+  isApiModelNode,
+  isApiOutputHandleId,
   isMcpContextProviderNode,
   isRoutableToolNode,
   isWireJunctionNode,
@@ -132,6 +139,13 @@ type PlacementState =
       position: GraphPosition;
     };
 
+type NodeClipboardState = {
+  node: GraphNode;
+  pasteCount: number;
+};
+
+const NODE_CLIPBOARD_PASTE_OFFSET = 48;
+
 const KIND_COLORS: Record<string, string> = {
   input: "#8486a5",
   model: "#6c5ce7",
@@ -199,6 +213,20 @@ const TOOL_EDGE_TONES = {
     targetColor: "#ff6b9f",
     markerColor: "#ff8a8a",
     routeTone: "tool-failure" as const,
+  },
+};
+const API_EDGE_TONES = {
+  toolCall: {
+    sourceColor: "#f4a8ff",
+    targetColor: "#d97bff",
+    markerColor: "#f4a8ff",
+    routeTone: "api-tool-call" as const,
+  },
+  message: {
+    sourceColor: "#7eb8ff",
+    targetColor: "#55a3ff",
+    markerColor: "#7eb8ff",
+    routeTone: "api-message" as const,
   },
 };
 const JUNCTION_NODE_STYLE = {
@@ -559,6 +587,7 @@ export function GraphCanvas({
   const canvasZoomRef = useRef(1);
   const graphRef = useRef<GraphDefinition | null>(graph);
   const draftConnectionRef = useRef<DraftConnectionState | null>(draftConnection);
+  const nodeClipboardRef = useRef<NodeClipboardState | null>(null);
   const draftWirePathRef = useRef<SVGPathElement | null>(null);
   const draftPreviewPointerPositionRef = useRef<GraphPosition | null>(null);
   const draftSnapTargetNodeIdRef = useRef<string | null>(null);
@@ -732,6 +761,11 @@ export function GraphCanvas({
     }
     const tag = target.tagName;
     return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
+  }, []);
+
+  const hasSelectedText = useCallback((): boolean => {
+    const selection = window.getSelection();
+    return Boolean(selection && !selection.isCollapsed && selection.toString().trim().length > 0);
   }, []);
 
   const setCanvasZoom = useCallback((zoom: number) => {
@@ -1056,8 +1090,11 @@ export function GraphCanvas({
         return null;
       }
       const dimensions = getNodeDimensions(sourceNode);
-      const verticalRatio =
-        isRoutableToolNode(sourceNode) || isMcpContextProviderNode(sourceNode)
+      const verticalRatio = isApiModelNode(sourceNode)
+        ? sourceHandleId
+          ? getToolSourceHandleAnchorRatio(sourceHandleId)
+          : 0.5
+        : isRoutableToolNode(sourceNode) || isMcpContextProviderNode(sourceNode)
           ? getToolSourceHandleAnchorRatio(sourceHandleId ?? TOOL_SUCCESS_HANDLE_ID)
           : 0.5;
       return {
@@ -1100,6 +1137,17 @@ export function GraphCanvas({
 
       graph.nodes.forEach((node) => {
         if (!canConnectNodes(sourceNode, node, catalog)) {
+          return;
+        }
+        if (
+          isApiModelNode(sourceNode) &&
+          sourceHandleId === API_TOOL_CALL_HANDLE_ID &&
+          node.category !== "tool" &&
+          !(node.category === "data" && node.provider_id === "core.data_display")
+        ) {
+          return;
+        }
+        if (isApiModelNode(sourceNode) && sourceHandleId === API_MESSAGE_HANDLE_ID && node.category === "tool") {
           return;
         }
         const targetHandleId =
@@ -1199,6 +1247,15 @@ export function GraphCanvas({
     (sourceNode: GraphNode | undefined, sourceHandleId: string | null) => {
       if (isMcpContextProviderNode(sourceNode)) {
         return TOOL_CONTEXT_HANDLE_ID;
+      }
+      if (isApiModelNode(sourceNode)) {
+        if (sourceHandleId === API_MESSAGE_HANDLE_ID) {
+          return API_MESSAGE_HANDLE_ID;
+        }
+        if (sourceHandleId === API_TOOL_CALL_HANDLE_ID) {
+          return API_TOOL_CALL_HANDLE_ID;
+        }
+        return sourceHandleId ?? null;
       }
       if (!isRoutableToolNode(sourceNode)) {
         return sourceHandleId ?? null;
@@ -1461,6 +1518,59 @@ export function GraphCanvas({
           priority: effectiveHandleId === TOOL_FAILURE_HANDLE_ID ? 10 : 100,
           waypoints,
           condition: effectiveHandleId === TOOL_FAILURE_HANDLE_ID ? defaultToolFailureCondition(nextEdgeId) : null,
+        };
+      }
+      if (isApiModelNode(sourceNode) && isApiOutputHandleId(effectiveSourceHandleId)) {
+        const hasToolCallOutgoing = sourceEdges.some(
+          (edge) => inferToolEdgeSourceHandle(edge, sourceNode) === API_TOOL_CALL_HANDLE_ID,
+        );
+        const hasMessageOutgoing = sourceEdges.some(
+          (edge) => inferToolEdgeSourceHandle(edge, sourceNode) === API_MESSAGE_HANDLE_ID,
+        );
+        if (effectiveSourceHandleId === API_TOOL_CALL_HANDLE_ID) {
+          if (
+            targetNode?.category !== "tool" &&
+            !(targetNode?.category === "data" && targetNode.provider_id === "core.data_display")
+          ) {
+            setEditorMessage("API tool-call output can only connect to tool nodes or Envelope Display nodes.");
+            return null;
+          }
+          if (hasToolCallOutgoing) {
+            setEditorMessage("API nodes can only have one tool-call route.");
+            return null;
+          }
+          return {
+            id: nextEdgeId,
+            source_id: sourceId,
+            target_id: targetId,
+            source_handle_id: API_TOOL_CALL_HANDLE_ID,
+            target_handle_id: effectiveTargetHandleId,
+            label: "tool call",
+            kind: "conditional",
+            priority: 10,
+            waypoints,
+            condition: defaultApiToolCallCondition(nextEdgeId),
+          };
+        }
+        if (targetNode?.category === "tool") {
+          setEditorMessage("API message output cannot connect directly to tool nodes.");
+          return null;
+        }
+        if (hasMessageOutgoing) {
+          setEditorMessage("API nodes can only have one message route.");
+          return null;
+        }
+        return {
+          id: nextEdgeId,
+          source_id: sourceId,
+          target_id: targetId,
+          source_handle_id: API_MESSAGE_HANDLE_ID,
+          target_handle_id: effectiveTargetHandleId,
+          label: "message",
+          kind: "conditional",
+          priority: 20,
+          waypoints,
+          condition: defaultApiMessageCondition(nextEdgeId),
         };
       }
       return {
@@ -2111,6 +2221,59 @@ export function GraphCanvas({
     [],
   );
 
+  const copySelectedNodeToClipboard = useCallback(() => {
+    if (!graph || !selectedNodeId) {
+      setEditorMessage("Select a node to copy.");
+      return;
+    }
+    const selectedNode = graph.nodes.find((node) => node.id === selectedNodeId);
+    if (!selectedNode) {
+      setEditorMessage("Select a node to copy.");
+      return;
+    }
+    nodeClipboardRef.current = {
+      node: JSON.parse(JSON.stringify(selectedNode)) as GraphNode,
+      pasteCount: 0,
+    };
+    setEditorMessage(`Copied ${selectedNode.label}.`);
+  }, [graph, selectedNodeId]);
+
+  const pasteNodeFromClipboard = useCallback(() => {
+    if (!graph) {
+      return;
+    }
+    if (pendingPlacement || draftConnection) {
+      setEditorMessage("Finish the current placement before pasting.");
+      return;
+    }
+    const clipboard = nodeClipboardRef.current;
+    if (!clipboard) {
+      setEditorMessage("Copy a node first.");
+      return;
+    }
+    const pasteCount = clipboard.pasteCount + 1;
+    const nextNode = duplicateGraphNode(graph, clipboard.node, {
+      position: {
+        x: clipboard.node.position.x + NODE_CLIPBOARD_PASTE_OFFSET * pasteCount,
+        y: clipboard.node.position.y + NODE_CLIPBOARD_PASTE_OFFSET * pasteCount,
+      },
+    });
+    nodeClipboardRef.current = {
+      ...clipboard,
+      pasteCount,
+    };
+    onGraphChange({
+      ...graph,
+      start_node_id: !graph.start_node_id && nextNode.category === "start" ? nextNode.id : graph.start_node_id,
+      nodes: [...graph.nodes, nextNode],
+    });
+    onSelectionChange(nextNode.id, null);
+    setTooltipNodeId(null);
+    setToolDetailsNodeId(null);
+    setProviderDetailsNodeId(null);
+    setEditorMessage(`Pasted ${nextNode.label}.`);
+  }, [draftConnection, graph, onGraphChange, onSelectionChange, pendingPlacement]);
+
   const handleDeleteSavedNode = useCallback(
     (id: string) => {
       deleteSavedNode(id);
@@ -2163,11 +2326,17 @@ export function GraphCanvas({
       return "";
     }
     const sourceNode = graph.nodes.find((node) => node.id === draftConnection.sourceNodeId);
-    if (!isRoutableToolNode(sourceNode) && !isMcpContextProviderNode(sourceNode)) {
+    if (!isRoutableToolNode(sourceNode) && !isMcpContextProviderNode(sourceNode) && !isApiModelNode(sourceNode)) {
       return "";
     }
     if (draftConnection.sourceHandleId === TOOL_CONTEXT_HANDLE_ID) {
       return " graph-draft-wire-path--tool-context";
+    }
+    if (draftConnection.sourceHandleId === API_TOOL_CALL_HANDLE_ID) {
+      return " graph-draft-wire-path--api-tool-call";
+    }
+    if (draftConnection.sourceHandleId === API_MESSAGE_HANDLE_ID) {
+      return " graph-draft-wire-path--api-message";
     }
     return draftConnection.sourceHandleId === TOOL_FAILURE_HANDLE_ID
       ? " graph-draft-wire-path--tool-failure"
@@ -2254,6 +2423,32 @@ export function GraphCanvas({
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [beginProviderPlacement, cancelDraftConnection, cancelPlacement, clearCanvasChrome, draftConnection, handleFitView, isEditableTarget, openDrawerTab, pendingPlacement, quickAddItems]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (isEditableTarget(event.target) || hasSelectedText()) {
+        return;
+      }
+      if (!(event.metaKey || event.ctrlKey) || event.altKey) {
+        return;
+      }
+      const key = event.key.toLowerCase();
+      if (key === "c") {
+        event.preventDefault();
+        copySelectedNodeToClipboard();
+        return;
+      }
+      if (key === "v") {
+        event.preventDefault();
+        pasteNodeFromClipboard();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [copySelectedNodeToClipboard, hasSelectedText, isEditableTarget, pasteNodeFromClipboard]);
 
   const nodes = useMemo<FlowNode[]>(() => {
     if (!graph) {
@@ -2450,8 +2645,11 @@ export function GraphCanvas({
         return null;
       }
       const dimensions = getNodeDimensions(sourceNode);
-      const verticalRatio =
-        isRoutableToolNode(sourceNode) || isMcpContextProviderNode(sourceNode)
+      const verticalRatio = isApiModelNode(sourceNode)
+        ? sourceHandleId
+          ? getToolSourceHandleAnchorRatio(sourceHandleId)
+          : 0.5
+        : isRoutableToolNode(sourceNode) || isMcpContextProviderNode(sourceNode)
           ? getToolSourceHandleAnchorRatio(sourceHandleId ?? TOOL_SUCCESS_HANDLE_ID)
           : 0.5;
       return {
@@ -2543,6 +2741,12 @@ export function GraphCanvas({
             : sourceHandleId === TOOL_SUCCESS_HANDLE_ID
               ? TOOL_EDGE_TONES.success
               : null
+          : isApiModelNode(sourceNode)
+            ? sourceHandleId === API_TOOL_CALL_HANDLE_ID
+              ? API_EDGE_TONES.toolCall
+              : sourceHandleId === API_MESSAGE_HANDLE_ID
+                ? API_EDGE_TONES.message
+                : null
           : null;
       const siblingIndex = siblingEdges.findIndex((candidate) => candidate.id === edge.id);
       const overlappingIndex = overlappingEdges.findIndex((candidate) => candidate.id === edge.id);
@@ -3329,6 +3533,9 @@ export function GraphCanvas({
               </span>
               <span>
                 <strong>Space / F</strong> recenter camera
+              </span>
+              <span>
+                <strong>Cmd/Ctrl+C, Cmd/Ctrl+V</strong> copy and paste selected node
               </span>
               <span>
                 <strong>L</strong> pan lock

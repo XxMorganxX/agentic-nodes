@@ -5,6 +5,8 @@ from collections.abc import Callable
 from uuid import uuid4
 
 from graph_agent.runtime.core import (
+    API_MESSAGE_HANDLE_ID,
+    API_TOOL_CALL_HANDLE_ID,
     Edge,
     GraphDefinition,
     NodeContext,
@@ -177,6 +179,7 @@ class GraphRuntime:
         result: NodeExecutionResult,
     ) -> Edge | None:
         outgoing = graph.get_outgoing_edges(node_id)
+        outgoing = self._filter_api_output_edges(graph, node_id, outgoing, result)
         conditional_edges = [edge for edge in outgoing if edge.kind == "conditional"]
         standard_edges = [edge for edge in outgoing if edge.kind == "standard"]
 
@@ -206,6 +209,35 @@ class GraphRuntime:
             return standard_edges[0]
 
         return None
+
+    def _result_contract(self, result: NodeExecutionResult) -> str | None:
+        output = result.output
+        if not isinstance(output, dict):
+            return None
+        metadata = output.get("metadata")
+        if not isinstance(metadata, dict):
+            return None
+        contract = metadata.get("contract")
+        return contract if isinstance(contract, str) and contract else None
+
+    def _filter_api_output_edges(
+        self,
+        graph: GraphDefinition,
+        node_id: str,
+        outgoing: list[Edge],
+        result: NodeExecutionResult,
+    ) -> list[Edge]:
+        source_node = graph.get_node(node_id)
+        if source_node.kind != "model":
+            return outgoing
+        if not any(edge.source_handle_id in {API_TOOL_CALL_HANDLE_ID, API_MESSAGE_HANDLE_ID} for edge in outgoing):
+            return outgoing
+        contract = self._result_contract(result)
+        if contract == "tool_call_envelope":
+            return [edge for edge in outgoing if edge.source_handle_id != API_MESSAGE_HANDLE_ID]
+        if contract == "message_envelope":
+            return [edge for edge in outgoing if edge.source_handle_id != API_TOOL_CALL_HANDLE_ID]
+        return [edge for edge in outgoing if edge.source_handle_id not in {API_TOOL_CALL_HANDLE_ID, API_MESSAGE_HANDLE_ID}]
 
     def fail_run(self, state: RunState, summary: str, error: dict[str, Any]) -> RunState:
         state.status = "failed"

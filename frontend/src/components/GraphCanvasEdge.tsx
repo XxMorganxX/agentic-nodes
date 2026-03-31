@@ -18,7 +18,7 @@ export type GraphCanvasEdgeData = {
   routePoints?: GraphPosition[];
   sourceColor?: string;
   targetColor?: string;
-  routeTone?: "tool-success" | "tool-failure";
+  routeTone?: "tool-success" | "tool-failure" | "api-tool-call" | "api-message";
   routeShiftX?: number;
   routeShiftY?: number;
   showWaypointHandles?: boolean;
