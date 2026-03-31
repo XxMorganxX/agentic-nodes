@@ -77,6 +77,20 @@ export type TestEnvironmentDefinition = {
 
 export type GraphDocument = GraphDefinition | TestEnvironmentDefinition;
 
+export type ProviderConfigFieldDefinition = {
+  key: string;
+  label: string;
+  input_type: string;
+  help_text: string;
+  placeholder: string;
+  options?: ProviderConfigOptionDefinition[];
+};
+
+export type ProviderConfigOptionDefinition = {
+  value: string;
+  label: string;
+};
+
 export type NodeProviderDefinition = {
   provider_id: string;
   display_name: string;
@@ -84,6 +98,9 @@ export type NodeProviderDefinition = {
   node_kind: string;
   description: string;
   capabilities: string[];
+  model_provider_name?: string | null;
+  default_config?: Record<string, unknown>;
+  config_fields?: ProviderConfigFieldDefinition[];
 };
 
 export type ToolDefinition = {
@@ -110,6 +127,29 @@ export type EditorCatalog = {
   tools: ToolDefinition[];
   connection_rules: ConnectionRule[];
   contracts: Record<string, CategoryContract>;
+  provider_statuses?: Record<string, ProviderPreflightResult>;
+};
+
+export type ProviderPreflightResult = {
+  provider_name?: string;
+  status: string;
+  ok: boolean;
+  message: string;
+  warnings?: string[];
+  details: Record<string, unknown>;
+};
+
+export type ProviderDiagnosticsResult = {
+  provider_name: string;
+  active_backend: string;
+  claude_binary_exists: boolean;
+  claude_binary_path?: string | null;
+  anthropic_api_key_present: boolean;
+  warning?: string | null;
+  child_env_sanitized: boolean;
+  sanitized_env_removed_vars: string[];
+  authentication_status: string;
+  preflight: ProviderPreflightResult;
 };
 
 export type RuntimeEvent = {

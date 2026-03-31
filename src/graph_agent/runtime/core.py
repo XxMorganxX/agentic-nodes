@@ -9,7 +9,7 @@ import re
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
-from graph_agent.providers.base import ModelProvider, ModelMessage, ModelRequest
+from graph_agent.providers.base import ModelMessage, ModelProvider, ModelRequest, ModelToolDefinition
 from graph_agent.runtime.node_providers import (
     NodeCategory,
     NodeProviderRegistry,
@@ -715,9 +715,18 @@ class ModelNode(BaseNode):
             else:
                 metadata[key] = binding
         allowed_tool_names = list(self.config.get("allowed_tool_names", []))
-        available_tools = context.available_tool_definitions(allowed_tool_names)
+        available_tool_payloads = context.available_tool_definitions(allowed_tool_names)
+        available_tools = [
+            ModelToolDefinition(
+                name=str(tool.get("name", "")),
+                description=str(tool.get("description", "")),
+                input_schema=dict(tool.get("input_schema", {})),
+            )
+            for tool in available_tool_payloads
+            if isinstance(tool, Mapping) and isinstance(tool.get("name"), str) and isinstance(tool.get("input_schema"), Mapping)
+        ]
         response_mode = str(self.config.get("response_mode", "message"))
-        metadata["available_tools"] = available_tools
+        metadata["available_tools"] = available_tool_payloads
         metadata["mode"] = self.config.get("mode", self.prompt_name)
         metadata["preferred_tool_name"] = self.config.get("preferred_tool_name")
         metadata["response_mode"] = response_mode
@@ -733,6 +742,9 @@ class ModelNode(BaseNode):
             ],
             response_schema=self.config.get("response_schema"),
             provider_config=provider_config,
+            available_tools=available_tools,
+            preferred_tool_name=str(self.config.get("preferred_tool_name", "") or "") or None,
+            response_mode=response_mode,
             metadata=metadata,
         )
         response = provider.generate(request)
@@ -747,18 +759,34 @@ class ModelNode(BaseNode):
                 "node_kind": self.kind,
                 "provider": provider.name,
                 "prompt_name": self.prompt_name,
+                "tool_call_count": len(response.tool_calls),
                 **response.metadata,
             },
         )
         if response_mode == "tool_call":
-            target_tool = self.config.get("preferred_tool_name") or (allowed_tool_names[0] if allowed_tool_names else None)
-            envelope.tool_calls = [
+            normalized_tool_calls = [
                 {
-                    "tool_name": target_tool,
-                    "arguments": output,
+                    "tool_name": tool_call.tool_name,
+                    "arguments": tool_call.arguments,
+                    "provider_tool_id": tool_call.provider_tool_id,
+                    "metadata": dict(tool_call.metadata),
                     "tool_target_node_ids": list(self.config.get("tool_target_node_ids", [])),
                 }
+                for tool_call in response.tool_calls
             ]
+            if not normalized_tool_calls and response.structured_output is not None:
+                target_tool = self.config.get("preferred_tool_name") or (allowed_tool_names[0] if allowed_tool_names else None)
+                if target_tool:
+                    normalized_tool_calls = [
+                        {
+                            "tool_name": target_tool,
+                            "arguments": response.structured_output,
+                            "provider_tool_id": None,
+                            "metadata": {"fallback": True},
+                            "tool_target_node_ids": list(self.config.get("tool_target_node_ids", [])),
+                        }
+                    ]
+            envelope.tool_calls = normalized_tool_calls
         return NodeExecutionResult(
             status="success",
             output=envelope.to_dict(),
@@ -1072,8 +1100,33 @@ class GraphDefinition:
                     raise GraphValidationError(
                         f"Model node '{node.id}' references unknown model provider '{model_provider_name}'."
                     )
-                for tool_name in node.config.get("allowed_tool_names", []):
+                allowed_tool_names = [str(tool_name) for tool_name in node.config.get("allowed_tool_names", [])]
+                for tool_name in allowed_tool_names:
                     services.tool_registry.get(str(tool_name))
+                response_mode = str(node.config.get("response_mode", "message"))
+                if response_mode == "tool_call" and not allowed_tool_names and not isinstance(
+                    node.config.get("response_schema"), Mapping
+                ):
+                    raise GraphValidationError(
+                        f"Model node '{node.id}' uses tool_call mode but does not expose any allowed tools."
+                    )
+                preferred_tool_name = str(node.config.get("preferred_tool_name", "") or "").strip()
+                if preferred_tool_name and allowed_tool_names and preferred_tool_name not in allowed_tool_names:
+                    raise GraphValidationError(
+                        f"Model node '{node.id}' prefers tool '{preferred_tool_name}', but it is not in allowed_tool_names."
+                    )
+                tool_target_node_ids = node.config.get("tool_target_node_ids", [])
+                if tool_target_node_ids:
+                    if not isinstance(tool_target_node_ids, Sequence) or isinstance(tool_target_node_ids, (str, bytes)):
+                        raise GraphValidationError(
+                            f"Model node '{node.id}' must declare tool_target_node_ids as a list of tool node ids."
+                        )
+                    for target_node_id in tool_target_node_ids:
+                        target_node = self.nodes.get(str(target_node_id))
+                        if not isinstance(target_node, ToolNode):
+                            raise GraphValidationError(
+                                f"Model node '{node.id}' references unknown tool target node '{target_node_id}'."
+                            )
             if node.kind == "tool":
                 services.tool_registry.get(str(node.config.get("tool_name", "")))
 

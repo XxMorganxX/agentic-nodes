@@ -1,4 +1,4 @@
-import type { EditorCatalog, GraphDocument, RunState } from "./types";
+import type { EditorCatalog, GraphDocument, ProviderDiagnosticsResult, ProviderPreflightResult, RunState } from "./types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
 
@@ -62,6 +62,50 @@ export async function fetchEditorCatalog(): Promise<EditorCatalog> {
     throw new Error("Failed to load editor catalog.");
   }
   return (await response.json()) as EditorCatalog;
+}
+
+export async function preflightProvider(
+  providerName: string,
+  providerConfig: Record<string, unknown>,
+  live = false,
+): Promise<ProviderPreflightResult> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/providers/preflight`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      provider_name: providerName,
+      provider_config: providerConfig,
+      live,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error("Failed to preflight provider.");
+  }
+  return (await response.json()) as ProviderPreflightResult;
+}
+
+export async function fetchProviderDiagnostics(
+  providerName: string,
+  providerConfig: Record<string, unknown>,
+  live = false,
+): Promise<ProviderDiagnosticsResult> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/providers/diagnostics`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      provider_name: providerName,
+      provider_config: providerConfig,
+      live,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error("Failed to load provider diagnostics.");
+  }
+  return (await response.json()) as ProviderDiagnosticsResult;
 }
 
 export async function startRun(graphId: string, input: string): Promise<string> {

@@ -1,12 +1,28 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from graph_agent.providers.base import ModelMessage, ModelProvider, ModelRequest, ModelResponse
+from graph_agent.providers.base import (
+    ModelMessage,
+    ModelProvider,
+    ModelRequest,
+    ModelResponse,
+    ModelToolCall,
+    ModelToolDefinition,
+    ProviderPreflightResult,
+)
+
+_HEALTHCHECK_MIN_TURNS = 2
+_ANTHROPIC_API_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
+_LOG_PREVIEW_LIMIT = 240
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _is_mapping(value: Any) -> bool:
@@ -27,6 +43,38 @@ def _number_config(config: Mapping[str, Any], key: str) -> float | int | None:
     return None
 
 
+def _bool_config(config: Mapping[str, Any], key: str, default: bool = False) -> bool:
+    value = config.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _truncate_for_log(value: str, limit: int = _LOG_PREVIEW_LIMIT) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[:limit]}..."
+
+
+def _command_preview(command: Sequence[str]) -> str:
+    preview_parts: list[str] = []
+    for index, part in enumerate(command):
+        if index > 0 and command[index - 1] in {"-p", "--system-prompt", "--json-schema"}:
+            preview_parts.append(f"<{command[index - 1].lstrip('-')}>")
+            continue
+        preview_parts.append(part)
+    return " ".join(preview_parts)
+
+
 class ClaudeCodeCLIModelProvider(ModelProvider):
     name = "claude_code"
     default_cli_path = "claude"
@@ -35,53 +83,239 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
     def generate(self, request: ModelRequest) -> ModelResponse:
         started_at = time.perf_counter()
         provider_config = self._provider_config(request)
-        response_schema = self._resolve_response_schema(request)
+        tools = self._tool_definitions(request)
+        response_schema = self._response_schema(request, tools)
         payload = self._run_command(
-            command=self._build_command(request, provider_config, response_schema),
+            command=self._build_command(request, provider_config, tools, response_schema),
             cwd=self._working_directory(provider_config),
             timeout_seconds=float(_number_config(provider_config, "timeout_seconds") or 60),
         )
         latency_ms = int((time.perf_counter() - started_at) * 1000)
-        return self._parse_response(payload, response_schema, provider_config, latency_ms)
+        return self._parse_response(payload, tools, response_schema, provider_config, latency_ms)
 
     def _provider_config(self, request: ModelRequest) -> Mapping[str, Any]:
         return request.provider_config if _is_mapping(request.provider_config) else {}
 
-    def _resolve_response_schema(self, request: ModelRequest) -> Mapping[str, Any] | None:
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        config = provider_config if _is_mapping(provider_config) else {}
+        cli_path = _string_config(config, "cli_path", self.default_cli_path)
+        working_directory = self._working_directory(config)
+        timeout_seconds = float(_number_config(config, "timeout_seconds") or 15)
+        warnings = self._billing_warnings()
+        child_env = self._child_env()
+        LOGGER.info(
+            "claude_code preflight starting: cli_path=%s cwd=%s timeout_seconds=%s check_auth=%s anthropic_api_key_present=%s sanitized_env=%s",
+            cli_path,
+            working_directory or "<workspace>",
+            timeout_seconds,
+            _bool_config(config, "check_auth", False),
+            self._anthropic_api_key_present(),
+            _ANTHROPIC_API_KEY_ENV_VAR not in child_env,
+        )
+        try:
+            completed = subprocess.run(
+                [cli_path, "--version"],
+                capture_output=True,
+                text=True,
+                check=False,
+                cwd=working_directory,
+                env=child_env,
+                timeout=min(timeout_seconds, 15),
+            )
+        except FileNotFoundError:
+            LOGGER.warning("claude_code preflight failed: cli binary not found at '%s'", cli_path)
+            return ProviderPreflightResult(
+                status="missing_cli",
+                ok=False,
+                message="Claude Code CLI was not found. Install `claude` or set `cli_path`.",
+                warnings=warnings,
+                details={"cli_path": cli_path},
+            )
+        except subprocess.TimeoutExpired:
+            LOGGER.warning("claude_code preflight failed: version check timed out after %s seconds", min(timeout_seconds, 15))
+            return ProviderPreflightResult(
+                status="timeout",
+                ok=False,
+                message="Claude Code CLI version check timed out.",
+                warnings=warnings,
+                details={"cli_path": cli_path},
+            )
+        except OSError as exc:
+            LOGGER.warning("claude_code preflight failed to start CLI: %s", exc)
+            return ProviderPreflightResult(
+                status="unavailable",
+                ok=False,
+                message=f"Claude Code CLI could not be started: {exc}",
+                warnings=warnings,
+                details={"cli_path": cli_path},
+            )
+
+        LOGGER.info(
+            "claude_code preflight version check finished: returncode=%s stdout=%s stderr=%s",
+            completed.returncode,
+            _truncate_for_log(completed.stdout.strip()),
+            _truncate_for_log(completed.stderr.strip()),
+        )
+
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+            LOGGER.warning("claude_code preflight unhealthy version check: %s", _truncate_for_log(detail))
+            return ProviderPreflightResult(
+                status="unavailable",
+                ok=False,
+                message=f"Claude Code CLI is installed but not healthy: {detail}",
+                warnings=warnings,
+                details={"cli_path": cli_path},
+            )
+
+        if not _bool_config(config, "check_auth", False):
+            version_text = completed.stdout.strip() or completed.stderr.strip()
+            LOGGER.info("claude_code preflight completed without live auth check")
+            return ProviderPreflightResult(
+                status="installed",
+                ok=True,
+                message="Claude Code CLI is installed. Run live verification to confirm auth/subscription access.",
+                warnings=warnings,
+                details={
+                    "backend_type": "claude_code",
+                    "auth_mode": "claude_code_subscription",
+                    "cli_path": cli_path,
+                    "version": version_text,
+                    "anthropic_api_key_present": self._anthropic_api_key_present(),
+                    "sanitized_child_env": True,
+                    "sanitized_env_removed_vars": [_ANTHROPIC_API_KEY_ENV_VAR],
+                },
+            )
+
+        try:
+            self._run_command(
+                command=self._healthcheck_command(config),
+                cwd=working_directory,
+                timeout_seconds=timeout_seconds,
+            )
+        except RuntimeError as exc:
+            detail = str(exc)
+            LOGGER.warning("claude_code live preflight failed: %s", _truncate_for_log(detail))
+            if self._is_auth_error(detail):
+                return ProviderPreflightResult(
+                    status="unauthenticated",
+                    ok=False,
+                    message="Claude Code CLI is installed but is not authenticated or lacks subscription access.",
+                    warnings=warnings,
+                    details={
+                        "backend_type": "claude_code",
+                        "auth_mode": "claude_code_subscription",
+                        "cli_path": cli_path,
+                        "error": detail,
+                        "anthropic_api_key_present": self._anthropic_api_key_present(),
+                        "sanitized_child_env": True,
+                        "sanitized_env_removed_vars": [_ANTHROPIC_API_KEY_ENV_VAR],
+                    },
+                )
+            return ProviderPreflightResult(
+                status="unavailable",
+                ok=False,
+                message=detail,
+                warnings=warnings,
+                details={
+                    "backend_type": "claude_code",
+                    "auth_mode": "claude_code_subscription",
+                    "cli_path": cli_path,
+                    "anthropic_api_key_present": self._anthropic_api_key_present(),
+                    "sanitized_child_env": True,
+                    "sanitized_env_removed_vars": [_ANTHROPIC_API_KEY_ENV_VAR],
+                },
+            )
+
+        LOGGER.info("claude_code live preflight succeeded")
+        return ProviderPreflightResult(
+            status="available",
+            ok=True,
+            message="Claude Code CLI is installed and responded successfully.",
+            warnings=warnings,
+            details={
+                "backend_type": "claude_code",
+                "auth_mode": "claude_code_subscription",
+                "cli_path": cli_path,
+                "anthropic_api_key_present": self._anthropic_api_key_present(),
+                "sanitized_child_env": True,
+                "sanitized_env_removed_vars": [_ANTHROPIC_API_KEY_ENV_VAR],
+            },
+        )
+
+    def _tool_definitions(self, request: ModelRequest) -> list[ModelToolDefinition]:
+        if request.available_tools:
+            return list(request.available_tools)
+        if request.response_mode != "tool_call" or not _is_mapping(request.response_schema):
+            return []
+        tool_name = request.preferred_tool_name or "emit_structured_output"
+        return [
+            ModelToolDefinition(
+                name=tool_name,
+                description="Return the structured payload for this graph node.",
+                input_schema=request.response_schema,
+            )
+        ]
+
+    def _preferred_tool_name(self, request: ModelRequest, tools: list[ModelToolDefinition]) -> str | None:
+        preferred_name = str(request.preferred_tool_name or "").strip()
+        if not preferred_name:
+            return None
+        if any(tool.name == preferred_name for tool in tools):
+            return preferred_name
+        return None
+
+    def _response_schema(
+        self,
+        request: ModelRequest,
+        tools: list[ModelToolDefinition],
+    ) -> Mapping[str, Any] | None:
+        if tools:
+            preferred_tool_name = self._preferred_tool_name(request, tools)
+            if preferred_tool_name:
+                preferred_tool = next(tool for tool in tools if tool.name == preferred_tool_name)
+                return {
+                    "type": "object",
+                    "properties": {
+                        "tool_name": {"type": "string", "const": preferred_tool.name},
+                        "arguments": dict(preferred_tool.input_schema),
+                    },
+                    "required": ["tool_name", "arguments"],
+                    "additionalProperties": False,
+                }
+            if len(tools) == 1:
+                return {
+                    "type": "object",
+                    "properties": {
+                        "tool_name": {"type": "string", "const": tools[0].name},
+                        "arguments": dict(tools[0].input_schema),
+                    },
+                    "required": ["tool_name", "arguments"],
+                    "additionalProperties": False,
+                }
+            return {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "tool_name": {"type": "string", "const": tool.name},
+                            "arguments": dict(tool.input_schema),
+                        },
+                        "required": ["tool_name", "arguments"],
+                        "additionalProperties": False,
+                    }
+                    for tool in tools
+                ]
+            }
         if _is_mapping(request.response_schema):
             return request.response_schema
-
-        if str(request.metadata.get("response_mode", "message")) != "tool_call":
-            return None
-
-        available_tools = request.metadata.get("available_tools", [])
-        if not isinstance(available_tools, list):
-            return None
-
-        preferred_name = request.metadata.get("preferred_tool_name")
-        preferred_tool = None
-        if isinstance(preferred_name, str) and preferred_name:
-            preferred_tool = next(
-                (
-                    tool
-                    for tool in available_tools
-                    if _is_mapping(tool) and tool.get("name") == preferred_name and _is_mapping(tool.get("input_schema"))
-                ),
-                None,
-            )
-        if preferred_tool is None:
-            preferred_tool = next(
-                (tool for tool in available_tools if _is_mapping(tool) and _is_mapping(tool.get("input_schema"))),
-                None,
-            )
-        if preferred_tool is None:
-            return None
-        return preferred_tool["input_schema"]
+        return None
 
     def _build_command(
         self,
         request: ModelRequest,
         provider_config: Mapping[str, Any],
+        tools: list[ModelToolDefinition],
         response_schema: Mapping[str, Any] | None,
     ) -> list[str]:
         command = [_string_config(provider_config, "cli_path", self.default_cli_path)]
@@ -115,6 +349,46 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
 
         return command
 
+    def _healthcheck_command(self, provider_config: Mapping[str, Any]) -> list[str]:
+        healthcheck_config = dict(provider_config)
+        configured_max_turns = int(_number_config(provider_config, "max_turns") or 1)
+        healthcheck_config["max_turns"] = max(configured_max_turns, _HEALTHCHECK_MIN_TURNS)
+        return self._build_command(
+            ModelRequest(
+                prompt_name="claude_code_healthcheck",
+                messages=[ModelMessage(role="user", content="Reply with a JSON object containing {\"status\":\"ok\"}.")],
+                response_schema={
+                    "type": "object",
+                    "properties": {"status": {"type": "string", "const": "ok"}},
+                    "required": ["status"],
+                    "additionalProperties": False,
+                },
+                provider_config=healthcheck_config,
+                response_mode="message",
+            ),
+            healthcheck_config,
+            [],
+            {
+                "type": "object",
+                "properties": {"status": {"type": "string", "const": "ok"}},
+                "required": ["status"],
+                "additionalProperties": False,
+            },
+        )
+
+    def _is_auth_error(self, detail: str) -> bool:
+        normalized = detail.lower()
+        auth_markers = [
+            "login",
+            "logged in",
+            "not authenticated",
+            "authentication",
+            "subscription",
+            "plan",
+            "access denied",
+        ]
+        return any(marker in normalized for marker in auth_markers)
+
     def _system_prompt(self, messages: Sequence[ModelMessage]) -> str:
         parts = [message.content for message in messages if message.role == "system" and message.content]
         return "\n\n".join(parts)
@@ -143,7 +417,32 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
             return working_directory.strip()
         return None
 
+    def _anthropic_api_key_present(self) -> bool:
+        return bool(os.environ.get(_ANTHROPIC_API_KEY_ENV_VAR, "").strip())
+
+    def _billing_warnings(self) -> list[str]:
+        if not self._anthropic_api_key_present():
+            return []
+        return [
+            "ANTHROPIC_API_KEY is set in the host environment. Claude Code can switch to API-key billing when it sees this variable, so this app removes it from Claude Code child processes to preserve subscription-backed auth."
+        ]
+
+    def _child_env(self) -> dict[str, str]:
+        child_env = dict(os.environ)
+        child_env.pop(_ANTHROPIC_API_KEY_ENV_VAR, None)
+        return child_env
+
     def _run_command(self, command: Sequence[str], cwd: str | None, timeout_seconds: float) -> Mapping[str, Any]:
+        child_env = self._child_env()
+        started_at = time.perf_counter()
+        LOGGER.info(
+            "claude_code subprocess starting: command=%s cwd=%s timeout_seconds=%s anthropic_api_key_present=%s sanitized_env=%s",
+            _command_preview(command),
+            cwd or "<workspace>",
+            timeout_seconds,
+            self._anthropic_api_key_present(),
+            _ANTHROPIC_API_KEY_ENV_VAR not in child_env,
+        )
         try:
             completed = subprocess.run(
                 list(command),
@@ -151,41 +450,65 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
                 text=True,
                 check=False,
                 cwd=cwd,
+                env=child_env,
                 timeout=timeout_seconds,
             )
         except FileNotFoundError as exc:
+            LOGGER.warning("claude_code subprocess failed: cli binary not found")
             raise RuntimeError(
                 "claude_code provider could not find the Claude Code CLI. "
                 "Install `claude` or set `cli_path` in the provider config."
             ) from exc
         except subprocess.TimeoutExpired as exc:
+            LOGGER.warning("claude_code subprocess timed out after %s seconds", int(timeout_seconds))
             raise RuntimeError(
                 f"claude_code provider timed out after {int(timeout_seconds)} seconds."
             ) from exc
         except OSError as exc:
+            LOGGER.warning("claude_code subprocess failed to start: %s", exc)
             raise RuntimeError(f"claude_code provider failed to start: {exc}") from exc
 
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
         stdout = completed.stdout.strip()
         stderr = completed.stderr.strip()
+        LOGGER.info(
+            "claude_code subprocess finished: returncode=%s elapsed_ms=%s stdout=%s stderr=%s",
+            completed.returncode,
+            elapsed_ms,
+            _truncate_for_log(stdout),
+            _truncate_for_log(stderr),
+        )
         if completed.returncode != 0:
             detail = stderr or stdout or f"exit code {completed.returncode}"
             raise RuntimeError(f"claude_code provider request failed: {detail}")
 
         if not stdout:
+            LOGGER.warning("claude_code subprocess returned no stdout")
             raise RuntimeError("claude_code provider returned no output.")
 
         try:
             payload = json.loads(stdout)
         except json.JSONDecodeError as exc:
+            LOGGER.warning("claude_code subprocess returned invalid JSON stdout=%s", _truncate_for_log(stdout))
             raise RuntimeError("claude_code provider returned invalid JSON output.") from exc
 
         if not _is_mapping(payload):
+            LOGGER.warning("claude_code subprocess returned unexpected payload type=%s", type(payload).__name__)
             raise RuntimeError("claude_code provider returned an unexpected response shape.")
+        LOGGER.info(
+            "claude_code payload parsed: keys=%s session_id=%s stop_reason=%s subtype=%s is_error=%s",
+            sorted(str(key) for key in payload.keys()),
+            payload.get("session_id"),
+            payload.get("stop_reason"),
+            payload.get("subtype"),
+            payload.get("is_error"),
+        )
         return payload
 
     def _parse_response(
         self,
         payload: Mapping[str, Any],
+        tools: list[ModelToolDefinition],
         response_schema: Mapping[str, Any] | None,
         provider_config: Mapping[str, Any],
         latency_ms: int,
@@ -196,9 +519,30 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
         if structured_output is None and response_schema is not None and content_text.strip():
             structured_output = json.loads(content_text)
 
+        normalized_tool_calls: list[ModelToolCall] = []
+        if _is_mapping(structured_output):
+            if isinstance(structured_output.get("tool_name"), str) and "arguments" in structured_output:
+                normalized_tool_calls.append(
+                    ModelToolCall(
+                        tool_name=str(structured_output["tool_name"]),
+                        arguments=structured_output.get("arguments"),
+                    )
+                )
+            elif len(tools) == 1:
+                normalized_tool_calls.append(
+                    ModelToolCall(
+                        tool_name=tools[0].name,
+                        arguments=dict(structured_output),
+                    )
+                )
+
+        if normalized_tool_calls:
+            structured_output = normalized_tool_calls[0].arguments
+
         return ModelResponse(
             content=content_text,
             structured_output=structured_output,
+            tool_calls=normalized_tool_calls,
             metadata={
                 "latency_ms": latency_ms,
                 "vendor_model": payload.get("model") or _string_config(provider_config, "model", self.default_model),

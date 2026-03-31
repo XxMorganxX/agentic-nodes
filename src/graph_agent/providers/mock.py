@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from graph_agent.providers.base import ModelProvider, ModelRequest, ModelResponse
+from typing import Any, Mapping
+
+from graph_agent.providers.base import ModelProvider, ModelRequest, ModelResponse, ProviderPreflightResult
 
 
 class MockModelProvider(ModelProvider):
@@ -42,3 +44,20 @@ class MockModelProvider(ModelProvider):
             )
 
         return ModelResponse(content="Mock provider produced no structured output.", metadata={"mode": mode})
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        check_auth = bool(provider_config and provider_config.get("check_auth"))
+        return ProviderPreflightResult(
+            status="available",
+            ok=True,
+            message=(
+                "Mock provider is always available in local development."
+                if not check_auth
+                else "Mock provider does not require live verification."
+            ),
+            details={
+                "backend_type": "mock",
+                "auth_mode": "not_applicable",
+                "supports_live_verification": False,
+            },
+        )

@@ -11,7 +11,6 @@ import {
   fetchEditorCatalog,
   fetchGraph,
   fetchGraphs,
-  fetchRun,
   startRun,
   updateGraph,
 } from "./lib/api";
@@ -148,12 +147,17 @@ function pickDefaultGraphId(graphs: GraphDocument[]): string {
   return graphs.find((graph) => graph.graph_id === DEFAULT_TEST_ENVIRONMENT_ID)?.graph_id ?? graphs[0]?.graph_id ?? "";
 }
 
+function serializeGraphSnapshot(graph: GraphDocument | null): string {
+  return graph ? JSON.stringify(normalizeGraphDocument(graph)) : "";
+}
+
 export default function App() {
   const [graphs, setGraphs] = useState<GraphDocument[]>([]);
   const [selectedGraphId, setSelectedGraphId] = useState<string>("");
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const history = useGraphHistory();
   const { graph: draftGraph, set: setDraftGraph, setQuiet: setDraftGraphQuiet, reset: resetHistory } = history;
+  const [savedGraphSnapshot, setSavedGraphSnapshot] = useState("");
   const [catalog, setCatalog] = useState<EditorCatalog | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
@@ -186,6 +190,8 @@ export default function App() {
     () => buildFocusedEventGroups(canvasGraph, filteredEvents),
     [canvasGraph, filteredEvents],
   );
+  const draftGraphSnapshot = useMemo(() => serializeGraphSnapshot(draftGraph), [draftGraph]);
+  const hasUnsavedChanges = Boolean(draftGraph) && draftGraphSnapshot !== savedGraphSnapshot;
 
   useEffect(() => {
     Promise.all([fetchGraphs(), fetchEditorCatalog()])
@@ -195,7 +201,9 @@ export default function App() {
         if (loadedGraphs.length > 0) {
           setSelectedGraphId(pickDefaultGraphId(loadedGraphs));
         } else {
-          resetHistory(createBlankGraph());
+          const blankGraph = createBlankGraph();
+          resetHistory(blankGraph);
+          setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
         }
       })
       .catch((loadError: Error) => {
@@ -217,6 +225,7 @@ export default function App() {
       .then((graph) => {
         const nextGraph = layoutGraphDocument(graph);
         resetHistory(nextGraph);
+        setSavedGraphSnapshot(serializeGraphSnapshot(nextGraph));
         setSelectedAgentId(getDefaultAgentId(nextGraph));
         setSelectedNodeId(null);
         setSelectedEdgeId(null);
@@ -228,6 +237,20 @@ export default function App() {
     setSelectedNodeId(null);
     setSelectedEdgeId(null);
   }, [selectedAgentId]);
+
+  useEffect(() => {
+    if (!hasUnsavedChanges || isSaving) {
+      return;
+    }
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+    };
+  }, [hasUnsavedChanges, isSaving]);
 
   async function refreshGraphs(nextSelectedGraphId?: string) {
     const loadedGraphs = await fetchGraphs();
@@ -254,6 +277,7 @@ export default function App() {
           ? await updateGraph(selectedGraphId, normalized)
           : await createGraph(normalized);
       await refreshGraphs(savedGraph.graph_id);
+      setSavedGraphSnapshot(serializeGraphSnapshot(savedGraph));
       setDraftGraph(savedGraph);
       if (isTestEnvironment(savedGraph)) {
         setSelectedAgentId((current) => current ?? getDefaultAgentId(savedGraph));
@@ -269,10 +293,12 @@ export default function App() {
   }
 
   function handleCreateGraph() {
+    const blankGraph = createBlankGraph();
     sourceRef.current?.close();
     setSelectedGraphId("");
     setSelectedAgentId(null);
-    resetHistory(createBlankGraph());
+    resetHistory(blankGraph);
+    setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
     setSelectedNodeId(null);
     setSelectedEdgeId(null);
     setActiveRunId(null);
@@ -293,9 +319,11 @@ export default function App() {
       if (loadedGraphs.length > 0) {
         setSelectedGraphId(pickDefaultGraphId(loadedGraphs));
       } else {
+        const blankGraph = createBlankGraph();
         setSelectedGraphId("");
         setSelectedAgentId(null);
-        resetHistory(createBlankGraph());
+        resetHistory(blankGraph);
+        setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
       }
       setSelectedNodeId(null);
       setSelectedEdgeId(null);
@@ -336,10 +364,7 @@ export default function App() {
 
         if (!event.agent_id && (event.event_type === "run.completed" || event.event_type === "run.failed")) {
           source.close();
-          fetchRun(runId)
-            .then((state) => setRunState(state))
-            .catch((fetchError: Error) => setError(fetchError.message))
-            .finally(() => setIsRunning(false));
+          setIsRunning(false);
         }
       };
 
@@ -432,7 +457,7 @@ export default function App() {
           <div className="mosaic-tile panel mosaic-execution">
             <label className="mosaic-execution-input">
               Input
-              <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={4} />
+              <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={10} />
             </label>
             <div className="mosaic-execution-run">
               <button type="button" onClick={() => void handleRun()} disabled={!draftGraph || isRunning || isSaving}>

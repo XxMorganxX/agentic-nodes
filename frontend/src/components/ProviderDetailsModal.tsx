@@ -1,8 +1,10 @@
-import { useEffect } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, MouseEvent } from "react";
 
+import { fetchProviderDiagnostics, preflightProvider } from "../lib/api";
+import { findProviderDefinition, modelProviderDefinitions, providerDefaultConfig, providerModelName } from "../lib/editor";
 import { getGraphEnvVars, resolveGraphEnvReferences } from "../lib/graphEnv";
-import type { EditorCatalog, GraphDefinition, GraphNode, NodeProviderDefinition } from "../lib/types";
+import type { EditorCatalog, GraphDefinition, GraphNode, ProviderDiagnosticsResult, ProviderPreflightResult } from "../lib/types";
 
 type ProviderDetailsModalProps = {
   graph: GraphDefinition;
@@ -23,16 +25,12 @@ function updateModelNode(
   };
 }
 
-function resolveProviderDefinition(node: GraphNode, catalog: EditorCatalog | null): NodeProviderDefinition | null {
+function resolveProviderDefinition(node: GraphNode, catalog: EditorCatalog | null) {
   const providerName = String(node.config.provider_name ?? node.model_provider_name ?? "").trim();
   if (!providerName) {
     return null;
   }
-  return (
-    (catalog?.node_providers ?? []).find(
-      (provider) => provider.category === "provider" && provider.provider_id === `provider.${providerName}`,
-    ) ?? null
-  );
+  return findProviderDefinition(catalog, providerName);
 }
 
 export function ProviderDetailsModal({
@@ -43,7 +41,15 @@ export function ProviderDetailsModal({
   onClose,
 }: ProviderDetailsModalProps) {
   const provider = resolveProviderDefinition(node, catalog);
+  const availableProviders = modelProviderDefinitions(catalog);
   const envVarEntries = Object.entries(getGraphEnvVars(graph));
+  const providerName = String(node.config.provider_name ?? node.model_provider_name ?? "not-set");
+  const providerConfigFields = provider?.config_fields ?? [];
+  const supportsLiveVerification = providerName !== "mock";
+  const [preflightResult, setPreflightResult] = useState<ProviderPreflightResult | null>(null);
+  const [diagnostics, setDiagnostics] = useState<ProviderDiagnosticsResult | null>(null);
+  const [preflightError, setPreflightError] = useState<string | null>(null);
+  const [isPreflighting, setIsPreflighting] = useState(false);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -55,6 +61,55 @@ export function ProviderDetailsModal({
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [onClose]);
+
+  const preflightConfig = useMemo<Record<string, unknown>>(() => {
+    const entries: Array<[string, unknown]> = [["provider_name", providerName]];
+    providerConfigFields.forEach((field) => {
+      entries.push([field.key, node.config[field.key]]);
+    });
+    return Object.fromEntries(entries);
+  }, [node.config, providerConfigFields, providerName]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!providerName || providerName === "not-set") {
+      setPreflightResult(null);
+      setDiagnostics(null);
+      setPreflightError(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setIsPreflighting(true);
+    setPreflightError(null);
+    Promise.all([
+      preflightProvider(providerName, preflightConfig, false),
+      fetchProviderDiagnostics(providerName, preflightConfig, false),
+    ])
+      .then(([result, diagnosticsResult]) => {
+        if (!cancelled) {
+          setPreflightResult(result);
+          setDiagnostics(diagnosticsResult);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setPreflightError("Unable to load provider health.");
+          setPreflightResult(null);
+          setDiagnostics(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsPreflighting(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [preflightConfig, providerName]);
 
   function updateProviderConfig(key: string, value: string | number) {
     onGraphChange(
@@ -75,7 +130,7 @@ export function ProviderDetailsModal({
   }
 
   function handleTextInputChange(key: string) {
-    return (event: ChangeEvent<HTMLInputElement>) => {
+    return (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
       updateProviderConfig(key, event.target.value);
     };
   }
@@ -86,21 +141,64 @@ export function ProviderDetailsModal({
     };
   }
 
-  const providerName = String(node.config.provider_name ?? node.model_provider_name ?? "not-set");
-  const providerModel = String(node.config.model ?? "");
-  const resolvedPreviewConfig = {
-    provider_name: resolveGraphEnvReferences(String(node.config.provider_name ?? node.model_provider_name ?? ""), graph) || null,
-    model: resolveGraphEnvReferences(String(node.config.model ?? ""), graph) || null,
-    temperature: node.config.temperature ?? null,
-    max_tokens: node.config.max_tokens ?? null,
-    api_base: resolveGraphEnvReferences(String(node.config.api_base ?? ""), graph) || null,
-    api_key_env_var: resolveGraphEnvReferences(String(node.config.api_key_env_var ?? ""), graph) || null,
-    cli_path: resolveGraphEnvReferences(String(node.config.cli_path ?? ""), graph) || null,
-    working_directory: resolveGraphEnvReferences(String(node.config.working_directory ?? ""), graph) || null,
-    timeout_seconds: node.config.timeout_seconds ?? null,
-    max_turns: node.config.max_turns ?? null,
-  };
-  const isClaudeCodeProvider = providerName === "claude_code";
+  function handleProviderChange(nextProviderName: string) {
+    const nextProvider = findProviderDefinition(catalog, nextProviderName);
+    if (!nextProvider) {
+      return;
+    }
+    const nextProviderConfig = providerDefaultConfig(nextProvider);
+    const providerConfigKeys = Array.from(
+      new Set(
+        availableProviders.flatMap((candidate) => [
+          "provider_name",
+          ...((candidate.config_fields ?? []).map((field) => field.key)),
+        ]),
+      ),
+    );
+    onGraphChange(
+      updateModelNode(graph, node.id, (currentNode) => {
+        const nextConfig = { ...currentNode.config };
+        providerConfigKeys.forEach((key) => delete nextConfig[key]);
+        return {
+          ...currentNode,
+          model_provider_name: nextProviderName,
+          config: {
+            ...nextConfig,
+            ...nextProviderConfig,
+            provider_name: nextProviderName,
+          },
+        };
+      }),
+    );
+  }
+
+  async function handleLiveVerification() {
+    setIsPreflighting(true);
+    setPreflightError(null);
+    try {
+      const [result, diagnosticsResult] = await Promise.all([
+        preflightProvider(providerName, preflightConfig, true),
+        fetchProviderDiagnostics(providerName, preflightConfig, true),
+      ]);
+      setPreflightResult(result);
+      setDiagnostics(diagnosticsResult);
+    } catch {
+      setPreflightError("Live provider verification failed.");
+      setPreflightResult(null);
+      setDiagnostics(null);
+    } finally {
+      setIsPreflighting(false);
+    }
+  }
+
+  const resolvedPreviewConfig = Object.fromEntries(
+    [["provider_name", providerName], ...providerConfigFields.map((field) => [field.key, node.config[field.key]])].map(
+      ([key, value]) => [
+        key,
+        typeof value === "string" ? resolveGraphEnvReferences(value, graph) || null : (value ?? null),
+      ],
+    ),
+  );
 
   return (
     <div className="tool-details-modal-backdrop" onClick={handleOverlayClick} role="presentation">
@@ -143,81 +241,157 @@ export function ProviderDetailsModal({
                 ))}
               </div>
             ) : null}
+            {preflightResult ? (
+              <div className="tool-details-modal-help">
+                <strong>Provider Health</strong>
+                <div>{preflightResult.message}</div>
+                {preflightResult.warnings?.map((warning) => (
+                  <div key={warning}>{warning}</div>
+                ))}
+              </div>
+            ) : null}
+            {diagnostics ? (
+              <div className="tool-details-modal-help">
+                <strong>Provider Diagnostics</strong>
+                <div className="provider-diagnostics-card">
+                  <div className="provider-diagnostics-section">
+                    <div className="provider-diagnostics-section-title">Backend</div>
+                    <div className="provider-diagnostics-row">
+                      <span>Active backend</span>
+                      <strong>{diagnostics.active_backend}</strong>
+                    </div>
+                    <div className="provider-diagnostics-row">
+                      <span>Authentication status</span>
+                      <strong>{diagnostics.authentication_status}</strong>
+                    </div>
+                  </div>
+                  {diagnostics.active_backend === "claude_code" ? (
+                    <div className="provider-diagnostics-section">
+                      <div className="provider-diagnostics-section-title">Claude Code</div>
+                      <div className="provider-diagnostics-row">
+                        <span>Claude binary</span>
+                        <strong>{diagnostics.claude_binary_exists ? "found" : "not found"}</strong>
+                      </div>
+                    </div>
+                  ) : null}
+                  {diagnostics.active_backend === "claude_code" || diagnostics.active_backend === "anthropic_api" ? (
+                    <div className="provider-diagnostics-section">
+                      <div className="provider-diagnostics-section-title">Environment</div>
+                      <div className="provider-diagnostics-row">
+                        <span>`ANTHROPIC_API_KEY` present</span>
+                        <strong>{diagnostics.anthropic_api_key_present ? "yes" : "no"}</strong>
+                      </div>
+                    </div>
+                  ) : null}
+                {diagnostics.child_env_sanitized ? (
+                    <div className="provider-diagnostics-section">
+                      <div className="provider-diagnostics-section-title">Child Process</div>
+                      <div className="provider-diagnostics-list">
+                        <div>Sanitized environment enabled.</div>
+                        <div>Strips: {diagnostics.sanitized_env_removed_vars.join(", ")}</div>
+                      </div>
+                    </div>
+                ) : null}
+                  {diagnostics.warning ? (
+                    <div className="provider-diagnostics-section">
+                      <div className="provider-diagnostics-section-title">Warning</div>
+                      <div className="provider-diagnostics-list">
+                        <div>{diagnostics.warning}</div>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+            {preflightError ? <div className="tool-details-modal-help">{preflightError}</div> : null}
+            {!supportsLiveVerification ? (
+              <div className="tool-details-modal-help">Live verification is not required for the mock provider.</div>
+            ) : null}
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={handleLiveVerification}
+              disabled={isPreflighting || !supportsLiveVerification}
+            >
+              {isPreflighting ? "Checking Provider..." : supportsLiveVerification ? "Run Live Verification" : "Live Verification Not Required"}
+            </button>
           </section>
 
           <div className="provider-details-grid">
             <label>
-              Provider Name
-              <input value={providerName} readOnly />
+              Provider
+              <select
+                value={providerName}
+                onChange={(event) => handleProviderChange(event.target.value)}
+              >
+                {availableProviders.map((candidate) => {
+                  const candidateName = providerModelName(candidate);
+                  return (
+                    <option key={candidate.provider_id} value={candidateName}>
+                      {candidate.display_name}
+                    </option>
+                  );
+                })}
+              </select>
             </label>
-
-            <label>
-              Model
-              <input value={providerModel} onChange={handleTextInputChange("model")} />
-            </label>
-
-            <label>
-              Temperature
-              <input
-                type="number"
-                step="0.1"
-                value={String(node.config.temperature ?? "")}
-                onChange={handleNumberInputChange("temperature")}
-              />
-            </label>
-
-            <label>
-              Max Tokens
-              <input
-                type="number"
-                value={String(node.config.max_tokens ?? "")}
-                onChange={handleNumberInputChange("max_tokens")}
-              />
-            </label>
-
-            <label>
-              API Base
-              <input value={String(node.config.api_base ?? "")} onChange={handleTextInputChange("api_base")} />
-            </label>
-
-            <label>
-              API Key Env Var
-              <input
-                value={String(node.config.api_key_env_var ?? "")}
-                onChange={handleTextInputChange("api_key_env_var")}
-              />
-            </label>
-            {isClaudeCodeProvider ? (
-              <>
-                <label>
-                  Claude CLI Path
-                  <input value={String(node.config.cli_path ?? "")} onChange={handleTextInputChange("cli_path")} />
-                </label>
-                <label>
-                  Working Directory
-                  <input
-                    value={String(node.config.working_directory ?? "")}
-                    onChange={handleTextInputChange("working_directory")}
-                  />
-                </label>
-                <label>
-                  Timeout Seconds
-                  <input
-                    type="number"
-                    value={String(node.config.timeout_seconds ?? "")}
-                    onChange={handleNumberInputChange("timeout_seconds")}
-                  />
-                </label>
-                <label>
-                  Max Turns
-                  <input
-                    type="number"
-                    value={String(node.config.max_turns ?? "")}
-                    onChange={handleNumberInputChange("max_turns")}
-                  />
-                </label>
-              </>
-            ) : null}
+            {providerConfigFields.map((field) => (
+              <label key={field.key}>
+                {field.label}
+                {(() => {
+                  const currentValue = String(node.config[field.key] ?? "");
+                  const isSelectField = field.input_type === "select" && (field.options?.length ?? 0) > 0;
+                  const isModelSelectField = isSelectField && field.key === "model";
+                  const selectOptions =
+                    isSelectField && currentValue && !field.options?.some((option) => option.value === currentValue)
+                      ? [...(field.options ?? []), { value: currentValue, label: `Custom: ${currentValue}` }]
+                      : (field.options ?? []);
+                  const datalistId = `${node.id}-${field.key}-modal-options`;
+                  return (
+                    <>
+                      {isModelSelectField ? (
+                        <>
+                          <input
+                            list={datalistId}
+                            value={currentValue}
+                            placeholder={field.placeholder || "Select or type a model id"}
+                            onChange={handleTextInputChange(field.key)}
+                          />
+                          <datalist id={datalistId}>
+                            {selectOptions.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </datalist>
+                        </>
+                      ) : isSelectField ? (
+                        <select
+                          value={currentValue}
+                          onChange={handleTextInputChange(field.key)}
+                        >
+                          {selectOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          type={field.input_type === "number" ? "number" : "text"}
+                          value={currentValue}
+                          placeholder={field.placeholder || undefined}
+                          onChange={
+                            field.input_type === "number"
+                              ? handleNumberInputChange(field.key)
+                              : handleTextInputChange(field.key)
+                          }
+                        />
+                      )}
+                    </>
+                  );
+                })()}
+              </label>
+            ))}
           </div>
 
           <div className="tool-details-modal-help">

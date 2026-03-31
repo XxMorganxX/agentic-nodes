@@ -1,6 +1,13 @@
 import type { ChangeEvent } from "react";
 
-import { isWireJunctionNode } from "../lib/editor";
+import {
+  defaultModelName,
+  findProviderDefinition,
+  isWireJunctionNode,
+  modelProviderDefinitions,
+  providerDefaultConfig,
+  providerModelName,
+} from "../lib/editor";
 import { useRenderDiagnostics } from "../lib/dragDiagnostics";
 import type { EditorCatalog, GraphDefinition, GraphEdge, GraphNode, NodeProviderDefinition } from "../lib/types";
 
@@ -26,23 +33,6 @@ function updateEdge(graph: GraphDefinition, edgeId: string, updater: (edge: Grap
     ...graph,
     edges: graph.edges.map((edge) => (edge.id === edgeId ? updater(edge) : edge)),
   };
-}
-
-function modelProviders(catalog: EditorCatalog | null): NodeProviderDefinition[] {
-  return (catalog?.node_providers ?? []).filter((provider) => provider.category === "provider");
-}
-
-function defaultModelName(providerName: string): string {
-  if (providerName === "openai") {
-    return "gpt-4.1-mini";
-  }
-  if (providerName === "claude") {
-    return "claude-3-5-haiku-latest";
-  }
-  if (providerName === "claude_code") {
-    return "sonnet";
-  }
-  return "mock-default";
 }
 
 export function GraphInspector({
@@ -137,9 +127,11 @@ export function GraphInspector({
     const allowedTools = Array.isArray(selectedNode.config.allowed_tool_names)
       ? (selectedNode.config.allowed_tool_names as string[])
       : [];
-    const availableModelProviders = modelProviders(catalog);
+    const availableModelProviders = modelProviderDefinitions(catalog);
     const selectedProviderName = String(selectedNode.config.provider_name ?? selectedNode.model_provider_name ?? "mock");
-    const isClaudeCodeProvider = selectedProviderName === "claude_code";
+    const selectedProvider = findProviderDefinition(catalog, selectedProviderName);
+    const providerConfigFields = selectedProvider?.config_fields ?? [];
+    const providerStatus = catalog?.provider_statuses?.[selectedProviderName];
     const isDiscordStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.discord_message";
     const isManualStartNode =
       selectedNode.kind === "input" &&
@@ -328,32 +320,39 @@ export function GraphInspector({
                     if (!nextProvider) {
                       return;
                     }
-                    const nextProviderName = nextProvider.provider_id.replace("provider.", "");
-                    const nextModelName = defaultModelName(nextProviderName);
+                    const nextProviderName = providerModelName(nextProvider);
+                    const nextProviderConfig = providerDefaultConfig(nextProvider);
+                    const providerConfigKeys = Array.from(
+                      new Set(
+                        availableModelProviders.flatMap((provider) => [
+                          "provider_name",
+                          ...((provider.config_fields ?? []).map((field) => field.key)),
+                        ]),
+                      ),
+                    );
                     onGraphChange(
-                      updateNode(graph, selectedNode.id, (node) => ({
-                        ...node,
-                        model_provider_name: nextProviderName,
-                        config: {
-                          ...node.config,
-                          provider_name: nextProviderName,
-                          model: nextModelName || node.config.model,
-                          max_tokens: nextProviderName === "claude" ? Number(node.config.max_tokens ?? 1024) : node.config.max_tokens,
-                          timeout_seconds:
-                            nextProviderName === "claude_code"
-                              ? Number(node.config.timeout_seconds ?? 60)
-                              : node.config.timeout_seconds,
-                          max_turns:
-                            nextProviderName === "claude_code"
-                              ? Number(node.config.max_turns ?? 1)
-                              : node.config.max_turns,
-                        },
-                      })),
+                      updateNode(graph, selectedNode.id, (node) => {
+                        const nextConfig = { ...node.config };
+                        providerConfigKeys.forEach((key) => delete nextConfig[key]);
+                        return {
+                          ...node,
+                          model_provider_name: nextProviderName,
+                          config: {
+                            ...nextConfig,
+                            ...nextProviderConfig,
+                            provider_name: nextProviderName,
+                            model:
+                              typeof nextProviderConfig.model === "string"
+                                ? nextProviderConfig.model
+                                : defaultModelName(nextProviderName, catalog) || node.config.model,
+                          },
+                        };
+                      }),
                     );
                   }}
                 >
                   {availableModelProviders.map((provider) => {
-                    const providerName = provider.provider_id.replace("provider.", "");
+                    const providerName = providerModelName(provider);
                     return (
                       <option key={provider.provider_id} value={providerName}>
                         {provider.display_name}
@@ -370,6 +369,15 @@ export function GraphInspector({
                 >
                   Learn More About Provider
                 </button>
+              ) : null}
+              {providerStatus ? (
+                <div className="contract-card">
+                  <strong>Provider Health</strong>
+                  <span>{providerStatus.message}</span>
+                  {(providerStatus.warnings ?? []).map((warning) => (
+                    <span key={warning}>{warning}</span>
+                  ))}
+                </div>
               ) : null}
               <label>
                 Model Provider Name
@@ -401,153 +409,90 @@ export function GraphInspector({
                   }
                 />
               </label>
-              <label>
-                Model Name
-                <input
-                  value={String(selectedNode.config.model ?? "")}
-                  onChange={(event) =>
-                    onGraphChange(
-                      updateNode(graph, selectedNode.id, (node) => ({
-                        ...node,
-                        config: { ...node.config, model: event.target.value },
-                      })),
-                    )
-                  }
-                />
-              </label>
-              <label>
-                Temperature
-                <input
-                  type="number"
-                  step="0.1"
-                  value={String(selectedNode.config.temperature ?? "")}
-                  onChange={(event) =>
-                    onGraphChange(
-                      updateNode(graph, selectedNode.id, (node) => ({
-                        ...node,
-                        config: {
-                          ...node.config,
-                          temperature: event.target.value === "" ? "" : Number(event.target.value),
-                        },
-                      })),
-                    )
-                  }
-                />
-              </label>
-              <label>
-                Max Tokens
-                <input
-                  type="number"
-                  value={String(selectedNode.config.max_tokens ?? "")}
-                  onChange={(event) =>
-                    onGraphChange(
-                      updateNode(graph, selectedNode.id, (node) => ({
-                        ...node,
-                        config: {
-                          ...node.config,
-                          max_tokens: event.target.value === "" ? "" : Number(event.target.value),
-                        },
-                      })),
-                    )
-                  }
-                />
-              </label>
-              <label>
-                API Base
-                <input
-                  value={String(selectedNode.config.api_base ?? "")}
-                  onChange={(event) =>
-                    onGraphChange(
-                      updateNode(graph, selectedNode.id, (node) => ({
-                        ...node,
-                        config: { ...node.config, api_base: event.target.value },
-                      })),
-                    )
-                  }
-                />
-              </label>
-              <label>
-                API Key Env Var
-                <input
-                  value={String(selectedNode.config.api_key_env_var ?? "")}
-                  onChange={(event) =>
-                    onGraphChange(
-                      updateNode(graph, selectedNode.id, (node) => ({
-                        ...node,
-                        config: { ...node.config, api_key_env_var: event.target.value },
-                      })),
-                    )
-                  }
-                />
-              </label>
-              {isClaudeCodeProvider ? (
-                <>
-                  <label>
-                    Claude CLI Path
-                    <input
-                      value={String(selectedNode.config.cli_path ?? "")}
-                      onChange={(event) =>
-                        onGraphChange(
-                          updateNode(graph, selectedNode.id, (node) => ({
-                            ...node,
-                            config: { ...node.config, cli_path: event.target.value },
-                          })),
-                        )
-                      }
-                    />
+              {providerConfigFields.map((field) => {
+                const value = selectedNode.config[field.key];
+                const isNumberField = field.input_type === "number";
+                const isSelectField = field.input_type === "select" && (field.options?.length ?? 0) > 0;
+                const isModelSelectField = isSelectField && field.key === "model";
+                const currentValue = String(value ?? "");
+                const selectOptions =
+                  isSelectField && currentValue && !field.options?.some((option) => option.value === currentValue)
+                    ? [...(field.options ?? []), { value: currentValue, label: `Custom: ${currentValue}` }]
+                    : (field.options ?? []);
+                const datalistId = `${selectedNode.id}-${field.key}-options`;
+                const inputProps = isNumberField ? { type: "number" } : {};
+                return (
+                  <label key={field.key}>
+                    {field.label}
+                    {isModelSelectField ? (
+                      <>
+                        <input
+                          list={datalistId}
+                          value={currentValue}
+                          placeholder={field.placeholder || "Select or type a model id"}
+                          onChange={(event) =>
+                            onGraphChange(
+                              updateNode(graph, selectedNode.id, (node) => ({
+                                ...node,
+                                config: {
+                                  ...node.config,
+                                  [field.key]: event.target.value,
+                                },
+                              })),
+                            )
+                          }
+                        />
+                        <datalist id={datalistId}>
+                          {selectOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </datalist>
+                      </>
+                    ) : isSelectField ? (
+                      <select
+                        value={currentValue}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                [field.key]: event.target.value,
+                              },
+                            })),
+                          )
+                        }
+                      >
+                        {selectOptions.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        {...inputProps}
+                        value={currentValue}
+                        placeholder={field.placeholder || undefined}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                [field.key]:
+                                  isNumberField && event.target.value !== "" ? Number(event.target.value) : event.target.value,
+                              },
+                            })),
+                          )
+                        }
+                      />
+                    )}
                   </label>
-                  <label>
-                    Working Directory
-                    <input
-                      value={String(selectedNode.config.working_directory ?? "")}
-                      onChange={(event) =>
-                        onGraphChange(
-                          updateNode(graph, selectedNode.id, (node) => ({
-                            ...node,
-                            config: { ...node.config, working_directory: event.target.value },
-                          })),
-                        )
-                      }
-                    />
-                  </label>
-                  <label>
-                    Timeout Seconds
-                    <input
-                      type="number"
-                      value={String(selectedNode.config.timeout_seconds ?? "")}
-                      onChange={(event) =>
-                        onGraphChange(
-                          updateNode(graph, selectedNode.id, (node) => ({
-                            ...node,
-                            config: {
-                              ...node.config,
-                              timeout_seconds: event.target.value === "" ? "" : Number(event.target.value),
-                            },
-                          })),
-                        )
-                      }
-                    />
-                  </label>
-                  <label>
-                    Max Turns
-                    <input
-                      type="number"
-                      value={String(selectedNode.config.max_turns ?? "")}
-                      onChange={(event) =>
-                        onGraphChange(
-                          updateNode(graph, selectedNode.id, (node) => ({
-                            ...node,
-                            config: {
-                              ...node.config,
-                              max_turns: event.target.value === "" ? "" : Number(event.target.value),
-                            },
-                          })),
-                        )
-                      }
-                    />
-                  </label>
-                </>
-              ) : null}
+                );
+              })}
               <label>
                 System Prompt
                 <textarea

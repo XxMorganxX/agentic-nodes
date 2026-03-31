@@ -26,8 +26,24 @@ export type AgentRunMilestone = {
   label: string;
   eventType: string;
   timestamp: string;
+  timestampLabel: string;
+  timestampDetail: string;
+  relativeTimestampLabel: string | null;
+  deltaLabel: string | null;
   tone: "idle" | "info" | "running" | "success" | "danger";
   nodeId: string | null;
+  details: AgentRunMilestoneDetail[];
+  dataSections: AgentRunMilestoneDataSection[];
+};
+
+export type AgentRunMilestoneDetail = {
+  label: string;
+  value: string;
+};
+
+export type AgentRunMilestoneDataSection = {
+  label: string;
+  value: unknown;
 };
 
 export type AgentRunLane = {
@@ -89,6 +105,10 @@ function normalizeEventType(eventType: string): string {
   return eventType.replace(/^agent\./, "");
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function nodeLabelMap(graph: GraphDefinition | null): Map<string, string> {
   return new Map((graph?.nodes ?? []).map((node) => [node.id, node.label]));
 }
@@ -133,6 +153,64 @@ function formatElapsed(startedAt: string | null | undefined, endedAt: string | n
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = seconds % 60;
   return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+}
+
+function formatDurationMs(durationMs: number): string {
+  if (!Number.isFinite(durationMs) || durationMs < 0) {
+    return "n/a";
+  }
+  if (durationMs < 1000) {
+    return `${Math.round(durationMs)}ms`;
+  }
+  if (durationMs < 10_000) {
+    return `${(durationMs / 1000).toFixed(1)}s`;
+  }
+  const seconds = Math.round(durationMs / 1000);
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+}
+
+function formatTimestamp(timestamp: string, detail = false): string {
+  const parsed = Date.parse(timestamp);
+  if (!Number.isFinite(parsed)) {
+    return timestamp;
+  }
+  const date = new Date(parsed);
+  const dateLabel = detail ? `${date.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ` : "";
+  const timeLabel = date.toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  return `${dateLabel}${timeLabel}.${String(date.getMilliseconds()).padStart(3, "0")}`;
+}
+
+function formatRelativeTimestamp(timestamp: string, startedAt: string | null | undefined): string | null {
+  if (!startedAt) {
+    return null;
+  }
+  const timestampMs = Date.parse(timestamp);
+  const startMs = Date.parse(startedAt);
+  if (!Number.isFinite(timestampMs) || !Number.isFinite(startMs)) {
+    return null;
+  }
+  return `T+${formatDurationMs(Math.max(0, timestampMs - startMs))}`;
+}
+
+function formatDeltaLabel(timestamp: string, previousTimestamp: string | null): string | null {
+  if (!previousTimestamp) {
+    return null;
+  }
+  const timestampMs = Date.parse(timestamp);
+  const previousMs = Date.parse(previousTimestamp);
+  if (!Number.isFinite(timestampMs) || !Number.isFinite(previousMs)) {
+    return null;
+  }
+  return `+${formatDurationMs(Math.max(0, timestampMs - previousMs))}`;
 }
 
 function nodeIdFromEvent(event: RuntimeEvent): string | null {
@@ -180,6 +258,192 @@ function milestoneLabel(event: RuntimeEvent, graph: GraphDefinition | null): str
     return "Transition";
   }
   return event.summary;
+}
+
+function formatEventTypeLabel(eventType: string): string {
+  return eventType
+    .split(".")
+    .flatMap((segment) => segment.split(/[\s_-]+/))
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function nodeInputPreview(
+  nodeId: string | null,
+  graph: GraphDefinition | null,
+  inputPayload: unknown,
+  knownNodeOutputs: Record<string, unknown>,
+  labels: Map<string, string>,
+): unknown {
+  if (!nodeId) {
+    return undefined;
+  }
+  const node = graph?.nodes.find((candidate) => candidate.id === nodeId) ?? null;
+  if (node?.kind === "input") {
+    return inputPayload;
+  }
+  const incomingEdges = (graph?.edges ?? []).filter((edge) => edge.target_id === nodeId);
+  const sources = incomingEdges
+    .filter((edge, index, edges) => edges.findIndex((candidate) => candidate.source_id === edge.source_id) === index)
+    .map((edge) => ({
+      sourceLabel: labels.get(edge.source_id) ?? edge.source_id,
+      value: knownNodeOutputs[edge.source_id],
+    }))
+    .filter((entry) => entry.value !== undefined);
+  if (sources.length === 0) {
+    return undefined;
+  }
+  if (sources.length === 1) {
+    return {
+      source: sources[0].sourceLabel,
+      value: sources[0].value,
+    };
+  }
+  return Object.fromEntries(sources.map((entry) => [entry.sourceLabel, entry.value]));
+}
+
+function appendSection(
+  sections: AgentRunMilestoneDataSection[],
+  label: string,
+  value: unknown,
+  options: { allowNull?: boolean } = {},
+): void {
+  if (value === undefined) {
+    return;
+  }
+  if (value === null && !options.allowNull) {
+    return;
+  }
+  sections.push({ label, value });
+}
+
+function appendOutputSections(sections: AgentRunMilestoneDataSection[], output: unknown): void {
+  if (!isRecord(output)) {
+    appendSection(sections, "Output", output, { allowNull: true });
+    return;
+  }
+  let added = false;
+  if ("payload" in output && output.payload !== undefined) {
+    sections.push({ label: "Output payload", value: output.payload });
+    added = true;
+  }
+  if (Array.isArray(output.tool_calls) && output.tool_calls.length > 0) {
+    sections.push({ label: "Tool calls", value: output.tool_calls });
+    added = true;
+  }
+  if (Array.isArray(output.errors) && output.errors.length > 0) {
+    sections.push({ label: "Output errors", value: output.errors });
+    added = true;
+  }
+  if ("metadata" in output && output.metadata !== undefined) {
+    sections.push({ label: "Output metadata", value: output.metadata });
+    added = true;
+  }
+  if (!added) {
+    sections.push({ label: "Output", value: output });
+  }
+}
+
+function buildMilestoneDetails(
+  event: RuntimeEvent,
+  graph: GraphDefinition | null,
+  labels: Map<string, string>,
+): AgentRunMilestoneDetail[] {
+  const payload = event.payload;
+  const nodeId = nodeIdFromEvent(event);
+  const details: AgentRunMilestoneDetail[] = [{ label: "State", value: formatEventTypeLabel(event.event_type) }];
+  if (nodeId) {
+    details.push({ label: "Node", value: labels.get(nodeId) ?? nodeId });
+  }
+  if (typeof payload.node_kind === "string") {
+    details.push({ label: "Kind", value: payload.node_kind });
+  }
+  if (typeof payload.node_category === "string") {
+    details.push({ label: "Category", value: payload.node_category });
+  }
+  if (typeof payload.node_provider_label === "string") {
+    details.push({ label: "Provider", value: payload.node_provider_label });
+  }
+  if (typeof payload.status === "string") {
+    details.push({ label: "Status", value: payload.status });
+  }
+  if (typeof payload.visit_count === "number") {
+    details.push({ label: "Visit", value: `#${payload.visit_count}` });
+  }
+  if (typeof payload.source_id === "string" && typeof payload.target_id === "string") {
+    const sourceLabel = labels.get(payload.source_id) ?? payload.source_id;
+    const targetLabel = labels.get(payload.target_id) ?? payload.target_id;
+    details.push({ label: "Route", value: `${sourceLabel} -> ${targetLabel}` });
+  }
+  if (typeof payload.matched === "boolean") {
+    details.push({ label: "Matched", value: payload.matched ? "yes" : "no" });
+  }
+  if (typeof payload.result_status === "string") {
+    details.push({ label: "Result", value: payload.result_status });
+  }
+  if (typeof payload.agent_name === "string") {
+    details.push({ label: "Agent", value: payload.agent_name });
+  }
+  return details;
+}
+
+function buildMilestoneDataSections(
+  event: RuntimeEvent,
+  graph: GraphDefinition | null,
+  inputPayload: unknown,
+  knownNodeOutputs: Record<string, unknown>,
+  labels: Map<string, string>,
+): AgentRunMilestoneDataSection[] {
+  const payload = event.payload;
+  const nodeId = nodeIdFromEvent(event);
+  const sections: AgentRunMilestoneDataSection[] = [];
+  if (event.event_type === "run.started") {
+    appendSection(sections, "Input", inputPayload, { allowNull: true });
+    return sections;
+  }
+  if (event.event_type === "node.started") {
+    appendSection(sections, "Structured input", nodeInputPreview(nodeId, graph, inputPayload, knownNodeOutputs, labels), {
+      allowNull: true,
+    });
+    return sections;
+  }
+  if (event.event_type === "node.completed") {
+    if ("output" in payload) {
+      appendOutputSections(sections, payload.output);
+    }
+    if ("error" in payload) {
+      appendSection(sections, "Error", payload.error, { allowNull: true });
+    }
+    if ("metadata" in payload) {
+      appendSection(sections, "Execution metadata", payload.metadata);
+    }
+    return sections;
+  }
+  if (event.event_type === "run.completed") {
+    appendSection(sections, "Final output", payload.final_output, { allowNull: true });
+    return sections;
+  }
+  if (event.event_type === "run.failed") {
+    appendSection(sections, "Failure", payload.error, { allowNull: true });
+    if ("final_output" in payload) {
+      appendSection(sections, "Final output", payload.final_output, { allowNull: true });
+    }
+    return sections;
+  }
+  if (event.event_type === "condition.evaluated") {
+    appendSection(sections, "Condition payload", payload);
+    return sections;
+  }
+  if (event.event_type === "retry.triggered") {
+    appendSection(sections, "Retry context", payload);
+    return sections;
+  }
+  if (event.event_type === "edge.selected") {
+    appendSection(sections, "Transition payload", payload);
+    return sections;
+  }
+  return sections;
 }
 
 function isEnvironmentGraph(graph: GraphDocument | null): graph is TestEnvironmentDefinition {
@@ -239,6 +503,8 @@ export function buildAgentRunLanes(
     const agentEvents = events
       .filter((event) => event.agent_id === agent.agent_id)
       .map((event) => ({ ...event, event_type: normalizeEventType(event.event_type) }));
+    const knownNodeOutputs: Record<string, unknown> = {};
+    let previousTimestamp: string | null = null;
     return {
       agentId: agent.agent_id,
       agentName: agent.name,
@@ -255,14 +521,34 @@ export function buildAgentRunLanes(
       errorCount: Object.keys(agentState?.node_errors ?? {}).length,
       retryCount: agentEvents.filter((event) => event.event_type === "retry.triggered").length,
       elapsedLabel: formatElapsed(agentState?.started_at, agentState?.ended_at),
-      milestones: agentEvents.map((event, index) => ({
-        id: `${agent.agent_id}-${event.timestamp}-${index}`,
-        label: milestoneLabel(event, currentGraph),
-        eventType: event.event_type,
-        timestamp: event.timestamp,
-        tone: eventTone(event.event_type),
-        nodeId: nodeIdFromEvent(event),
-      })),
+      milestones: agentEvents.map((event, index) => {
+        const milestone = {
+          id: `${agent.agent_id}-${event.timestamp}-${index}`,
+          label: milestoneLabel(event, currentGraph),
+          eventType: event.event_type,
+          timestamp: event.timestamp,
+          timestampLabel: formatTimestamp(event.timestamp),
+          timestampDetail: formatTimestamp(event.timestamp, true),
+          relativeTimestampLabel: formatRelativeTimestamp(event.timestamp, agentState?.started_at),
+          deltaLabel: formatDeltaLabel(event.timestamp, previousTimestamp),
+          tone: eventTone(event.event_type),
+          nodeId: nodeIdFromEvent(event),
+          details: buildMilestoneDetails(event, currentGraph, labels),
+          dataSections: buildMilestoneDataSections(
+            event,
+            currentGraph,
+            agentState?.input_payload ?? runState?.input_payload ?? null,
+            knownNodeOutputs,
+            labels,
+          ),
+        };
+        const completedNodeId = event.event_type === "node.completed" ? nodeIdFromEvent(event) : null;
+        if (completedNodeId && "output" in event.payload) {
+          knownNodeOutputs[completedNodeId] = event.payload.output;
+        }
+        previousTimestamp = event.timestamp;
+        return milestone;
+      }),
     };
   });
 }

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 from queue import Queue
 from threading import Lock, Thread
 from typing import Any
@@ -71,7 +73,88 @@ class GraphRunManager:
         self._sync_discord_service()
 
     def get_catalog(self) -> dict[str, Any]:
-        return self._store.catalog()
+        provider_statuses: dict[str, Any] = {}
+        for provider_name, provider in self._services.model_providers.items():
+            result = provider.preflight()
+            provider_statuses[provider_name] = {
+                "status": result.status,
+                "ok": result.ok,
+                "message": result.message,
+                "warnings": result.warnings,
+                "details": result.details,
+            }
+        return {
+            **self._store.catalog(),
+            "provider_statuses": provider_statuses,
+        }
+
+    def preflight_provider(
+        self,
+        provider_name: str,
+        provider_config: dict[str, Any] | None = None,
+        *,
+        live: bool = False,
+    ) -> dict[str, Any]:
+        provider = self._services.model_providers[provider_name]
+        config = dict(provider_config or {})
+        if live:
+            config["check_auth"] = True
+        result = provider.preflight(config)
+        return {
+            "provider_name": provider_name,
+            "status": result.status,
+            "ok": result.ok,
+            "message": result.message,
+            "warnings": result.warnings,
+            "details": result.details,
+        }
+
+    def provider_diagnostics(
+        self,
+        provider_name: str,
+        provider_config: dict[str, Any] | None = None,
+        *,
+        live: bool = False,
+    ) -> dict[str, Any]:
+        config = dict(provider_config or {})
+        if live:
+            config["check_auth"] = True
+
+        preflight = self.preflight_provider(provider_name, config, live=live)
+        cli_path = str(config.get("cli_path") or "claude").strip() or "claude"
+        anthropic_api_key_present = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+        is_mock = provider_name == "mock"
+        is_claude_code = provider_name == "claude_code"
+        is_anthropic_api = provider_name == "claude"
+        claude_binary_path = shutil.which(cli_path) if is_claude_code else None
+
+        warning = None
+        if is_claude_code and anthropic_api_key_present:
+            warning = (
+                "ANTHROPIC_API_KEY is present in the host environment. Claude Code may use API billing instead of subscription "
+                "auth if that variable reaches the child process. This app strips it for Claude Code runs."
+            )
+
+        auth_status = "not_checked"
+        if is_mock:
+            auth_status = "not_applicable"
+        elif live:
+            auth_status = preflight["status"]
+        elif is_anthropic_api:
+            auth_status = "api_key_present" if anthropic_api_key_present else "missing_api_key"
+
+        return {
+            "provider_name": provider_name,
+            "active_backend": "claude_code" if is_claude_code else "anthropic_api" if is_anthropic_api else provider_name,
+            "claude_binary_exists": bool(claude_binary_path),
+            "claude_binary_path": claude_binary_path,
+            "anthropic_api_key_present": anthropic_api_key_present,
+            "warning": warning,
+            "child_env_sanitized": is_claude_code,
+            "sanitized_env_removed_vars": ["ANTHROPIC_API_KEY"] if is_claude_code else [],
+            "authentication_status": auth_status,
+            "preflight": preflight,
+        }
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         with self._lock:

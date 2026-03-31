@@ -15,6 +15,38 @@ class NodeCategory(str, Enum):
 
 
 @dataclass
+class ProviderConfigOptionDefinition:
+    value: str
+    label: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "value": self.value,
+            "label": self.label,
+        }
+
+
+@dataclass
+class ProviderConfigFieldDefinition:
+    key: str
+    label: str
+    input_type: str = "text"
+    help_text: str = ""
+    placeholder: str = ""
+    options: list[ProviderConfigOptionDefinition] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "key": self.key,
+            "label": self.label,
+            "input_type": self.input_type,
+            "help_text": self.help_text,
+            "placeholder": self.placeholder,
+            "options": [option.to_dict() for option in self.options],
+        }
+
+
+@dataclass
 class NodeProviderDefinition:
     provider_id: str
     display_name: str
@@ -22,10 +54,14 @@ class NodeProviderDefinition:
     node_kind: str
     description: str
     capabilities: list[str] = field(default_factory=list)
+    model_provider_name: str | None = None
+    default_config: dict[str, Any] = field(default_factory=dict)
+    config_fields: list[ProviderConfigFieldDefinition] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
         payload["category"] = self.category.value
+        payload["config_fields"] = [field.to_dict() for field in self.config_fields]
         return payload
 
 

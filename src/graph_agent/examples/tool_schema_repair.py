@@ -5,7 +5,13 @@ from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
 from graph_agent.providers.mock import MockModelProvider
 from graph_agent.providers.vendor_api import ClaudeMessagesModelProvider, OpenAIChatModelProvider
 from graph_agent.runtime.core import GraphDefinition, RuntimeServices
-from graph_agent.runtime.node_providers import NodeCategory, NodeProviderDefinition, NodeProviderRegistry
+from graph_agent.runtime.node_providers import (
+    NodeCategory,
+    NodeProviderDefinition,
+    NodeProviderRegistry,
+    ProviderConfigOptionDefinition,
+    ProviderConfigFieldDefinition,
+)
 from graph_agent.tools.base import ToolRegistry
 from graph_agent.tools.example_tools import build_search_catalog_tool
 
@@ -62,6 +68,18 @@ def build_example_services() -> RuntimeServices:
             node_kind="provider",
             description="Provides mock-model settings to a generic API call node.",
             capabilities=["local test provider", "schema proposal", "response composition"],
+            model_provider_name="mock",
+            default_config={"provider_name": "mock", "model": "mock-default"},
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="model",
+                    label="Model",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="mock-default", label="mock-default"),
+                    ],
+                ),
+            ],
         )
     )
     node_providers.register(
@@ -72,16 +90,68 @@ def build_example_services() -> RuntimeServices:
             node_kind="provider",
             description="Provides OpenAI chat-completions settings to a generic API call node.",
             capabilities=["structured output", "tool-schema generation", "response composition"],
+            model_provider_name="openai",
+            default_config={
+                "provider_name": "openai",
+                "model": "gpt-4.1-mini",
+                "api_key_env_var": "OPENAI_API_KEY",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="model",
+                    label="Model",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="gpt-4.1-mini", label="gpt-4.1-mini"),
+                        ProviderConfigOptionDefinition(value="gpt-4.1", label="gpt-4.1"),
+                        ProviderConfigOptionDefinition(value="gpt-4o-mini", label="gpt-4o-mini"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(key="temperature", label="Temperature", input_type="number"),
+                ProviderConfigFieldDefinition(key="max_tokens", label="Max Tokens", input_type="number"),
+                ProviderConfigFieldDefinition(key="api_base", label="API Base"),
+                ProviderConfigFieldDefinition(
+                    key="api_key_env_var",
+                    label="API Key Env Var",
+                    placeholder="OPENAI_API_KEY",
+                ),
+            ],
         )
     )
     node_providers.register(
         NodeProviderDefinition(
             provider_id="provider.claude",
-            display_name="Claude Provider",
+            display_name="Anthropic API Provider",
             category=NodeCategory.PROVIDER,
             node_kind="provider",
-            description="Provides Anthropic Claude messages settings to a generic API call node.",
-            capabilities=["structured output", "tool-schema generation", "response composition"],
+            description="Uses the Anthropic Messages API with an ANTHROPIC_API_KEY and pay-per-usage API billing.",
+            capabilities=["Anthropic API key auth", "structured output", "tool-schema generation", "response composition"],
+            model_provider_name="claude",
+            default_config={
+                "provider_name": "claude",
+                "model": "claude-3-5-haiku-latest",
+                "max_tokens": 1024,
+                "api_key_env_var": "ANTHROPIC_API_KEY",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="model",
+                    label="Model",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="claude-3-5-haiku-latest", label="claude-3-5-haiku-latest"),
+                        ProviderConfigOptionDefinition(value="claude-3-7-sonnet-latest", label="claude-3-7-sonnet-latest"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(key="temperature", label="Temperature", input_type="number"),
+                ProviderConfigFieldDefinition(key="max_tokens", label="Max Tokens", input_type="number"),
+                ProviderConfigFieldDefinition(key="api_base", label="API Base"),
+                ProviderConfigFieldDefinition(
+                    key="api_key_env_var",
+                    label="API Key Env Var",
+                    placeholder="ANTHROPIC_API_KEY",
+                ),
+            ],
         )
     )
     node_providers.register(
@@ -90,8 +160,31 @@ def build_example_services() -> RuntimeServices:
             display_name="Claude Code Provider",
             category=NodeCategory.PROVIDER,
             node_kind="provider",
-            description="Uses the local Claude Code CLI authenticated on this machine instead of the Anthropic HTTP API.",
-            capabilities=["local Claude subscription", "structured output", "tool-schema generation"],
+            description="Delegates to the local Claude Code CLI authenticated on this machine and strips ANTHROPIC_API_KEY from child processes to preserve subscription-backed auth.",
+            capabilities=["local Claude subscription", "sanitized child env", "structured output", "tool-schema generation"],
+            model_provider_name="claude_code",
+            default_config={
+                "provider_name": "claude_code",
+                "model": "sonnet",
+                "cli_path": "claude",
+                "timeout_seconds": 60,
+                "max_turns": 1,
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="model",
+                    label="Model",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="sonnet", label="sonnet"),
+                        ProviderConfigOptionDefinition(value="opus", label="opus"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(key="cli_path", label="Claude CLI Path", placeholder="claude"),
+                ProviderConfigFieldDefinition(key="working_directory", label="Working Directory"),
+                ProviderConfigFieldDefinition(key="timeout_seconds", label="Timeout Seconds", input_type="number"),
+                ProviderConfigFieldDefinition(key="max_turns", label="Max Turns", input_type="number"),
+            ],
         )
     )
     node_providers.register(

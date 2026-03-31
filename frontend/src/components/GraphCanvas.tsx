@@ -35,6 +35,8 @@ import {
   TOOL_SUCCESS_HANDLE_ID,
 } from "../lib/editor";
 import { logGraphDiagnostic, useGraphDiagnosticsEnabled, useRenderDiagnostics, warnGraphDiagnostic } from "../lib/dragDiagnostics";
+import { clearHotbarFavorite, getHotbarFavorites, setHotbarFavorite } from "../lib/hotbarFavorites";
+import type { HotbarFavorites } from "../lib/hotbarFavorites";
 import { deleteSavedNode, getSavedNodes, saveNodeToLibrary } from "../lib/savedNodes";
 import type { SavedNode } from "../lib/savedNodes";
 import { formatRunStatusLabel, type AgentRunLane, type FocusedEventGroup, type FocusedRunSummary } from "../lib/runVisualization";
@@ -448,7 +450,19 @@ const QUICK_ADD_SLOTS: QuickAddSlot[] = [
   },
 ];
 
-function resolveQuickAddProvider(providers: NodeProviderDefinition[], slot: QuickAddSlot): NodeProviderDefinition | null {
+function resolveQuickAddProvider(
+  providers: NodeProviderDefinition[],
+  slot: QuickAddSlot,
+  favoriteProviderId?: string | null,
+): NodeProviderDefinition | null {
+  if (favoriteProviderId) {
+    const favorite = providers.find(
+      (provider) => provider.provider_id === favoriteProviderId && provider.category === slot.category,
+    );
+    if (favorite) {
+      return favorite;
+    }
+  }
   for (const providerId of slot.preferredProviderIds) {
     const preferred = providers.find((provider) => provider.provider_id === providerId);
     if (preferred) {
@@ -516,6 +530,7 @@ export function GraphCanvas({
   const [isSavedNodeDragActive, setIsSavedNodeDragActive] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [savedNodes, setSavedNodes] = useState<SavedNode[]>(() => getSavedNodes());
+  const [hotbarFavorites, setHotbarFavorites] = useState<HotbarFavorites>(() => getHotbarFavorites());
   const [panLocked, setPanLocked] = useState(false);
   const [isCommandHeld, setIsCommandHeld] = useState(false);
   const [showHotkeys, setShowHotkeys] = useState(false);
@@ -1991,13 +2006,27 @@ export function GraphCanvas({
     [],
   );
 
+  const handleToggleHotbarFavorite = useCallback(
+    (provider: NodeProviderDefinition) => {
+      if (hotbarFavorites[provider.category] === provider.provider_id) {
+        setHotbarFavorites(clearHotbarFavorite(provider.category));
+        setEditorMessage(`Removed ${provider.display_name} from the ${provider.category} hotbar.`);
+        return;
+      }
+      setHotbarFavorites(setHotbarFavorite(provider.category, provider.provider_id));
+      setEditorMessage(`Pinned ${provider.display_name} to the ${provider.category} hotbar.`);
+    },
+    [hotbarFavorites],
+  );
+
   const quickAddItems = useMemo(() => {
     const providers = (catalog?.node_providers ?? []).filter((provider) => provider.category !== "provider");
     return QUICK_ADD_SLOTS.map((slot) => ({
       ...slot,
-      provider: resolveQuickAddProvider(providers, slot),
+      provider: resolveQuickAddProvider(providers, slot, hotbarFavorites[slot.category]),
+      isFavorite: hotbarFavorites[slot.category] !== undefined,
     }));
-  }, [catalog]);
+  }, [catalog, hotbarFavorites]);
 
   const pendingPlacementPreviewNode = useMemo(() => {
     if (!graph || !pendingPlacement) {
@@ -2803,7 +2832,32 @@ export function GraphCanvas({
     >
       <div className="graph-shell-header panel-header">
         <div>
-          <h2>{graph.name}</h2>
+          <h2
+            className="graph-shell-name"
+            contentEditable
+            suppressContentEditableWarning
+            spellCheck={false}
+            onBlur={(event) => {
+              const next = (event.currentTarget.textContent ?? "").trim();
+              if (next && next !== graph.name) {
+                onGraphChange({ ...graph, name: next });
+              } else {
+                event.currentTarget.textContent = graph.name;
+              }
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                event.currentTarget.blur();
+              }
+              if (event.key === "Escape") {
+                event.currentTarget.textContent = graph.name;
+                event.currentTarget.blur();
+              }
+            }}
+          >
+            {graph.name}
+          </h2>
           <p>
             Drag node cards into the canvas and use the inspector to configure prompts, providers, tools, and routing.
           </p>
@@ -3070,10 +3124,19 @@ export function GraphCanvas({
                     className="graph-quick-add-button"
                     onClick={() => item.provider && beginProviderPlacement(item.provider)}
                     disabled={!item.provider}
-                    title={item.provider ? `${item.label} (${item.hotkey})` : `No ${item.label.toLowerCase()} node available`}
+                    title={
+                      item.provider
+                        ? `${item.label}: ${item.provider.display_name} (${item.hotkey})${item.isFavorite ? " [pinned]" : ""}`
+                        : `No ${item.label.toLowerCase()} node available`
+                    }
                   >
                     <span className="graph-quick-add-hotkey">{item.hotkey}</span>
-                    <span className="graph-quick-add-label">{item.label}</span>
+                    <span className="graph-quick-add-label-stack">
+                      <span className="graph-quick-add-label">{item.label}</span>
+                      <span className="graph-quick-add-provider">
+                        {item.provider ? item.provider.display_name : "Unavailable"}
+                      </span>
+                    </span>
                   </button>
                 ))}
               </div>
@@ -3157,6 +3220,9 @@ export function GraphCanvas({
                   query={providerQuery}
                   onQueryChange={setProviderQuery}
                   onProviderClick={addProviderNode}
+                  hotbarItems={quickAddItems}
+                  hotbarFavorites={hotbarFavorites}
+                  onToggleHotbarFavorite={handleToggleHotbarFavorite}
                   savedNodes={savedNodes}
                   onSavedNodeClick={addSavedNode}
                   onDeleteSavedNode={handleDeleteSavedNode}

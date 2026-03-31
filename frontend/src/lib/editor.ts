@@ -23,71 +23,57 @@ function uniqueNodeId(graph: GraphDefinition, base: string): string {
   return candidate;
 }
 
-function defaultModelProviderName(provider: NodeProviderDefinition): string {
-  if (provider.provider_id === "provider.openai") {
-    return "openai";
+export function providerModelName(provider: NodeProviderDefinition): string {
+  const explicitName = typeof provider.model_provider_name === "string" ? provider.model_provider_name.trim() : "";
+  if (explicitName) {
+    return explicitName;
   }
-  if (provider.provider_id === "provider.claude") {
-    return "claude";
-  }
-  if (provider.provider_id === "provider.claude_code") {
-    return "claude_code";
-  }
-  return "mock";
+  return provider.provider_id.replace(/^provider\./, "") || "mock";
 }
 
-function defaultModelName(providerName: string): string {
-  if (providerName === "openai") {
-    return "gpt-4.1-mini";
-  }
-  if (providerName === "claude") {
-    return "claude-3-5-haiku-latest";
-  }
-  if (providerName === "claude_code") {
-    return "sonnet";
-  }
-  return "mock-default";
+export function modelProviderDefinitions(catalog: EditorCatalog | null): NodeProviderDefinition[] {
+  return (catalog?.node_providers ?? []).filter((provider) => provider.category === "provider");
 }
 
-function defaultModelConfig(promptName: string): GraphNode["config"] {
+export function findProviderDefinition(catalog: EditorCatalog | null, providerName: string): NodeProviderDefinition | null {
+  return modelProviderDefinitions(catalog).find((provider) => providerModelName(provider) === providerName) ?? null;
+}
+
+export function providerDefaultConfig(provider: NodeProviderDefinition): GraphNode["config"] {
+  const defaultConfig = provider.default_config && typeof provider.default_config === "object" ? provider.default_config : {};
   return {
-    provider_name: "mock",
+    provider_name: providerModelName(provider),
+    ...defaultConfig,
+  };
+}
+
+export function defaultModelName(providerName: string, catalog: EditorCatalog | null): string {
+  const provider = findProviderDefinition(catalog, providerName);
+  const defaultConfig = provider ? providerDefaultConfig(provider) : {};
+  if (typeof defaultConfig.model === "string" && defaultConfig.model.trim()) {
+    return defaultConfig.model.trim();
+  }
+  if (providerName === "mock") {
+    return "mock-default";
+  }
+  return "";
+}
+
+function defaultModelConfig(promptName: string, catalog: EditorCatalog | null): GraphNode["config"] {
+  const defaultProvider =
+    findProviderDefinition(catalog, "mock") ?? modelProviderDefinitions(catalog)[0] ?? null;
+  const providerName = defaultProvider ? providerModelName(defaultProvider) : "mock";
+  const defaultConfig = defaultProvider ? providerDefaultConfig(defaultProvider) : { provider_name: "mock", model: "mock-default" };
+  return {
+    ...defaultConfig,
+    provider_name: providerName,
     prompt_name: promptName,
     mode: promptName,
     system_prompt: "You are a model node in an editable graph.",
     user_message_template: "{input_payload}",
     response_mode: "message",
     allowed_tool_names: [],
-    model: "mock-default",
-  };
-}
-
-function defaultProviderConfig(provider: NodeProviderDefinition): GraphNode["config"] {
-  const providerName = defaultModelProviderName(provider);
-  if (provider.provider_id === "provider.openai") {
-    return {
-      provider_name: providerName,
-      model: "gpt-4.1-mini",
-    };
-  }
-  if (provider.provider_id === "provider.claude") {
-    return {
-      provider_name: providerName,
-      model: "claude-3-5-haiku-latest",
-      max_tokens: 1024,
-    };
-  }
-  if (provider.provider_id === "provider.claude_code") {
-    return {
-      provider_name: providerName,
-      model: "sonnet",
-      timeout_seconds: 60,
-      max_turns: 1,
-    };
-  }
-  return {
-    provider_name: providerName,
-    model: "mock-default",
+    model: typeof defaultConfig.model === "string" ? defaultConfig.model : "mock-default",
   };
 }
 
@@ -128,7 +114,7 @@ export function syncModelNodeWithProvider(modelNode: GraphNode, providerNode: Gr
   };
 
   const providerModel = typeof providerNode.config.model === "string" ? providerNode.config.model.trim() : "";
-  nextConfig.model = providerModel || String(modelNode.config.model ?? "").trim() || defaultModelName(providerName);
+  nextConfig.model = providerModel || String(modelNode.config.model ?? "").trim() || "mock-default";
 
   return {
     ...modelNode,
@@ -181,9 +167,9 @@ export function createNodeFromProvider(
     const promptName = `${id}_prompt`;
     return {
       ...baseNode,
-      model_provider_name: "mock",
+      model_provider_name: String(defaultModelConfig(promptName, catalog).provider_name ?? "mock"),
       prompt_name: promptName,
-      config: defaultModelConfig(promptName),
+      config: defaultModelConfig(promptName, catalog),
     };
   }
 
@@ -208,11 +194,11 @@ export function createNodeFromProvider(
   }
 
   if (provider.node_kind === "provider") {
-    const providerName = defaultModelProviderName(provider);
+    const providerName = providerModelName(provider);
     return {
       ...baseNode,
       model_provider_name: providerName,
-      config: defaultProviderConfig(provider),
+      config: providerDefaultConfig(provider),
     };
   }
 

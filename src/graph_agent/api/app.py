@@ -16,6 +16,12 @@ class RunRequest(BaseModel):
     input: Any
 
 
+class ProviderPreflightRequest(BaseModel):
+    provider_name: str
+    provider_config: Optional[dict[str, Any]] = None
+    live: bool = False
+
+
 class GraphPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -98,6 +104,30 @@ def delete_graph(graph_id: str) -> dict[str, str]:
 @app.get("/api/editor/catalog")
 def get_editor_catalog() -> dict[str, Any]:
     return manager.get_catalog()
+
+
+@app.post("/api/editor/providers/preflight")
+def preflight_provider(request: ProviderPreflightRequest) -> dict[str, Any]:
+    try:
+        return manager.preflight_provider(
+            request.provider_name,
+            request.provider_config,
+            live=request.live,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown provider '{request.provider_name}'.") from exc
+
+
+@app.post("/api/editor/providers/diagnostics")
+def provider_diagnostics(request: ProviderPreflightRequest) -> dict[str, Any]:
+    try:
+        return manager.provider_diagnostics(
+            request.provider_name,
+            request.provider_config,
+            live=request.live,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown provider '{request.provider_name}'.") from exc
 
 
 @app.post("/api/graphs/{graph_id}/runs")

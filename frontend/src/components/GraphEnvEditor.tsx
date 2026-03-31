@@ -16,6 +16,10 @@ function isSensitiveEnvKey(key: string): boolean {
   return SENSITIVE_ENV_KEY_PATTERN.test(key);
 }
 
+function isEnvValueVisible(revealedEnvKeys: Record<string, boolean>, key: string): boolean {
+  return revealedEnvKeys[key] ?? !isSensitiveEnvKey(key);
+}
+
 function updateGraphEnvVars(
   graph: GraphDocument,
   updater: (envVars: Record<string, string>) => Record<string, string>,
@@ -55,18 +59,35 @@ export function GraphEnvEditor({ graph, onGraphChange }: GraphEnvEditorProps) {
       {STANDARD_GRAPH_ENV_FIELDS.map((field) => (
         <div key={field.key} className="env-tile">
           <label className="env-tile-label">{field.label}</label>
-          <input
-            value={envVars[field.key] ?? ""}
-            placeholder={field.placeholder}
-            onChange={(event) =>
-              onGraphChange(
-                updateGraphEnvVars(graph, (currentEnvVars) => ({
-                  ...currentEnvVars,
-                  [field.key]: event.target.value,
-                })),
-              )
-            }
-          />
+          <div className="env-tile-value-row">
+            <input
+              type={isEnvValueVisible(revealedEnvKeys, field.key) ? "text" : "password"}
+              value={envVars[field.key] ?? ""}
+              placeholder={field.placeholder}
+              onChange={(event) =>
+                onGraphChange(
+                  updateGraphEnvVars(graph, (currentEnvVars) => ({
+                    ...currentEnvVars,
+                    [field.key]: event.target.value,
+                  })),
+                )
+              }
+            />
+            <button
+              type="button"
+              className="secondary-button env-tile-visibility-toggle"
+              onClick={() =>
+                setRevealedEnvKeys((currentValue) => ({
+                  ...currentValue,
+                  [field.key]: !isEnvValueVisible(currentValue, field.key),
+                }))
+              }
+              aria-label={`${isEnvValueVisible(revealedEnvKeys, field.key) ? "Hide" : "Show"} value for ${field.key}`}
+              aria-pressed={isEnvValueVisible(revealedEnvKeys, field.key)}
+            >
+              {isEnvValueVisible(revealedEnvKeys, field.key) ? "Hide" : "Show"}
+            </button>
+          </div>
         </div>
       ))}
       {customEnvEntries.map(([key, value]) => (
@@ -76,7 +97,7 @@ export function GraphEnvEditor({ graph, onGraphChange }: GraphEnvEditorProps) {
           </label>
           <div className="env-tile-value-row">
             <input
-              type={(revealedEnvKeys[key] ?? !isSensitiveEnvKey(key)) ? "text" : "password"}
+              type={isEnvValueVisible(revealedEnvKeys, key) ? "text" : "password"}
               value={value}
               onChange={(event) =>
                 onGraphChange(
@@ -93,13 +114,13 @@ export function GraphEnvEditor({ graph, onGraphChange }: GraphEnvEditorProps) {
               onClick={() =>
                 setRevealedEnvKeys((currentValue) => ({
                   ...currentValue,
-                  [key]: !(currentValue[key] ?? !isSensitiveEnvKey(key)),
+                  [key]: !isEnvValueVisible(currentValue, key),
                 }))
               }
-              aria-label={`${(revealedEnvKeys[key] ?? !isSensitiveEnvKey(key)) ? "Hide" : "Show"} value for ${key}`}
-              aria-pressed={revealedEnvKeys[key] ?? !isSensitiveEnvKey(key)}
+              aria-label={`${isEnvValueVisible(revealedEnvKeys, key) ? "Hide" : "Show"} value for ${key}`}
+              aria-pressed={isEnvValueVisible(revealedEnvKeys, key)}
             >
-              {(revealedEnvKeys[key] ?? !isSensitiveEnvKey(key)) ? "Hide" : "Show"}
+              {isEnvValueVisible(revealedEnvKeys, key) ? "Hide" : "Show"}
             </button>
             <button
               type="button"

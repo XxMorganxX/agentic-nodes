@@ -10,10 +10,22 @@ type ProviderSummaryProps = {
   query?: string;
   onQueryChange?: (query: string) => void;
   onProviderClick?: (provider: NodeProviderDefinition) => void;
+  hotbarItems?: {
+    hotkey: string;
+    label: string;
+    category: string;
+    provider: NodeProviderDefinition | null;
+    isFavorite: boolean;
+  }[];
+  hotbarFavorites?: Record<string, string>;
+  onToggleHotbarFavorite?: (provider: NodeProviderDefinition) => void;
   savedNodes?: SavedNode[];
   onSavedNodeClick?: (saved: SavedNode) => void;
   onDeleteSavedNode?: (id: string) => void;
 };
+
+type HotbarItem = NonNullable<ProviderSummaryProps["hotbarItems"]>[number];
+type VisibleHotbarItem = Omit<HotbarItem, "provider"> & { provider: NodeProviderDefinition };
 
 const CATEGORY_DESCRIPTIONS: Record<string, string> = {
   start: "Start nodes are entry points that inject run-button input or external events such as Discord messages into a graph run.",
@@ -24,8 +36,6 @@ const CATEGORY_DESCRIPTIONS: Record<string, string> = {
 };
 
 const CATEGORY_ORDER = ["all", "saved", "start", "api", "tool", "data", "end"] as const;
-
-const QUICK_PICK_PROVIDER_IDS = ["start.manual_run", "start.discord_message", "core.api", "tool.registry", "core.output"];
 
 const KIND_LABELS: Record<string, string> = {
   input: "IN",
@@ -68,6 +78,9 @@ export function ProviderSummary({
   query = "",
   onQueryChange,
   onProviderClick,
+  hotbarItems = [],
+  hotbarFavorites = {},
+  onToggleHotbarFavorite,
   savedNodes = [],
   onSavedNodeClick,
   onDeleteSavedNode,
@@ -106,25 +119,28 @@ export function ProviderSummary({
     const haystack = [saved.name, saved.kind, saved.category, saved.description, saved.provider_id].join(" ").toLowerCase();
     return haystack.includes(normalizedQuery);
   });
-  const quickPicks = QUICK_PICK_PROVIDER_IDS
-    .map((providerId) => allProviders.find((provider) => provider.provider_id === providerId))
-    .filter((provider): provider is NodeProviderDefinition => Boolean(provider))
-    .filter((provider) => (activeCategory === "all" ? true : provider.category === activeCategory))
-    .filter((provider) => {
-      if (!normalizedQuery) {
-        return true;
-      }
-      const haystack = [
-        provider.display_name,
-        provider.provider_id,
-        provider.node_kind,
-        provider.description,
-        provider.capabilities.join(" "),
-      ]
-        .join(" ")
-        .toLowerCase();
-      return haystack.includes(normalizedQuery);
-    });
+  const visibleHotbarItems = hotbarItems.filter((item): item is VisibleHotbarItem => {
+    if (!item.provider) {
+      return false;
+    }
+    if (activeCategory !== "all" && item.category !== activeCategory) {
+      return false;
+    }
+    if (!normalizedQuery) {
+      return true;
+    }
+    const haystack = [
+      item.label,
+      item.category,
+      item.provider.display_name,
+      item.provider.provider_id,
+      item.provider.description,
+      item.provider.capabilities.join(" "),
+    ]
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(normalizedQuery);
+  });
   const groupedProviders = groupProviders(providers);
 
   useRenderDiagnostics(
@@ -136,7 +152,7 @@ export function ProviderSummary({
       queryLength: query.length,
       providerCount: providers.length,
       savedCount: filteredSavedNodes.length,
-      quickPickCount: quickPicks.length,
+      quickPickCount: visibleHotbarItems.length,
     },
     12,
   );
@@ -156,7 +172,7 @@ export function ProviderSummary({
               <div>
                 <div className="provider-library-eyebrow">Node Library</div>
                 <h4>Build the graph with quick visual picks</h4>
-                <p>Click a tile to insert it near the center, or drag it directly onto the canvas.</p>
+                <p>Click a tile to insert it near the center, drag it onto the canvas, or star it to pin that category hotbar slot.</p>
               </div>
             </section>
             <label className="provider-search provider-search--library">
@@ -179,27 +195,29 @@ export function ProviderSummary({
                 </button>
               ))}
             </div>
-            {quickPicks.length > 0 ? (
+            {visibleHotbarItems.length > 0 ? (
               <section className="provider-quick-picks">
                 <div className="provider-section-heading">
-                  <strong>Quick Add</strong>
-                  <span>Common starting points</span>
+                  <strong>Hotbar</strong>
+                  <span>Starred nodes replace their category slot here and in quick add.</span>
                 </div>
                 <div className="provider-quick-pick-list">
-                  {quickPicks.map((provider) => (
+                  {visibleHotbarItems.map((item) => (
                     <button
-                      key={provider.provider_id}
+                      key={item.hotkey}
                       type="button"
                       className="provider-quick-pick"
-                      onClick={() => onProviderClick?.(provider)}
+                      onClick={() => item.provider && onProviderClick?.(item.provider)}
+                      disabled={!item.provider}
                     >
-                      <span className={`provider-kind-pill provider-kind-pill--${provider.node_kind}`}>
-                        {KIND_LABELS[provider.node_kind] ?? provider.node_kind.slice(0, 3).toUpperCase()}
+                      <span className={`provider-kind-pill provider-kind-pill--${item.provider.node_kind}`}>
+                        {KIND_LABELS[item.provider.node_kind] ?? item.provider.node_kind.slice(0, 3).toUpperCase()}
                       </span>
                       <span className="provider-quick-pick-copy">
-                        <strong>{provider.display_name}</strong>
-                        <span>{provider.provider_id}</span>
+                        <strong>{item.label}</strong>
+                        <span>{item.provider.display_name}</span>
                       </span>
+                      {item.isFavorite ? <span className="provider-hotbar-badge">Pinned</span> : null}
                     </button>
                   ))}
                 </div>
@@ -328,70 +346,99 @@ export function ProviderSummary({
                 </div>
               ) : null}
               <div className={`provider-list${variant === "drawer" ? " provider-list--tiles" : ""}`}>
-                {categoryProviders.map((provider) => (
-                  <section
-                    key={provider.provider_id}
-                    className={`provider-item provider-item-draggable${variant === "drawer" ? " provider-item--drawer" : ""}`}
-                    draggable
-                    onDragStart={(event) => {
-                      event.dataTransfer.setData("application/graph-node-provider", JSON.stringify(provider));
-                      event.dataTransfer.effectAllowed = "copy";
-                    }}
-                    onClick={() => onProviderClick?.(provider)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        onProviderClick?.(provider);
-                      }
-                    }}
-                    tabIndex={onProviderClick ? 0 : -1}
-                    role={onProviderClick ? "button" : undefined}
-                  >
-                    {variant === "drawer" ? (
-                      <>
-                        <div className="provider-drawer-tile-top">
-                          <div className={`provider-visual-mark provider-visual-mark--${provider.node_kind}`}>
-                            <span>{KIND_GLYPHS[provider.node_kind] ?? provider.node_kind.slice(0, 2).toUpperCase()}</span>
+                {categoryProviders.map((provider) => {
+                  const isHotbarFavorite = hotbarFavorites[provider.category] === provider.provider_id;
+                  return (
+                    <section
+                      key={provider.provider_id}
+                      className={`provider-item provider-item-draggable${variant === "drawer" ? " provider-item--drawer" : ""}${isHotbarFavorite ? " is-hotbar-favorite" : ""}`}
+                      draggable
+                      onDragStart={(event) => {
+                        event.dataTransfer.setData("application/graph-node-provider", JSON.stringify(provider));
+                        event.dataTransfer.effectAllowed = "copy";
+                      }}
+                      onClick={() => onProviderClick?.(provider)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          onProviderClick?.(provider);
+                        }
+                      }}
+                      tabIndex={onProviderClick ? 0 : -1}
+                      role={onProviderClick ? "button" : undefined}
+                    >
+                      {variant === "drawer" ? (
+                        <>
+                          <div className="provider-drawer-tile-top">
+                            <div className={`provider-visual-mark provider-visual-mark--${provider.node_kind}`}>
+                              <span>{KIND_GLYPHS[provider.node_kind] ?? provider.node_kind.slice(0, 2).toUpperCase()}</span>
+                            </div>
+                            <span className={`provider-kind-pill provider-kind-pill--${provider.node_kind}`}>
+                              {KIND_LABELS[provider.node_kind] ?? provider.node_kind.slice(0, 3).toUpperCase()}
+                            </span>
+                            {onToggleHotbarFavorite ? (
+                              <button
+                                type="button"
+                                className={`provider-favorite-toggle${isHotbarFavorite ? " is-active" : ""}`}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  onToggleHotbarFavorite(provider);
+                                }}
+                                onPointerDown={(event) => event.stopPropagation()}
+                                aria-pressed={isHotbarFavorite}
+                                aria-label={
+                                  isHotbarFavorite
+                                    ? `Remove ${provider.display_name} from ${provider.category} hotbar`
+                                    : `Add ${provider.display_name} to ${provider.category} hotbar`
+                                }
+                                title={isHotbarFavorite ? "Remove from hotbar" : "Add to hotbar"}
+                              >
+                                <svg viewBox="0 0 24 24" aria-hidden="true">
+                                  <path d="M12 3.5l2.6 5.27 5.82.85-4.21 4.1.99 5.8L12 16.75 6.8 19.52l.99-5.8-4.21-4.1 5.82-.85L12 3.5z" />
+                                </svg>
+                              </button>
+                            ) : null}
                           </div>
-                          <span className={`provider-kind-pill provider-kind-pill--${provider.node_kind}`}>
-                            {KIND_LABELS[provider.node_kind] ?? provider.node_kind.slice(0, 3).toUpperCase()}
-                          </span>
-                        </div>
-                        <div className="provider-item-header">
-                          <strong>{provider.display_name}</strong>
-                        </div>
-                        <p>{compactDescription(provider.description)}.</p>
-                        {onProviderClick ? <div className="provider-action-hint">Add or drag</div> : null}
-                      </>
-                    ) : (
-                      <>
-                        <div className="provider-tile-top">
-                          <span className={`provider-kind-pill provider-kind-pill--${provider.node_kind}`}>
-                            {KIND_LABELS[provider.node_kind] ?? provider.node_kind.slice(0, 3).toUpperCase()}
-                          </span>
-                          <code>{provider.provider_id}</code>
-                        </div>
-                        <div className="provider-item-header">
-                          <strong>{provider.display_name}</strong>
-                        </div>
-                        <p>{provider.description}</p>
-                        <div className="provider-meta">
-                          <span>Kind: {provider.node_kind}</span>
-                        </div>
-                        {provider.capabilities.length > 0 ? (
-                          <div className="provider-capability-list">
-                            {provider.capabilities.slice(0, 3).map((capability) => (
-                              <span key={capability} className="provider-capability-chip">
-                                {capability}
-                              </span>
-                            ))}
+                          <div className="provider-item-header">
+                            <strong>{provider.display_name}</strong>
                           </div>
-                        ) : null}
-                        {onProviderClick ? <div className="provider-action-hint">Click to add or drag</div> : null}
-                      </>
-                    )}
-                  </section>
-                ))}
+                          <p>{compactDescription(provider.description)}.</p>
+                          {onProviderClick ? (
+                            <div className="provider-action-hint">
+                              {isHotbarFavorite ? "Pinned to hotbar. Add or drag" : "Add or drag"}
+                            </div>
+                          ) : null}
+                        </>
+                      ) : (
+                        <>
+                          <div className="provider-tile-top">
+                            <span className={`provider-kind-pill provider-kind-pill--${provider.node_kind}`}>
+                              {KIND_LABELS[provider.node_kind] ?? provider.node_kind.slice(0, 3).toUpperCase()}
+                            </span>
+                            <code>{provider.provider_id}</code>
+                          </div>
+                          <div className="provider-item-header">
+                            <strong>{provider.display_name}</strong>
+                          </div>
+                          <p>{provider.description}</p>
+                          <div className="provider-meta">
+                            <span>Kind: {provider.node_kind}</span>
+                          </div>
+                          {provider.capabilities.length > 0 ? (
+                            <div className="provider-capability-list">
+                              {provider.capabilities.slice(0, 3).map((capability) => (
+                                <span key={capability} className="provider-capability-chip">
+                                  {capability}
+                                </span>
+                              ))}
+                            </div>
+                          ) : null}
+                          {onProviderClick ? <div className="provider-action-hint">Click to add or drag</div> : null}
+                        </>
+                      )}
+                    </section>
+                  );
+                })}
               </div>
             </article>
           ))
