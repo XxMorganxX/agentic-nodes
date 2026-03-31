@@ -17,6 +17,7 @@ from graph_agent.runtime.node_providers import (
     is_valid_category_connection,
 )
 from graph_agent.tools.base import ToolContext, ToolRegistry
+from graph_agent.tools.mcp import McpServerManager
 
 
 def utc_now_iso() -> str:
@@ -302,6 +303,7 @@ class RuntimeServices:
     model_providers: dict[str, ModelProvider] = field(default_factory=dict)
     node_provider_registry: NodeProviderRegistry = field(default_factory=NodeProviderRegistry)
     tool_registry: ToolRegistry = field(default_factory=ToolRegistry)
+    mcp_server_manager: McpServerManager | None = None
     config: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -338,12 +340,8 @@ class NodeContext:
 
     def available_tool_definitions(self, names: list[str]) -> list[dict[str, Any]]:
         definitions: list[dict[str, Any]] = []
-        for name in names:
-            try:
-                definition = self.services.tool_registry.get(name).to_dict()
-                definitions.append(self._apply_tool_node_overrides(name, definition))
-            except KeyError:
-                continue
+        for tool in self.services.tool_registry.exposable_definitions(names):
+            definitions.append(self._apply_tool_node_overrides(tool.name, tool.to_dict()))
         return definitions
 
     def _matching_tool_node(self, tool_name: str) -> BaseNode | None:
@@ -478,6 +476,78 @@ class NodeContext:
             if isinstance(candidate, ProviderNode):
                 return candidate
         return None
+
+    def mcp_tool_context_for_model(self, node_id: str | None = None) -> dict[str, Any] | None:
+        target_node_id = node_id or self.node_id
+        target_node = self.graph.nodes.get(target_node_id)
+        if not isinstance(target_node, ModelNode):
+            return None
+
+        candidate_tool_ids: list[str] = []
+        configured_target_ids = target_node.config.get("tool_target_node_ids", [])
+        if isinstance(configured_target_ids, Sequence) and not isinstance(configured_target_ids, (str, bytes)):
+            candidate_tool_ids.extend(str(tool_id) for tool_id in configured_target_ids if str(tool_id).strip())
+        for edge in self.graph.get_incoming_edges(target_node_id):
+            candidate_tool_ids.append(str(edge.source_id))
+
+        seen_tool_ids: set[str] = set()
+        context_tools: list[dict[str, Any]] = []
+        server_ids: set[str] = set()
+        for tool_node_id in candidate_tool_ids:
+            if tool_node_id in seen_tool_ids:
+                continue
+            seen_tool_ids.add(tool_node_id)
+            candidate = self.graph.nodes.get(tool_node_id)
+            if not isinstance(candidate, ToolNode):
+                continue
+            if not bool(candidate.config.get("include_mcp_tool_context", False)):
+                continue
+            tool_name = str(candidate.config.get("tool_name", "") or candidate.tool_name).strip()
+            if not tool_name:
+                continue
+            registry_tool = self.services.tool_registry.get_optional(tool_name)
+            if registry_tool is None or registry_tool.source_type != "mcp":
+                continue
+            model_tool_definition = self._apply_tool_node_overrides(tool_name, registry_tool.to_dict())
+            server = None
+            if registry_tool.server_id and self.services.mcp_server_manager is not None:
+                try:
+                    server = self.services.mcp_server_manager.get_server(registry_tool.server_id)
+                    server_ids.add(registry_tool.server_id)
+                except KeyError:
+                    server = None
+            context_tools.append(
+                {
+                    "tool_node_id": candidate.id,
+                    "tool_node_label": candidate.label,
+                    "tool_name": tool_name,
+                    "tool": registry_tool.to_dict(),
+                    "model_tool_definition": model_tool_definition,
+                    "server": server,
+                }
+            )
+
+        if not context_tools:
+            return None
+
+        servers: list[dict[str, Any]] = []
+        if self.services.mcp_server_manager is not None:
+            for server_id in sorted(server_ids):
+                try:
+                    servers.append(self.services.mcp_server_manager.get_server(server_id))
+                except KeyError:
+                    continue
+
+        return {
+            "tool_names": [tool["tool_name"] for tool in context_tools],
+            "tool_nodes": context_tools,
+            "servers": servers,
+            "run_context": {
+                "run_id": self.state.run_id,
+                "graph_id": self.state.graph_id,
+                "node_id": target_node_id,
+            },
+        }
 
 
 class BaseNode(ABC):
@@ -714,6 +784,9 @@ class ModelNode(BaseNode):
                 metadata[key] = context.resolve_binding(binding)
             else:
                 metadata[key] = binding
+        mcp_tool_context = context.mcp_tool_context_for_model(self.id)
+        if mcp_tool_context is not None and "mcp_tool_context" not in metadata:
+            metadata["mcp_tool_context"] = mcp_tool_context
         allowed_tool_names = list(self.config.get("allowed_tool_names", []))
         available_tool_payloads = context.available_tool_definitions(allowed_tool_names)
         available_tools = [
@@ -1102,7 +1175,10 @@ class GraphDefinition:
                     )
                 allowed_tool_names = [str(tool_name) for tool_name in node.config.get("allowed_tool_names", [])]
                 for tool_name in allowed_tool_names:
-                    services.tool_registry.get(str(tool_name))
+                    try:
+                        services.tool_registry.require_exposable(str(tool_name))
+                    except (KeyError, ValueError) as exc:
+                        raise GraphValidationError(str(exc)) from exc
                 response_mode = str(node.config.get("response_mode", "message"))
                 if response_mode == "tool_call" and not allowed_tool_names and not isinstance(
                     node.config.get("response_schema"), Mapping
@@ -1128,7 +1204,10 @@ class GraphDefinition:
                                 f"Model node '{node.id}' references unknown tool target node '{target_node_id}'."
                             )
             if node.kind == "tool":
-                services.tool_registry.get(str(node.config.get("tool_name", "")))
+                try:
+                    services.tool_registry.require_invocable(str(node.config.get("tool_name", "")))
+                except (KeyError, ValueError) as exc:
+                    raise GraphValidationError(str(exc)) from exc
 
     def _resolve_provider_binding(self, node: BaseNode) -> ProviderNode | None:
         binding_node_id = str(node.config.get("provider_binding_node_id", "")).strip()

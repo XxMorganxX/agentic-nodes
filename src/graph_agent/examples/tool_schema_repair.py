@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import sys
+
 from graph_agent import config
 from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
 from graph_agent.providers.mock import MockModelProvider
@@ -12,13 +16,54 @@ from graph_agent.runtime.node_providers import (
     ProviderConfigOptionDefinition,
     ProviderConfigFieldDefinition,
 )
-from graph_agent.tools.base import ToolRegistry
+from graph_agent.tools.base import ToolDefinition, ToolRegistry
 from graph_agent.tools.example_tools import build_search_catalog_tool
+from graph_agent.tools.mcp import McpServerDefinition, McpServerManager
+
+
+def _default_mcp_server_definition() -> McpServerDefinition:
+    src_root = Path(__file__).resolve().parents[2]
+    current_python_path = str(src_root)
+    inherited_python_path = str(sys.path[0]).strip()
+    env_python_path = os.environ.get("PYTHONPATH", "").strip()
+    python_path_parts = [current_python_path]
+    if inherited_python_path and inherited_python_path not in python_path_parts:
+        python_path_parts.append(inherited_python_path)
+    if env_python_path and env_python_path not in python_path_parts:
+        python_path_parts.append(env_python_path)
+    return McpServerDefinition(
+        server_id="weather_mcp",
+        display_name="Weather MCP Server",
+        description="Built-in weather MCP server backed by a live weather lookup tool.",
+        command=[sys.executable, "-m", "graph_agent.tools.weather_mcp_server"],
+        env={"PYTHONPATH": os.pathsep.join(python_path_parts)},
+        auto_boot=False,
+        persistent=True,
+    )
 
 
 def build_example_services() -> RuntimeServices:
     registry = ToolRegistry()
     registry.register(build_search_catalog_tool())
+    registry.register(
+        ToolDefinition(
+            name="weather_current",
+            description="Fetch the current weather conditions for a city or location string.",
+            input_schema={
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"],
+            },
+            source_type="mcp",
+            server_id="weather_mcp",
+            enabled=False,
+            available=False,
+            availability_error="MCP server is offline.",
+            managed=True,
+        )
+    )
+    mcp_server_manager = McpServerManager(registry)
+    mcp_server_manager.register_server(_default_mcp_server_definition())
     node_providers = NodeProviderRegistry()
     node_providers.register(
         NodeProviderDefinition(
@@ -226,6 +271,7 @@ def build_example_services() -> RuntimeServices:
         },
         node_provider_registry=node_providers,
         tool_registry=registry,
+        mcp_server_manager=mcp_server_manager,
         config={
             "max_steps": config.DEFAULT_RUN_MAX_STEPS,
             "max_visits_per_node": config.DEFAULT_MAX_VISITS_PER_NODE,

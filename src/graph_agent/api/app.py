@@ -37,6 +37,10 @@ class GraphPayload(BaseModel):
     agents: Optional[list[dict[str, Any]]] = None
 
 
+class ToolToggleRequest(BaseModel):
+    enabled: bool
+
+
 app = FastAPI(title="Graph Agent API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -128,6 +132,46 @@ def provider_diagnostics(request: ProviderPreflightRequest) -> dict[str, Any]:
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Unknown provider '{request.provider_name}'.") from exc
+
+
+@app.post("/api/editor/mcp/servers/{server_id}/boot")
+def boot_mcp_server(server_id: str) -> dict[str, Any]:
+    try:
+        return manager.boot_mcp_server(server_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown MCP server '{server_id}'.") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/editor/mcp/servers/{server_id}/stop")
+def stop_mcp_server(server_id: str) -> dict[str, Any]:
+    try:
+        return manager.stop_mcp_server(server_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown MCP server '{server_id}'.") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/editor/mcp/servers/{server_id}/refresh")
+def refresh_mcp_server(server_id: str) -> dict[str, Any]:
+    try:
+        return manager.refresh_mcp_server(server_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown MCP server '{server_id}'.") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/editor/mcp/tools/{tool_name}/toggle")
+def toggle_mcp_tool(tool_name: str, request: ToolToggleRequest) -> dict[str, Any]:
+    try:
+        return manager.set_mcp_tool_enabled(tool_name, request.enabled)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown tool '{tool_name}'.") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/graphs/{graph_id}/runs")

@@ -108,6 +108,46 @@ export async function fetchProviderDiagnostics(
   return (await response.json()) as ProviderDiagnosticsResult;
 }
 
+export async function bootMcpServer(serverId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/mcp/servers/${serverId}/boot`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+}
+
+export async function stopMcpServer(serverId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/mcp/servers/${serverId}/stop`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+}
+
+export async function refreshMcpServer(serverId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/mcp/servers/${serverId}/refresh`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+}
+
+export async function setMcpToolEnabled(toolName: string, enabled: boolean): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/mcp/tools/${toolName}/toggle`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ enabled }),
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+}
+
 export async function startRun(graphId: string, input: string): Promise<string> {
   const response = await fetch(`${API_BASE_URL}/api/graphs/${graphId}/runs`, {
     method: "POST",

@@ -185,10 +185,12 @@ export function createNodeFromProvider(
   }
 
   if (provider.node_kind === "data") {
+    const defaultConfig = provider.default_config && typeof provider.default_config === "object" ? provider.default_config : {};
     return {
       ...baseNode,
       config: {
         mode: "passthrough",
+        ...defaultConfig,
       },
     };
   }

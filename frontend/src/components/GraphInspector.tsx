@@ -9,7 +9,7 @@ import {
   providerModelName,
 } from "../lib/editor";
 import { useRenderDiagnostics } from "../lib/dragDiagnostics";
-import type { EditorCatalog, GraphDefinition, GraphEdge, GraphNode, NodeProviderDefinition } from "../lib/types";
+import type { EditorCatalog, GraphDefinition, GraphEdge, GraphNode, NodeProviderDefinition, ToolDefinition } from "../lib/types";
 
 type GraphInspectorProps = {
   graph: GraphDefinition | null;
@@ -33,6 +33,24 @@ function updateEdge(graph: GraphDefinition, edgeId: string, updater: (edge: Grap
     ...graph,
     edges: graph.edges.map((edge) => (edge.id === edgeId ? updater(edge) : edge)),
   };
+}
+
+function isToolOnline(tool: ToolDefinition): boolean {
+  return tool.available !== false;
+}
+
+function isToolEnabled(tool: ToolDefinition): boolean {
+  return tool.enabled !== false;
+}
+
+function toolStatusLabel(tool: ToolDefinition): string {
+  if (!isToolEnabled(tool)) {
+    return "disabled";
+  }
+  if (!isToolOnline(tool)) {
+    return "offline";
+  }
+  return "ready";
 }
 
 export function GraphInspector({
@@ -132,6 +150,7 @@ export function GraphInspector({
     const selectedProvider = findProviderDefinition(catalog, selectedProviderName);
     const providerConfigFields = selectedProvider?.config_fields ?? [];
     const providerStatus = catalog?.provider_statuses?.[selectedProviderName];
+    const catalogTools = catalog?.tools ?? [];
     const isDiscordStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.discord_message";
     const isManualStartNode =
       selectedNode.kind === "input" &&
@@ -542,13 +561,15 @@ export function GraphInspector({
               </label>
               <div className="checkbox-grid">
                 <strong>Available Tools</strong>
-                {(catalog?.tools ?? []).map((tool) => {
+                {catalogTools.map((tool) => {
                   const isChecked = allowedTools.includes(tool.name);
+                  const canSelectTool = isToolEnabled(tool) && isToolOnline(tool);
                   return (
                     <label key={tool.name} className="checkbox-option">
                       <input
                         type="checkbox"
                         checked={isChecked}
+                        disabled={!isChecked && !canSelectTool}
                         onChange={(event) => {
                           const nextTools = event.target.checked
                             ? [...allowedTools, tool.name]
@@ -566,7 +587,10 @@ export function GraphInspector({
                           );
                         }}
                       />
-                      <span>{tool.name}</span>
+                      <span>
+                        {tool.name}
+                        <small>{toolStatusLabel(tool)}</small>
+                      </span>
                     </label>
                   );
                 })}
@@ -588,27 +612,60 @@ export function GraphInspector({
             </>
           ) : null}
           {selectedNode.kind === "tool" ? (
-            <label>
-              Tool
-              <select
-                value={String(selectedNode.config.tool_name ?? selectedNode.tool_name ?? "")}
-                onChange={(event) =>
-                  onGraphChange(
-                    updateNode(graph, selectedNode.id, (node) => ({
-                      ...node,
-                      tool_name: event.target.value,
-                      config: { ...node.config, tool_name: event.target.value },
-                    })),
-                  )
+            <>
+              <label>
+                Tool
+                <select
+                  value={String(selectedNode.config.tool_name ?? selectedNode.tool_name ?? "")}
+                  onChange={(event) =>
+                    onGraphChange(
+                      updateNode(graph, selectedNode.id, (node) => ({
+                        ...node,
+                        tool_name: event.target.value,
+                        config: { ...node.config, tool_name: event.target.value },
+                      })),
+                    )
+                  }
+                >
+                  {catalogTools.map((tool) => (
+                    <option key={tool.name} value={tool.name}>
+                      {tool.name} ({toolStatusLabel(tool)})
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {(() => {
+                const selectedTool = catalogTools.find(
+                  (tool) => tool.name === String(selectedNode.config.tool_name ?? selectedNode.tool_name ?? ""),
+                );
+                if (!selectedTool || selectedTool.source_type !== "mcp") {
+                  return null;
                 }
-              >
-                {(catalog?.tools ?? []).map((tool) => (
-                  <option key={tool.name} value={tool.name}>
-                    {tool.name}
-                  </option>
-                ))}
-              </select>
-            </label>
+                return (
+                  <label className="checkbox-option">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(selectedNode.config.include_mcp_tool_context)}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              include_mcp_tool_context: event.target.checked,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                    <span>
+                      Pass MCP Context To Model Provider
+                      <small>Expose this tool node's MCP metadata to connected or targeted model nodes as `mcp_tool_context`.</small>
+                    </span>
+                  </label>
+                );
+              })()}
+            </>
           ) : null}
           {selectedNode.kind === "data" ? (
             <>
@@ -629,21 +686,23 @@ export function GraphInspector({
                   <option value="template">template</option>
                 </select>
               </label>
-              <label>
-                Template
-                <textarea
-                  rows={4}
-                  value={String(selectedNode.config.template ?? "{input_payload}")}
-                  onChange={(event) =>
-                    onGraphChange(
-                      updateNode(graph, selectedNode.id, (node) => ({
-                        ...node,
-                        config: { ...node.config, template: event.target.value },
-                      })),
-                    )
-                  }
-                />
-              </label>
+              {String(selectedNode.config.mode ?? "passthrough") === "template" ? (
+                <label>
+                  Template
+                  <textarea
+                    rows={4}
+                    value={String(selectedNode.config.template ?? "{input_payload}")}
+                    onChange={(event) =>
+                      onGraphChange(
+                        updateNode(graph, selectedNode.id, (node) => ({
+                          ...node,
+                          config: { ...node.config, template: event.target.value },
+                        })),
+                      )
+                    }
+                  />
+                </label>
+              ) : null}
             </>
           ) : null}
           {onSaveNode ? (

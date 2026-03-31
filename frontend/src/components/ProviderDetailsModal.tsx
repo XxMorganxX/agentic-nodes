@@ -6,12 +6,19 @@ import { findProviderDefinition, modelProviderDefinitions, providerDefaultConfig
 import { getGraphEnvVars, resolveGraphEnvReferences } from "../lib/graphEnv";
 import type { EditorCatalog, GraphDefinition, GraphNode, ProviderDiagnosticsResult, ProviderPreflightResult } from "../lib/types";
 
+const LIVE_PROVIDER_VERIFICATION_STORAGE_KEY = "agentic-nodes-live-provider-verifications";
+
 type ProviderDetailsModalProps = {
   graph: GraphDefinition;
   node: GraphNode;
   catalog: EditorCatalog | null;
   onGraphChange: (graph: GraphDefinition) => void;
   onClose: () => void;
+};
+
+type PersistedProviderVerification = {
+  preflightResult: ProviderPreflightResult;
+  diagnostics: ProviderDiagnosticsResult;
 };
 
 function updateModelNode(
@@ -31,6 +38,41 @@ function resolveProviderDefinition(node: GraphNode, catalog: EditorCatalog | nul
     return null;
   }
   return findProviderDefinition(catalog, providerName);
+}
+
+function readPersistedProviderVerifications(): Record<string, PersistedProviderVerification> {
+  try {
+    const raw = localStorage.getItem(LIVE_PROVIDER_VERIFICATION_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return parsed as Record<string, PersistedProviderVerification>;
+  } catch {
+    return {};
+  }
+}
+
+function getPersistedProviderVerification(storageKey: string): PersistedProviderVerification | null {
+  const verifications = readPersistedProviderVerifications();
+  const verification = verifications[storageKey];
+  return verification ?? null;
+}
+
+function persistProviderVerification(storageKey: string, verification: PersistedProviderVerification): void {
+  const verifications = readPersistedProviderVerifications();
+  verifications[storageKey] = verification;
+  localStorage.setItem(LIVE_PROVIDER_VERIFICATION_STORAGE_KEY, JSON.stringify(verifications));
+}
+
+function buildProviderVerificationStorageKey(providerName: string, providerConfig: Record<string, unknown>): string {
+  return JSON.stringify({
+    provider_name: providerName,
+    provider_config: providerConfig,
+  });
 }
 
 export function ProviderDetailsModal({
@@ -69,6 +111,15 @@ export function ProviderDetailsModal({
     });
     return Object.fromEntries(entries);
   }, [node.config, providerConfigFields, providerName]);
+  const verificationStorageKey = useMemo(
+    () => buildProviderVerificationStorageKey(providerName, preflightConfig),
+    [preflightConfig, providerName],
+  );
+  const [persistedVerification, setPersistedVerification] = useState<PersistedProviderVerification | null>(null);
+
+  useEffect(() => {
+    setPersistedVerification(getPersistedProviderVerification(verificationStorageKey));
+  }, [verificationStorageKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -110,6 +161,32 @@ export function ProviderDetailsModal({
       cancelled = true;
     };
   }, [preflightConfig, providerName]);
+
+  const displayedPreflightResult = useMemo(() => {
+    if (
+      preflightResult?.status === "installed" &&
+      diagnostics?.authentication_status === "not_checked" &&
+      persistedVerification?.diagnostics.active_backend === diagnostics.active_backend
+    ) {
+      return persistedVerification.preflightResult;
+    }
+    return preflightResult;
+  }, [diagnostics, persistedVerification, preflightResult]);
+
+  const displayedDiagnostics = useMemo(() => {
+    if (
+      diagnostics &&
+      diagnostics.authentication_status === "not_checked" &&
+      persistedVerification?.diagnostics.active_backend === diagnostics.active_backend
+    ) {
+      return {
+        ...diagnostics,
+        authentication_status: persistedVerification.diagnostics.authentication_status,
+        preflight: persistedVerification.preflightResult,
+      };
+    }
+    return diagnostics;
+  }, [diagnostics, persistedVerification]);
 
   function updateProviderConfig(key: string, value: string | number) {
     onGraphChange(
@@ -182,6 +259,9 @@ export function ProviderDetailsModal({
       ]);
       setPreflightResult(result);
       setDiagnostics(diagnosticsResult);
+      const verification = { preflightResult: result, diagnostics: diagnosticsResult };
+      persistProviderVerification(verificationStorageKey, verification);
+      setPersistedVerification(verification);
     } catch {
       setPreflightError("Live provider verification failed.");
       setPreflightResult(null);
@@ -241,16 +321,16 @@ export function ProviderDetailsModal({
                 ))}
               </div>
             ) : null}
-            {preflightResult ? (
+            {displayedPreflightResult ? (
               <div className="tool-details-modal-help">
                 <strong>Provider Health</strong>
-                <div>{preflightResult.message}</div>
-                {preflightResult.warnings?.map((warning) => (
+                <div>{displayedPreflightResult.message}</div>
+                {displayedPreflightResult.warnings?.map((warning) => (
                   <div key={warning}>{warning}</div>
                 ))}
               </div>
             ) : null}
-            {diagnostics ? (
+            {displayedDiagnostics ? (
               <div className="tool-details-modal-help">
                 <strong>Provider Diagnostics</strong>
                 <div className="provider-diagnostics-card">
@@ -258,45 +338,45 @@ export function ProviderDetailsModal({
                     <div className="provider-diagnostics-section-title">Backend</div>
                     <div className="provider-diagnostics-row">
                       <span>Active backend</span>
-                      <strong>{diagnostics.active_backend}</strong>
+                      <strong>{displayedDiagnostics.active_backend}</strong>
                     </div>
                     <div className="provider-diagnostics-row">
                       <span>Authentication status</span>
-                      <strong>{diagnostics.authentication_status}</strong>
+                      <strong>{displayedDiagnostics.authentication_status}</strong>
                     </div>
                   </div>
-                  {diagnostics.active_backend === "claude_code" ? (
+                  {displayedDiagnostics.active_backend === "claude_code" ? (
                     <div className="provider-diagnostics-section">
                       <div className="provider-diagnostics-section-title">Claude Code</div>
                       <div className="provider-diagnostics-row">
                         <span>Claude binary</span>
-                        <strong>{diagnostics.claude_binary_exists ? "found" : "not found"}</strong>
+                        <strong>{displayedDiagnostics.claude_binary_exists ? "found" : "not found"}</strong>
                       </div>
                     </div>
                   ) : null}
-                  {diagnostics.active_backend === "claude_code" || diagnostics.active_backend === "anthropic_api" ? (
+                  {displayedDiagnostics.active_backend === "claude_code" || displayedDiagnostics.active_backend === "anthropic_api" ? (
                     <div className="provider-diagnostics-section">
                       <div className="provider-diagnostics-section-title">Environment</div>
                       <div className="provider-diagnostics-row">
                         <span>`ANTHROPIC_API_KEY` present</span>
-                        <strong>{diagnostics.anthropic_api_key_present ? "yes" : "no"}</strong>
+                        <strong>{displayedDiagnostics.anthropic_api_key_present ? "yes" : "no"}</strong>
                       </div>
                     </div>
                   ) : null}
-                {diagnostics.child_env_sanitized ? (
+                {displayedDiagnostics.child_env_sanitized ? (
                     <div className="provider-diagnostics-section">
                       <div className="provider-diagnostics-section-title">Child Process</div>
                       <div className="provider-diagnostics-list">
                         <div>Sanitized environment enabled.</div>
-                        <div>Strips: {diagnostics.sanitized_env_removed_vars.join(", ")}</div>
+                        <div>Strips: {displayedDiagnostics.sanitized_env_removed_vars.join(", ")}</div>
                       </div>
                     </div>
                 ) : null}
-                  {diagnostics.warning ? (
+                  {displayedDiagnostics.warning ? (
                     <div className="provider-diagnostics-section">
                       <div className="provider-diagnostics-section-title">Warning</div>
                       <div className="provider-diagnostics-list">
-                        <div>{diagnostics.warning}</div>
+                        <div>{displayedDiagnostics.warning}</div>
                       </div>
                     </div>
                   ) : null}

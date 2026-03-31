@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 import unittest
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,9 +18,12 @@ if str(SRC) not in sys.path:
 from graph_agent.api.manager import GraphRunManager
 from graph_agent.examples.tool_schema_repair import build_example_graph_payload, build_example_services
 from graph_agent.providers.base import ModelMessage, ModelRequest, ModelToolDefinition
+from graph_agent.providers.base import ModelProvider, ModelResponse, ProviderPreflightResult
 from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
 from graph_agent.providers.vendor_api import ClaudeMessagesModelProvider, OpenAIChatModelProvider
 from graph_agent.runtime.core import GraphDefinition, GraphValidationError
+from graph_agent.runtime.engine import GraphRuntime
+from graph_agent.tools.base import ToolContext, ToolDefinition
 
 
 SEARCH_CATALOG_TOOL = ModelToolDefinition(
@@ -98,6 +103,49 @@ def _print_model_debug(
     }
     print(f"\n=== {title} ===")
     print(json.dumps(debug_payload, indent=2, sort_keys=True))
+
+
+class _WeatherStubHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        payload = {
+            "current_condition": [
+                {
+                    "temp_C": "22",
+                    "temp_F": "72",
+                    "FeelsLikeC": "24",
+                    "FeelsLikeF": "75",
+                    "humidity": "76",
+                    "windspeedKmph": "14",
+                    "winddir16Point": "SW",
+                    "observation_time": "04:08 PM",
+                    "weatherDesc": [{"value": "Partly cloudy"}],
+                }
+            ],
+            "nearest_area": [{"areaName": [{"value": "Testville"}]}],
+        }
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+        return
+
+
+class WeatherStubServer:
+    def __enter__(self) -> str:
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _WeatherStubHandler)
+        self._thread = Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        host, port = self._server.server_address
+        return f"http://{host}:{port}"
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2)
 
 
 class StubOpenAIProvider(OpenAIChatModelProvider):
@@ -192,6 +240,16 @@ class StubClaudeCodeProvider(ClaudeCodeCLIModelProvider):
             "usage": {"input_tokens": 10, "output_tokens": 6},
         }
         return self.last_payload
+
+
+class ContextEchoProvider(ModelProvider):
+    name = "context_echo"
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        return ModelResponse(content="", structured_output=request.metadata.get("mcp_tool_context"))
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
 
 
 class ModelProviderTests(unittest.TestCase):
@@ -416,6 +474,185 @@ class ModelProviderTests(unittest.TestCase):
         )
         self.assertEqual(claude_code_provider["model_provider_name"], "claude_code")
         self.assertTrue(claude_code_provider["config_fields"])
+
+    def test_manager_catalog_includes_mcp_servers_and_tool_metadata(self) -> None:
+        manager = GraphRunManager(services=build_example_services())
+        catalog = manager.get_catalog()
+
+        self.assertIn("mcp_servers", catalog)
+        self.assertTrue(any(server["server_id"] == "weather_mcp" for server in catalog["mcp_servers"]))
+        weather_tool = next(tool for tool in catalog["tools"] if tool["name"] == "weather_current")
+        self.assertEqual(weather_tool["source_type"], "mcp")
+        self.assertFalse(weather_tool["enabled"])
+        self.assertFalse(weather_tool["available"])
+        self.assertEqual(weather_tool["schema_origin"], "static")
+
+    def test_graph_validation_rejects_offline_mcp_tools(self) -> None:
+        services = build_example_services()
+        payload = build_example_graph_payload()
+
+        for node in payload["nodes"]:
+            if node["kind"] == "model":
+                node["config"]["response_mode"] = "tool_call"
+                node["config"]["allowed_tool_names"] = ["weather_current"]
+                node["config"]["preferred_tool_name"] = "weather_current"
+            if node["kind"] == "tool":
+                node["tool_name"] = "weather_current"
+                node["config"]["tool_name"] = "weather_current"
+
+        with self.assertRaises(GraphValidationError):
+            GraphDefinition.from_dict(payload).validate_against_services(services)
+
+    def test_booted_enabled_mcp_tools_can_validate_and_execute(self) -> None:
+        services = build_example_services()
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    server = manager.boot_mcp_server("weather_mcp")
+                    self.assertTrue(server["running"])
+                    manager.set_mcp_tool_enabled("weather_current", True)
+
+                    catalog = manager.get_catalog()
+                    weather_tool = next(tool for tool in catalog["tools"] if tool["name"] == "weather_current")
+                    self.assertTrue(weather_tool["available"])
+                    self.assertEqual(weather_tool["schema_origin"], "discovered")
+
+                    payload = build_example_graph_payload()
+                    for node in payload["nodes"]:
+                        if node["kind"] == "model":
+                            node["config"]["response_mode"] = "tool_call"
+                            node["config"]["allowed_tool_names"] = ["weather_current"]
+                            node["config"]["preferred_tool_name"] = "weather_current"
+                        if node["kind"] == "tool":
+                            node["tool_name"] = "weather_current"
+                            node["config"]["tool_name"] = "weather_current"
+
+                    GraphDefinition.from_dict(payload).validate_against_services(services)
+
+                    result = services.tool_registry.invoke(
+                        "weather_current",
+                        {"location": "Austin"},
+                        ToolContext(run_id="run-1", graph_id="graph-1", node_id="tool-node", state_snapshot={}),
+                    )
+                    self.assertEqual(result.status, "success")
+                    self.assertEqual(result.output["resolved_location"], "Testville")
+                    self.assertEqual(result.output["condition"], "Partly cloudy")
+                    self.assertEqual(result.output["temperature_c"], "22")
+            finally:
+                manager.stop_background_services()
+
+    def test_mcp_boot_reports_schema_drift_when_live_tool_metadata_changes(self) -> None:
+        services = build_example_services()
+        manager = GraphRunManager(services=services)
+        services.tool_registry.upsert(
+            ToolDefinition(
+                name="weather_current",
+                description="Outdated preregistered schema.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+                source_type="mcp",
+                server_id="weather_mcp",
+                enabled=False,
+                available=False,
+                availability_error="MCP server is offline.",
+                managed=True,
+            )
+        )
+        try:
+            manager.boot_mcp_server("weather_mcp")
+            catalog = manager.get_catalog()
+            weather_tool = next(tool for tool in catalog["tools"] if tool["name"] == "weather_current")
+            self.assertEqual(weather_tool["schema_origin"], "discovered")
+            self.assertIn("differs", weather_tool["schema_warning"])
+        finally:
+            manager.stop_background_services()
+
+    def test_model_nodes_receive_targeted_tool_node_mcp_context_metadata(self) -> None:
+        services = build_example_services()
+        services.model_providers["context_echo"] = ContextEchoProvider()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "mcp-context-graph",
+            "name": "MCP Context Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "weather_tool",
+                    "kind": "tool",
+                    "category": "tool",
+                    "label": "Weather Tool",
+                    "provider_id": "tool.registry",
+                    "provider_label": "Registry Tool Node",
+                    "tool_name": "weather_current",
+                    "config": {"tool_name": "weather_current", "include_mcp_tool_context": True},
+                    "position": {"x": 100, "y": 0},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": "context_echo",
+                    "prompt_name": "context_prompt",
+                    "config": {
+                        "provider_name": "context_echo",
+                        "prompt_name": "context_prompt",
+                        "system_prompt": "Use the MCP context.",
+                        "user_message_template": "{mcp_tool_context}",
+                        "response_mode": "message",
+                        "tool_target_node_ids": ["weather_tool"],
+                    },
+                    "position": {"x": 200, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_envelope", "source": "model"}},
+                    "position": {"x": 300, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {"id": "e2", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, {"request": "weather please"}, run_id="run-mcp-context")
+        self.assertEqual(state.status, "completed")
+        payload = state.final_output
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["tool_names"], ["weather_current"])
+        self.assertEqual(payload["tool_nodes"][0]["tool_name"], "weather_current")
+        self.assertEqual(payload["tool_nodes"][0]["tool_node_id"], "weather_tool")
+        self.assertEqual(payload["tool_nodes"][0]["server"]["server_id"], "weather_mcp")
 
     def test_graphs_can_swap_between_registered_model_providers(self) -> None:
         services = build_example_services()

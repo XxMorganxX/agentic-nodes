@@ -86,7 +86,30 @@ class GraphRunManager:
         return {
             **self._store.catalog(),
             "provider_statuses": provider_statuses,
+            "mcp_servers": (
+                self._services.mcp_server_manager.list_servers() if self._services.mcp_server_manager is not None else []
+            ),
         }
+
+    def boot_mcp_server(self, server_id: str) -> dict[str, Any]:
+        if self._services.mcp_server_manager is None:
+            raise RuntimeError("MCP server manager is not configured.")
+        return self._services.mcp_server_manager.boot_server(server_id)
+
+    def stop_mcp_server(self, server_id: str) -> dict[str, Any]:
+        if self._services.mcp_server_manager is None:
+            raise RuntimeError("MCP server manager is not configured.")
+        return self._services.mcp_server_manager.stop_server(server_id)
+
+    def refresh_mcp_server(self, server_id: str) -> dict[str, Any]:
+        if self._services.mcp_server_manager is None:
+            raise RuntimeError("MCP server manager is not configured.")
+        return self._services.mcp_server_manager.refresh_server(server_id)
+
+    def set_mcp_tool_enabled(self, tool_name: str, enabled: bool) -> dict[str, Any]:
+        if self._services.mcp_server_manager is None:
+            raise RuntimeError("MCP server manager is not configured.")
+        return self._services.mcp_server_manager.set_tool_enabled(tool_name, enabled)
 
     def preflight_provider(
         self,
@@ -227,9 +250,13 @@ class GraphRunManager:
 
     def start_background_services(self) -> None:
         self._sync_discord_service()
+        if self._services.mcp_server_manager is not None:
+            self._services.mcp_server_manager.start_auto_boot()
 
     def stop_background_services(self) -> None:
         self._discord_service.stop()
+        if self._services.mcp_server_manager is not None:
+            self._services.mcp_server_manager.shutdown_all()
 
     def handle_discord_message(self, message: DiscordMessageEvent) -> list[str]:
         run_ids: list[str] = []

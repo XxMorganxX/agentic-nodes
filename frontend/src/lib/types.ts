@@ -107,6 +107,27 @@ export type ToolDefinition = {
   name: string;
   description: string;
   input_schema: Record<string, unknown>;
+  source_type?: string;
+  server_id?: string | null;
+  enabled?: boolean;
+  available?: boolean;
+  availability_error?: string;
+  schema_origin?: string;
+  schema_warning?: string;
+  managed?: boolean;
+};
+
+export type McpServerStatus = {
+  server_id: string;
+  display_name: string;
+  description: string;
+  auto_boot: boolean;
+  persistent: boolean;
+  running: boolean;
+  tool_names: string[];
+  error: string;
+  pid?: number | null;
+  booted_at?: string | null;
 };
 
 export type ConnectionRule = {
@@ -128,6 +149,7 @@ export type EditorCatalog = {
   connection_rules: ConnectionRule[];
   contracts: Record<string, CategoryContract>;
   provider_statuses?: Record<string, ProviderPreflightResult>;
+  mcp_servers?: McpServerStatus[];
 };
 
 export type ProviderPreflightResult = {

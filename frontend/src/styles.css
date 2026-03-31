@@ -600,10 +600,11 @@ pre {
 .hero-mosaic {
   display: grid;
   grid-template-columns: minmax(360px, 1.5fr) minmax(280px, 1fr) minmax(220px, 0.6fr);
-  grid-template-rows: auto auto;
+  grid-template-rows: auto auto auto;
   grid-template-areas:
     "title  graph  env"
-    "execution execution env";
+    "execution execution env"
+    "execution execution mcp";
   align-items: start;
   column-gap: 1.2rem;
   row-gap: 1.35rem;
@@ -627,6 +628,13 @@ pre {
 }
 .mosaic-env {
   grid-area: env;
+  align-self: start;
+  justify-self: end;
+  width: min(100%, 420px);
+  margin-bottom: 1.65rem;
+}
+.mosaic-mcp {
+  grid-area: mcp;
   align-self: start;
   justify-self: end;
   width: min(100%, 420px);
@@ -736,6 +744,17 @@ pre {
   flex-direction: column;
   max-height: fit-content;
   padding: 0.95rem 1rem;
+}
+
+.mosaic-mcp {
+  display: flex;
+  flex-direction: column;
+  max-height: fit-content;
+  padding: 0.95rem 1rem;
+}
+
+.mosaic-mcp .mcp-server-panel {
+  gap: 0.65rem;
 }
 
 .mosaic-env .env-tiles {
@@ -3103,9 +3122,92 @@ pre {
   color: #b4b6d0;
 }
 
+.checkbox-option span {
+  display: grid;
+  gap: 0.12rem;
+}
+
+.checkbox-option small {
+  color: #7c7e9c;
+  font-size: 0.72rem;
+}
+
 .checkbox-option input[type="checkbox"] {
   width: auto;
   accent-color: #6c5ce7;
+}
+
+.mcp-server-panel {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.mcp-server-card {
+  display: grid;
+  gap: 0.75rem;
+  padding: 0.85rem;
+  border-radius: 12px;
+  background: #141526;
+  border: 1px solid #2a2d49;
+}
+
+.mcp-server-card-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.mcp-server-card-header p {
+  margin: 0.2rem 0 0;
+  color: #8486a5;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.mcp-server-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+  padding: 0.2rem 0.65rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.status-pill.is-ready {
+  background: rgba(74, 222, 128, 0.15);
+  color: #74f0b8;
+  border: 1px solid rgba(74, 222, 128, 0.28);
+}
+
+.status-pill.is-muted {
+  background: rgba(148, 163, 184, 0.12);
+  color: #b4b6d0;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.mcp-tool-list {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.mcp-tool-option {
+  justify-content: space-between;
+}
+
+.inspector-hint {
+  margin: 0;
+  color: #7c7e9c;
+  font-size: 0.82rem;
 }
 
 /* ── Saved nodes ── */
@@ -3476,6 +3578,7 @@ pre {
       "title"
       "graph"
       "env"
+      "mcp"
       "execution";
     gap: 1.4rem;
     padding-left: 0.5rem;
@@ -3491,7 +3594,8 @@ pre {
     padding-bottom: 1.25rem;
   }
 
-  .mosaic-env {
+  .mosaic-env,
+  .mosaic-mcp {
     align-self: start;
     justify-self: stretch;
     width: 100%;

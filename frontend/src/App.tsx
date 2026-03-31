@@ -1,17 +1,22 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AgentRunSwimlanes } from "./components/AgentRunSwimlanes";
 import { EnvironmentRunSummary } from "./components/EnvironmentRunSummary";
 import { GraphCanvas } from "./components/GraphCanvas";
 import { GraphEnvEditor } from "./components/GraphEnvEditor";
+import { McpServerPanel } from "./components/McpServerPanel";
 import {
+  bootMcpServer,
   createGraph,
   deleteGraph,
   eventStreamUrl,
   fetchEditorCatalog,
   fetchGraph,
   fetchGraphs,
+  refreshMcpServer,
+  setMcpToolEnabled,
   startRun,
+  stopMcpServer,
   updateGraph,
 } from "./lib/api";
 import { createBlankGraph, layoutGraphDocument, layoutGraphLR, normalizeGraphDocument } from "./lib/editor";
@@ -167,6 +172,7 @@ export default function App() {
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [mcpPendingKey, setMcpPendingKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const sourceRef = useRef<EventSource | null>(null);
   const executionBoxRef = useRef<HTMLDivElement | null>(null);
@@ -193,8 +199,14 @@ export default function App() {
   const draftGraphSnapshot = useMemo(() => serializeGraphSnapshot(draftGraph), [draftGraph]);
   const hasUnsavedChanges = Boolean(draftGraph) && draftGraphSnapshot !== savedGraphSnapshot;
 
+  const refreshCatalog = useCallback(async () => {
+    const loadedCatalog = await fetchEditorCatalog();
+    setCatalog(loadedCatalog);
+    return loadedCatalog;
+  }, []);
+
   useEffect(() => {
-    Promise.all([fetchGraphs(), fetchEditorCatalog()])
+    Promise.all([fetchGraphs(), refreshCatalog()])
       .then(([loadedGraphs, loadedCatalog]) => {
         setGraphs(loadedGraphs);
         setCatalog(loadedCatalog);
@@ -209,7 +221,7 @@ export default function App() {
       .catch((loadError: Error) => {
         setError(loadError.message);
       });
-  }, [resetHistory]);
+  }, [refreshCatalog, resetHistory]);
 
   useEffect(() => {
     return () => {
@@ -261,6 +273,20 @@ export default function App() {
       setSelectedGraphId("");
       resetHistory(createBlankGraph());
       setSelectedAgentId(null);
+    }
+  }
+
+  async function runMcpAction(actionKey: string, callback: () => Promise<void>) {
+    setMcpPendingKey(actionKey);
+    setError(null);
+    try {
+      await callback();
+      await refreshCatalog();
+    } catch (actionError) {
+      const message = actionError instanceof Error ? actionError.message : "Unable to update MCP state.";
+      setError(message);
+    } finally {
+      setMcpPendingKey(null);
     }
   }
 
@@ -472,6 +498,21 @@ export default function App() {
             <h2>Environment</h2>
             <GraphEnvEditor graph={draftGraph} onGraphChange={setDraftGraph} />
           </div>
+
+          {(catalog?.mcp_servers?.length ?? 0) > 0 ? (
+            <div className="mosaic-tile panel mosaic-mcp">
+              <McpServerPanel
+                catalog={catalog}
+                onBootMcpServer={(serverId) => void runMcpAction(`boot:${serverId}`, () => bootMcpServer(serverId))}
+                onStopMcpServer={(serverId) => void runMcpAction(`stop:${serverId}`, () => stopMcpServer(serverId))}
+                onRefreshMcpServer={(serverId) => void runMcpAction(`refresh:${serverId}`, () => refreshMcpServer(serverId))}
+                onToggleMcpTool={(toolName, enabled) => void runMcpAction(`tool:${toolName}`, () => setMcpToolEnabled(toolName, enabled))}
+                mcpPendingKey={mcpPendingKey}
+                title="Project MCP"
+                description="Manage project-level MCP servers. Tool and model nodes can consume these tools, but they do not own the server lifecycle."
+              />
+            </div>
+          ) : null}
         </div>
 
         {environmentRunSummary ? <EnvironmentRunSummary summary={environmentRunSummary} /> : null}
