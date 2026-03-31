@@ -28,6 +28,11 @@ import { useGraphHistory } from "./lib/useGraphHistory";
 const DEFAULT_INPUT = "Find graph-agent references for a schema repair workflow.";
 const DEFAULT_TEST_ENVIRONMENT_ID = "test-environment";
 
+function getSavedInputPrompt(graph: GraphDocument | null | undefined): string {
+  const savedPrompt = typeof graph?.default_input === "string" ? graph.default_input.trim() : "";
+  return savedPrompt || DEFAULT_INPUT;
+}
+
 function createEmptyRunState(runId: string, graphId: string, input: string): RunState {
   return {
     run_id: runId,
@@ -36,11 +41,13 @@ function createEmptyRunState(runId: string, graphId: string, input: string): Run
     agent_name: null,
     parent_run_id: null,
     current_node_id: null,
+    current_edge_id: null,
     status: "queued",
     started_at: null,
     ended_at: null,
     input_payload: input,
     node_outputs: {},
+    edge_outputs: {},
     node_errors: {},
     visit_counts: {},
     transition_history: [],
@@ -167,6 +174,7 @@ export default function App() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [input, setInput] = useState(DEFAULT_INPUT);
+  const [savedInputPrompt, setSavedInputPrompt] = useState(DEFAULT_INPUT);
   const [events, setEvents] = useState<RuntimeEvent[]>([]);
   const [runState, setRunState] = useState<RunState | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
@@ -197,7 +205,7 @@ export default function App() {
     [canvasGraph, filteredEvents],
   );
   const draftGraphSnapshot = useMemo(() => serializeGraphSnapshot(draftGraph), [draftGraph]);
-  const hasUnsavedChanges = Boolean(draftGraph) && draftGraphSnapshot !== savedGraphSnapshot;
+  const hasUnsavedChanges = (Boolean(draftGraph) && draftGraphSnapshot !== savedGraphSnapshot) || input !== savedInputPrompt;
 
   const refreshCatalog = useCallback(async () => {
     const loadedCatalog = await fetchEditorCatalog();
@@ -216,6 +224,8 @@ export default function App() {
           const blankGraph = createBlankGraph();
           resetHistory(blankGraph);
           setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
+          setInput(DEFAULT_INPUT);
+          setSavedInputPrompt(DEFAULT_INPUT);
         }
       })
       .catch((loadError: Error) => {
@@ -238,6 +248,9 @@ export default function App() {
         const nextGraph = layoutGraphDocument(graph);
         resetHistory(nextGraph);
         setSavedGraphSnapshot(serializeGraphSnapshot(nextGraph));
+        const nextInput = getSavedInputPrompt(nextGraph);
+        setInput(nextInput);
+        setSavedInputPrompt(nextInput);
         setSelectedAgentId(getDefaultAgentId(nextGraph));
         setSelectedNodeId(null);
         setSelectedEdgeId(null);
@@ -270,8 +283,12 @@ export default function App() {
     if (nextSelectedGraphId) {
       setSelectedGraphId(nextSelectedGraphId);
     } else if (loadedGraphs.length === 0) {
+      const blankGraph = createBlankGraph();
       setSelectedGraphId("");
-      resetHistory(createBlankGraph());
+      resetHistory(blankGraph);
+      setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
+      setInput(DEFAULT_INPUT);
+      setSavedInputPrompt(DEFAULT_INPUT);
       setSelectedAgentId(null);
     }
   }
@@ -297,13 +314,17 @@ export default function App() {
     setIsSaving(true);
     setError(null);
     try {
-      const normalized = normalizeGraphDocument(draftGraph);
+      const normalized = {
+        ...normalizeGraphDocument(draftGraph),
+        default_input: input,
+      } satisfies GraphDocument;
       const savedGraph =
         selectedGraphId && persistedGraphIds.has(selectedGraphId)
           ? await updateGraph(selectedGraphId, normalized)
           : await createGraph(normalized);
       await refreshGraphs(savedGraph.graph_id);
       setSavedGraphSnapshot(serializeGraphSnapshot(savedGraph));
+      setSavedInputPrompt(getSavedInputPrompt(savedGraph));
       setDraftGraph(savedGraph);
       if (isTestEnvironment(savedGraph)) {
         setSelectedAgentId((current) => current ?? getDefaultAgentId(savedGraph));
@@ -325,6 +346,8 @@ export default function App() {
     setSelectedAgentId(null);
     resetHistory(blankGraph);
     setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
+    setInput(DEFAULT_INPUT);
+    setSavedInputPrompt(DEFAULT_INPUT);
     setSelectedNodeId(null);
     setSelectedEdgeId(null);
     setActiveRunId(null);
@@ -350,6 +373,8 @@ export default function App() {
         setSelectedAgentId(null);
         resetHistory(blankGraph);
         setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
+        setInput(DEFAULT_INPUT);
+        setSavedInputPrompt(DEFAULT_INPUT);
       }
       setSelectedNodeId(null);
       setSelectedEdgeId(null);

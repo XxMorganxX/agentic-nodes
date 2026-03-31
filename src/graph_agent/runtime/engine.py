@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from typing import Any
 from collections.abc import Callable
 from uuid import uuid4
@@ -54,7 +55,7 @@ class GraphRuntime:
             run_id=run_id or str(uuid4()),
             status="running",
         )
-        current_node_id = graph.start_node_id
+        pending_nodes = deque([{"node_id": graph.start_node_id, "incoming_edge_id": None}])
 
         self.emit(
             state,
@@ -64,8 +65,12 @@ class GraphRuntime:
         )
 
         step = 0
-        while step < self.max_steps:
+        while pending_nodes and step < self.max_steps:
+            frame = pending_nodes.popleft()
+            current_node_id = str(frame["node_id"])
             state.current_node_id = current_node_id
+            incoming_edge_id = frame.get("incoming_edge_id")
+            state.current_edge_id = str(incoming_edge_id) if incoming_edge_id is not None else None
             visit_count = state.visit_counts.get(current_node_id, 0) + 1
             state.visit_counts[current_node_id] = visit_count
 
@@ -123,46 +128,53 @@ class GraphRuntime:
                     "node_provider_label": node.provider_label,
                     "status": result.status,
                     "output": result.output,
+                    "route_outputs": result.route_outputs,
                     "error": result.error,
                     "metadata": result.metadata,
                 },
             )
 
             if node.kind == "output":
-                state.final_output = result.output
-                state.status = "completed"
-                completion_event = self.emit(
-                    state,
-                    "run.completed",
-                    "Run completed successfully.",
-                    {"final_output": state.final_output, "terminal_node_id": node.id},
-                )
-                state.ended_at = completion_event.timestamp
-                return state
+                if state.final_output is None:
+                    state.final_output = result.output
+                if not pending_nodes:
+                    state.status = "completed"
+                    completion_event = self.emit(
+                        state,
+                        "run.completed",
+                        "Run completed successfully.",
+                        {"final_output": state.final_output, "terminal_node_id": node.id},
+                    )
+                    state.ended_at = completion_event.timestamp
+                    return state
+                step += 1
+                continue
 
-            next_edge = self.select_edge(graph, state, node.id, result)
-            if next_edge is None:
+            next_edges = self.select_edges(graph, state, node.id, result)
+            if not next_edges:
                 return self.fail_run(
                     state,
                     summary=f"No outgoing edge matched after node '{node.id}'.",
                     error={"type": "no_matching_edge", "node_id": node.id},
                 )
 
-            state.transition_history.append(
-                TransitionRecord(
-                    edge_id=next_edge.id,
-                    source_id=next_edge.source_id,
-                    target_id=next_edge.target_id,
+            for next_edge, edge_result in next_edges:
+                if edge_result.output is not None:
+                    state.edge_outputs[next_edge.id] = edge_result.output
+                state.transition_history.append(
+                    TransitionRecord(
+                        edge_id=next_edge.id,
+                        source_id=next_edge.source_id,
+                        target_id=next_edge.target_id,
+                    )
                 )
-            )
-            self.emit(
-                state,
-                "edge.selected",
-                f"Transitioning from '{next_edge.source_id}' to '{next_edge.target_id}'.",
-                next_edge.to_dict(),
-            )
-
-            current_node_id = next_edge.target_id
+                self.emit(
+                    state,
+                    "edge.selected",
+                    f"Transitioning from '{next_edge.source_id}' to '{next_edge.target_id}'.",
+                    next_edge.to_dict(),
+                )
+                pending_nodes.append({"node_id": next_edge.target_id, "incoming_edge_id": next_edge.id})
             step += 1
 
         return self.fail_run(
@@ -171,6 +183,31 @@ class GraphRuntime:
             error={"type": "max_steps_exceeded", "max_steps": self.max_steps},
         )
 
+    def select_edges(
+        self,
+        graph: GraphDefinition,
+        state: RunState,
+        node_id: str,
+        result: NodeExecutionResult,
+    ) -> list[tuple[Edge, NodeExecutionResult]]:
+        outgoing = graph.get_outgoing_edges(node_id)
+        source_node = graph.get_node(node_id)
+        has_explicit_api_outputs = source_node.kind == "model" and any(
+            edge.source_handle_id in {API_TOOL_CALL_HANDLE_ID, API_MESSAGE_HANDLE_ID} for edge in outgoing
+        )
+        if has_explicit_api_outputs:
+            selected_edges: list[tuple[Edge, NodeExecutionResult]] = []
+            for handle_id in (API_TOOL_CALL_HANDLE_ID, API_MESSAGE_HANDLE_ID):
+                route_result = self._route_result(result, handle_id)
+                if route_result is None:
+                    continue
+                handle_edges = [edge for edge in outgoing if edge.source_handle_id == handle_id]
+                selected_edges.extend(self._select_matching_edges(state, node_id, handle_edges, route_result))
+            if selected_edges:
+                return selected_edges
+            outgoing = [edge for edge in outgoing if edge.source_handle_id not in {API_TOOL_CALL_HANDLE_ID, API_MESSAGE_HANDLE_ID}]
+        return self._select_matching_edges(state, node_id, outgoing, result)
+
     def select_edge(
         self,
         graph: GraphDefinition,
@@ -178,8 +215,16 @@ class GraphRuntime:
         node_id: str,
         result: NodeExecutionResult,
     ) -> Edge | None:
-        outgoing = graph.get_outgoing_edges(node_id)
-        outgoing = self._filter_api_output_edges(graph, node_id, outgoing, result)
+        selected = self.select_edges(graph, state, node_id, result)
+        return selected[0][0] if selected else None
+
+    def _select_matching_edges(
+        self,
+        state: RunState,
+        node_id: str,
+        outgoing: list[Edge],
+        result: NodeExecutionResult,
+    ) -> list[tuple[Edge, NodeExecutionResult]]:
         conditional_edges = [edge for edge in outgoing if edge.kind == "conditional"]
         standard_edges = [edge for edge in outgoing if edge.kind == "standard"]
 
@@ -203,12 +248,29 @@ class GraphRuntime:
                         f"Retry path selected through edge '{edge.id}'.",
                         {"edge_id": edge.id, "node_id": node_id, "result_status": result.status},
                     )
-                return edge
+                return [(edge, result)]
 
         if standard_edges:
-            return standard_edges[0]
+            return [(standard_edges[0], result)]
 
-        return None
+        return []
+
+    def _route_result(self, result: NodeExecutionResult, handle_id: str) -> NodeExecutionResult | None:
+        if handle_id not in result.route_outputs:
+            return None
+        route_output = result.route_outputs[handle_id]
+        route_metadata = result.metadata
+        if isinstance(route_output, dict):
+            output_metadata = route_output.get("metadata")
+            if isinstance(output_metadata, dict):
+                route_metadata = dict(output_metadata)
+        return NodeExecutionResult(
+            status=result.status,
+            output=route_output,
+            error=result.error,
+            summary=result.summary,
+            metadata=dict(route_metadata),
+        )
 
     def _result_contract(self, result: NodeExecutionResult) -> str | None:
         output = result.output
@@ -219,25 +281,6 @@ class GraphRuntime:
             return None
         contract = metadata.get("contract")
         return contract if isinstance(contract, str) and contract else None
-
-    def _filter_api_output_edges(
-        self,
-        graph: GraphDefinition,
-        node_id: str,
-        outgoing: list[Edge],
-        result: NodeExecutionResult,
-    ) -> list[Edge]:
-        source_node = graph.get_node(node_id)
-        if source_node.kind != "model":
-            return outgoing
-        if not any(edge.source_handle_id in {API_TOOL_CALL_HANDLE_ID, API_MESSAGE_HANDLE_ID} for edge in outgoing):
-            return outgoing
-        contract = self._result_contract(result)
-        if contract == "tool_call_envelope":
-            return [edge for edge in outgoing if edge.source_handle_id != API_MESSAGE_HANDLE_ID]
-        if contract == "message_envelope":
-            return [edge for edge in outgoing if edge.source_handle_id != API_TOOL_CALL_HANDLE_ID]
-        return [edge for edge in outgoing if edge.source_handle_id not in {API_TOOL_CALL_HANDLE_ID, API_MESSAGE_HANDLE_ID}]
 
     def fail_run(self, state: RunState, summary: str, error: dict[str, Any]) -> RunState:
         state.status = "failed"

@@ -47,6 +47,7 @@ export type GraphDefinition = {
   description: string;
   version: string;
   graph_type?: "graph" | "test_environment";
+  default_input?: string;
   start_node_id: string;
   env_vars?: Record<string, string>;
   nodes: GraphNode[];
@@ -71,6 +72,7 @@ export type TestEnvironmentDefinition = {
   description: string;
   version: string;
   graph_type: "test_environment" | "graph";
+  default_input?: string;
   env_vars?: Record<string, string>;
   agents: AgentDefinition[];
   node_providers?: NodeProviderDefinition[];
@@ -192,11 +194,13 @@ export type RunState = {
   agent_name?: string | null;
   parent_run_id?: string | null;
   current_node_id: string | null;
+  current_edge_id?: string | null;
   status: string;
   started_at: string | null;
   ended_at: string | null;
   input_payload: unknown;
   node_outputs: Record<string, unknown>;
+  edge_outputs?: Record<string, unknown>;
   node_errors: Record<string, unknown>;
   visit_counts: Record<string, number>;
   transition_history: Array<Record<string, unknown>>;

@@ -30,6 +30,7 @@ class GraphPayload(BaseModel):
     description: str = ""
     version: str = "1.0"
     graph_type: Optional[str] = None
+    default_input: Optional[str] = None
     env_vars: Optional[dict[str, str]] = None
     start_node_id: Optional[str] = None
     nodes: Optional[list[dict[str, Any]]] = None

@@ -514,24 +514,64 @@ class ModelProviderTests(unittest.TestCase):
     def test_claude_code_provider_strips_anthropic_api_key_from_child_process(self) -> None:
         provider = ClaudeCodeCLIModelProvider()
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key", "PATH": "test-path"}, clear=True):
-            with patch("graph_agent.providers.claude_code.subprocess.run") as run_mock:
-                run_mock.return_value = Mock(
-                    returncode=0,
-                    stdout='{"result":"ok","session_id":"session-123"}',
-                    stderr="",
-                )
-                provider.generate(
-                    ModelRequest(
-                        prompt_name="smoke_test",
-                        messages=[ModelMessage(role="user", content="Say ok.")],
-                        provider_config={"cli_path": "claude", "model": "sonnet"},
-                    )
-                )
+            child_env = provider._child_env()
+            payload = provider._run_command(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import json, os; "
+                        "print(json.dumps({'result': os.environ.get('ANTHROPIC_API_KEY', 'missing'), 'session_id': 'session-123'}))"
+                    ),
+                ],
+                cwd=str(ROOT),
+                timeout_seconds=5,
+            )
 
-        self.assertTrue(run_mock.called)
-        child_env = run_mock.call_args.kwargs["env"]
-        self.assertEqual(child_env["PATH"], "test-path")
+        self.assertEqual(payload["result"], "missing")
         self.assertNotIn("ANTHROPIC_API_KEY", child_env)
+        self.assertEqual(child_env["PATH"], "test-path")
+
+    def test_claude_code_provider_resets_timeout_when_output_progress_continues(self) -> None:
+        provider = ClaudeCodeCLIModelProvider()
+        payload = provider._run_command(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import json, sys, time; "
+                    "sys.stderr.write('tick1\\n'); sys.stderr.flush(); "
+                    "time.sleep(0.1); "
+                    "sys.stderr.write('tick2\\n'); sys.stderr.flush(); "
+                    "time.sleep(0.1); "
+                    "sys.stdout.write(json.dumps({'result': 'ok', 'session_id': 'session-123'})); "
+                    "sys.stdout.flush()"
+                ),
+            ],
+            cwd=str(ROOT),
+            timeout_seconds=0.15,
+        )
+
+        self.assertEqual(payload["result"], "ok")
+
+    def test_claude_code_provider_times_out_after_output_stalls(self) -> None:
+        provider = ClaudeCodeCLIModelProvider()
+        with self.assertRaises(RuntimeError) as context:
+            provider._run_command(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import json, time; "
+                        "time.sleep(0.3); "
+                        "print(json.dumps({'result': 'too late'}))"
+                    ),
+                ],
+                cwd=str(ROOT),
+                timeout_seconds=0.1,
+            )
+
+        self.assertIn("without output progress", str(context.exception))
 
     def test_manager_reports_claude_code_diagnostics_with_billing_warning(self) -> None:
         manager = GraphRunManager(services=build_example_services())
@@ -1142,8 +1182,11 @@ class ModelProviderTests(unittest.TestCase):
             finally:
                 manager.stop_background_services()
 
-    def test_auto_mode_prefers_tool_call_routing_when_message_and_tool_call_are_both_present(self) -> None:
+    def test_auto_mode_routes_both_tool_call_and_message_handles_for_mixed_responses(self) -> None:
         services, runtime, graph_payload = self._build_auto_branch_graph("auto_mixed", AutoMixedProvider())
+        for node in graph_payload["nodes"]:
+            if node["id"] == "model":
+                node["config"]["response_mode"] = "tool_call"
         graph = GraphDefinition.from_dict(graph_payload)
         manager = GraphRunManager(services=services)
         with WeatherStubServer() as weather_base:
@@ -1156,13 +1199,33 @@ class ModelProviderTests(unittest.TestCase):
                     state = runtime.run(graph, {"request": "weather please"}, run_id="run-auto-mixed")
                     self.assertEqual(state.status, "completed")
                     payload = state.final_output
-                    assert isinstance(payload, dict)
-                    self.assertEqual(payload["resolved_location"], "Testville")
+                    self.assertEqual(payload, "Checking the live weather tool now.")
+                    self.assertEqual(state.visit_counts["finish"], 2)
                     model_output = state.node_outputs["model"]
                     assert isinstance(model_output, dict)
                     self.assertEqual(model_output["metadata"]["contract"], "tool_call_envelope")
-                    self.assertEqual(model_output["artifacts"]["assistant_message"], "Checking the live weather tool now.")
+                    self.assertEqual(model_output["metadata"]["response_mode"], "auto")
+                    self.assertEqual(model_output["artifacts"], {})
                     self.assertEqual(model_output["tool_calls"][0]["tool_name"], "weather_current")
+                    tool_route_output = state.edge_outputs["edge-model-executor"]
+                    assert isinstance(tool_route_output, dict)
+                    self.assertEqual(tool_route_output["metadata"]["contract"], "tool_call_envelope")
+                    self.assertEqual(tool_route_output["artifacts"], {})
+                    self.assertEqual(tool_route_output["tool_calls"][0]["tool_name"], "weather_current")
+                    message_route_output = state.edge_outputs["edge-model-finish"]
+                    assert isinstance(message_route_output, dict)
+                    self.assertEqual(message_route_output["metadata"]["contract"], "message_envelope")
+                    self.assertEqual(message_route_output["payload"], "Checking the live weather tool now.")
+                    transition_edges = [transition.edge_id for transition in state.transition_history]
+                    self.assertIn("edge-model-executor", transition_edges)
+                    self.assertIn("edge-model-finish", transition_edges)
+                    finish_outputs = [
+                        event.payload["output"]
+                        for event in state.event_history
+                        if event.event_type == "node.completed" and event.payload.get("node_id") == "finish"
+                    ]
+                    self.assertIn("Checking the live weather tool now.", finish_outputs)
+                    self.assertTrue(any(isinstance(item, dict) and item.get("resolved_location") == "Testville" for item in finish_outputs))
             finally:
                 manager.stop_background_services()
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import selectors
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
@@ -73,6 +74,10 @@ def _command_preview(command: Sequence[str]) -> str:
             continue
         preview_parts.append(part)
     return " ".join(preview_parts)
+
+
+def _format_timeout_seconds(timeout_seconds: float) -> str:
+    return str(int(timeout_seconds)) if float(timeout_seconds).is_integer() else f"{timeout_seconds:g}"
 
 
 class ClaudeCodeCLIModelProvider(ModelProvider):
@@ -444,14 +449,14 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
             _ANTHROPIC_API_KEY_ENV_VAR not in child_env,
         )
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 list(command),
-                capture_output=True,
-                text=True,
-                check=False,
+                text=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 cwd=cwd,
                 env=child_env,
-                timeout=timeout_seconds,
+                stdin=subprocess.DEVNULL,
             )
         except FileNotFoundError as exc:
             LOGGER.warning("claude_code subprocess failed: cli binary not found")
@@ -459,27 +464,72 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
                 "claude_code provider could not find the Claude Code CLI. "
                 "Install `claude` or set `cli_path` in the provider config."
             ) from exc
-        except subprocess.TimeoutExpired as exc:
-            LOGGER.warning("claude_code subprocess timed out after %s seconds", int(timeout_seconds))
-            raise RuntimeError(
-                f"claude_code provider timed out after {int(timeout_seconds)} seconds."
-            ) from exc
         except OSError as exc:
             LOGGER.warning("claude_code subprocess failed to start: %s", exc)
             raise RuntimeError(f"claude_code provider failed to start: {exc}") from exc
 
+        selector = selectors.DefaultSelector()
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+        if process.stdout is not None:
+            selector.register(process.stdout, selectors.EVENT_READ, data="stdout")
+        if process.stderr is not None:
+            selector.register(process.stderr, selectors.EVENT_READ, data="stderr")
+
+        inactivity_deadline = time.monotonic() + timeout_seconds
+        try:
+            while selector.get_map():
+                remaining_seconds = inactivity_deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    raise subprocess.TimeoutExpired(list(command), timeout_seconds)
+                events = selector.select(timeout=remaining_seconds)
+                if not events:
+                    raise subprocess.TimeoutExpired(list(command), timeout_seconds)
+                made_progress = False
+                for key, _mask in events:
+                    chunk = key.fileobj.read1(4096)
+                    if chunk:
+                        made_progress = True
+                        if key.data == "stdout":
+                            stdout_chunks.append(chunk)
+                        else:
+                            stderr_chunks.append(chunk)
+                        continue
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                if made_progress:
+                    inactivity_deadline = time.monotonic() + timeout_seconds
+            completed = process.wait(timeout=1)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            try:
+                remaining_stdout, remaining_stderr = process.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                remaining_stdout, remaining_stderr = (b"", b"")
+            if remaining_stdout:
+                stdout_chunks.append(remaining_stdout)
+            if remaining_stderr:
+                stderr_chunks.append(remaining_stderr)
+            timeout_label = _format_timeout_seconds(timeout_seconds)
+            LOGGER.warning("claude_code subprocess timed out after %s seconds without output progress", timeout_label)
+            raise RuntimeError(
+                f"claude_code provider timed out after {timeout_label} seconds without output progress."
+            ) from exc
+        finally:
+            selector.close()
+
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-        stdout = completed.stdout.strip()
-        stderr = completed.stderr.strip()
+        stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace").strip()
+        stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
         LOGGER.info(
             "claude_code subprocess finished: returncode=%s elapsed_ms=%s stdout=%s stderr=%s",
-            completed.returncode,
+            completed,
             elapsed_ms,
             _truncate_for_log(stdout),
             _truncate_for_log(stderr),
         )
-        if completed.returncode != 0:
-            detail = stderr or stdout or f"exit code {completed.returncode}"
+        if completed != 0:
+            detail = stderr or stdout or f"exit code {completed}"
             raise RuntimeError(f"claude_code provider request failed: {detail}")
 
         if not stdout:

@@ -1,4 +1,5 @@
 import type { EditorCatalog, GraphDefinition, GraphNode, RunState } from "./types";
+import { inferModelResponseMode } from "./editor";
 import { resolveToolNodeDetails } from "./toolNodeDetails";
 
 type TooltipRow = {
@@ -55,12 +56,12 @@ function formatList(values: string[]): string {
 
 function describeResponseMode(value: string | null | undefined): string {
   if (value === "tool_call") {
-    return "tool_call (always emit tool-call envelope)";
+    return "tool_call (inferred from tool-call routing)";
   }
   if (value === "auto") {
-    return "auto (emit tool-call or message envelope)";
+    return "auto (inferred mixed routing; can emit both envelopes)";
   }
-  return "message (always emit message envelope)";
+  return "message (inferred from message-only routing)";
 }
 
 function truncate(value: string, limit = 96): string {
@@ -287,6 +288,7 @@ export function buildNodeTooltip(
           title: "MCP Context",
           rows: [
             { label: "Registered Tools", value: toolNames.length > 0 ? formatList(toolNames) : "None selected" },
+            { label: "Node Role", value: "Source-only context provider" },
             { label: "Expose Callable Tools", value: node.config.expose_mcp_tools === false ? "Disabled" : "Enabled" },
             { label: "Inject Prompt Context", value: node.config.include_mcp_tool_context ? "Enabled" : "Disabled" },
           ],
@@ -327,6 +329,7 @@ export function buildNodeTooltip(
   if (node.kind === "model") {
     const allowedTools = asStringArray(node.config.allowed_tool_names);
     const preferredTool = asString(node.config.preferred_tool_name);
+    const responseMode = inferModelResponseMode(graph, node);
     return {
       title: node.label,
       eyebrow: `${node.category} / ${node.kind}`,
@@ -338,9 +341,9 @@ export function buildNodeTooltip(
             { label: "Provider", value: asString(node.config.provider_name) ?? node.model_provider_name ?? "Not set" },
             { label: "Model", value: asString(node.config.model) ?? "Default" },
             { label: "Prompt", value: asString(node.config.prompt_name) ?? node.prompt_name ?? "Not set" },
-            { label: "Response", value: describeResponseMode(asString(node.config.response_mode)) },
-            { label: "Tool Call Output", value: "Routes structured tool-call envelopes to tool nodes" },
-            { label: "Message Output", value: "Routes normal assistant/message envelopes to api, data, or end nodes" },
+            { label: "Response", value: describeResponseMode(responseMode) },
+            { label: "Tool Call Output", value: "Routes structured tool-call envelopes to tool nodes whenever tools are emitted" },
+            { label: "Message Output", value: "Routes assistant/message envelopes to api, data, or end nodes when message content is emitted" },
             { label: "Allowed Tools", value: allowedTools.length > 0 ? formatList(allowedTools) : "None" },
             { label: "Preferred Tool", value: preferredTool ?? "None" },
           ],

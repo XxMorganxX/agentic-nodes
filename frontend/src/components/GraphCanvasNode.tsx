@@ -20,6 +20,7 @@ import {
 import { warnGraphDiagnostic } from "../lib/dragDiagnostics";
 import { buildNodeTooltip } from "../lib/nodeTooltip";
 import type { NodeTooltipData } from "../lib/nodeTooltip";
+import { formatRunStatusLabel } from "../lib/runVisualization";
 import type { EditorCatalog, GraphDefinition, GraphNode, RunState } from "../lib/types";
 
 export type GraphCanvasNodeData = {
@@ -35,6 +36,7 @@ export type GraphCanvasNodeData = {
   onToggleTooltip: (nodeId: string) => void;
   onOpenToolDetails: (nodeId: string) => void;
   onOpenProviderDetails: (nodeId: string) => void;
+  onOpenDisplayResponse: (nodeId: string) => void;
   onHandlePointerDown: (nodeId: string, handleType: "source" | "target", handleId: string | null) => boolean;
   onJunctionPointerDown: (nodeId: string, clientPosition: { x: number; y: number }) => void;
 };
@@ -58,6 +60,41 @@ const FALLBACK_TOOLTIP: NodeTooltipData = {
   emptyState: "The node is still available in the canvas.",
 };
 
+function hasContextConnection(graph: GraphDefinition | null, node: GraphNode): boolean {
+  if (!graph || node.kind !== "mcp_context_provider") {
+    return false;
+  }
+  const hasBindingEdge = graph.edges.some(
+    (edge) => edge.kind === "binding" && edge.source_id === node.id && edge.target_id !== node.id,
+  );
+  if (hasBindingEdge) {
+    return true;
+  }
+  return graph.nodes.some((candidate) => {
+    if (candidate.kind !== "model") {
+      return false;
+    }
+    const targetIds = Array.isArray(candidate.config.tool_target_node_ids) ? candidate.config.tool_target_node_ids : [];
+    return targetIds.some((targetId) => String(targetId) === node.id);
+  });
+}
+
+function isContextBooted(catalog: EditorCatalog | null, node: GraphNode): boolean {
+  const toolNames = Array.isArray(node.config.tool_names) ? node.config.tool_names.map((toolName) => String(toolName)) : [];
+  if (!catalog || toolNames.length === 0) {
+    return false;
+  }
+  const selectedTools = catalog.tools.filter((tool) => toolNames.includes(tool.name));
+  if (selectedTools.length === 0) {
+    return false;
+  }
+  const serverIds = [...new Set(selectedTools.map((tool) => tool.server_id).filter((serverId): serverId is string => Boolean(serverId)))];
+  if (serverIds.length === 0) {
+    return selectedTools.every((tool) => tool.available !== false);
+  }
+  return serverIds.every((serverId) => catalog.mcp_servers?.some((server) => server.server_id === serverId && server.running));
+}
+
 function GraphCanvasNodeComponent({
   data,
   selected,
@@ -75,6 +112,7 @@ function GraphCanvasNodeComponent({
     onToggleTooltip,
     onOpenToolDetails,
     onOpenProviderDetails,
+    onOpenDisplayResponse,
     onJunctionPointerDown,
   } = data;
   const isWireJunction = isWireJunctionNode(node);
@@ -142,7 +180,26 @@ function GraphCanvasNodeComponent({
     node.kind === "model"
       ? String(node.config.provider_name ?? node.model_provider_name ?? node.provider_label ?? node.provider_id)
       : node.provider_label ?? node.provider_id;
-  const nodeCardClassName = `graph-node-card graph-node-card--${status} ${isRoutableTool ? "graph-node-card--tool-outputs" : ""} ${
+  const isContextConnected = isContextProviderNode ? hasContextConnection(graph, node) : false;
+  const contextBooted = isContextProviderNode ? isContextBooted(catalog, node) : false;
+  const displayStatus = isContextProviderNode
+    ? contextBooted && isContextConnected
+      ? "success"
+      : isContextConnected
+        ? "failed"
+        : "idle"
+    : status;
+  const isActive = displayStatus === "active";
+  const statusLabel = isContextProviderNode
+    ? contextBooted && isContextConnected
+      ? "Connected and MCP booted"
+      : isContextConnected
+        ? "Connected but MCP not booted"
+        : contextBooted
+          ? "MCP booted but not connected"
+          : "MCP not booted and not connected"
+    : formatRunStatusLabel(displayStatus);
+  const nodeCardClassName = `graph-node-card graph-node-card--${displayStatus} ${isRoutableTool ? "graph-node-card--tool-outputs" : ""} ${
     isContextProviderNode ? "graph-node-card--tool-context-provider" : ""
   } ${
     isModelNode ? "graph-node-card--model-inputs" : ""
@@ -206,7 +263,7 @@ function GraphCanvasNodeComponent({
         onToggleTooltip(node.id);
       }}
     >
-      {showTargetHandle ? (
+      {showTargetHandle && !isContextProviderNode ? (
         <Handle
           type="target"
           position={Position.Left}
@@ -237,8 +294,17 @@ function GraphCanvasNodeComponent({
             <strong className="graph-node-title">{node.label}</strong>
             <div className="graph-node-subtitle">{subtitle}</div>
           </div>
-          <div className="graph-node-badge" aria-hidden="true">
-            <span className="graph-node-badge-dot" />
+          <div className="graph-node-badge" aria-label={`Node status: ${statusLabel}`}>
+            {isActive ? (
+              <span className="graph-node-badge-spinner">
+                <span className="graph-node-badge-spinner-core" />
+              </span>
+            ) : (
+              <span className="graph-node-badge-dot" />
+            )}
+            <span className="graph-node-status-tooltip" role="status">
+              {statusLabel}
+            </span>
           </div>
         </div>
         <div className="graph-node-meta">
@@ -246,9 +312,27 @@ function GraphCanvasNodeComponent({
           <span className="graph-node-meta-text">{node.kind}</span>
         </div>
         {isDisplayNode ? (
-          <div className="graph-node-inline-display">
+          <div
+            role="button"
+            tabIndex={preview ? -1 : 0}
+            className="graph-node-inline-display"
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenDisplayResponse(node.id);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                event.stopPropagation();
+                onOpenDisplayResponse(node.id);
+              }
+            }}
+            aria-label={`Open full response for ${node.label}`}
+          >
             <div className="graph-node-inline-display-header">Run Envelope</div>
             <pre className="graph-node-inline-display-body">{displayText}</pre>
+            <span className="graph-node-inline-display-hint">Click to expand</span>
           </div>
         ) : null}
         {!preview && (node.kind === "tool" || node.kind === "mcp_context_provider" || node.kind === "model") ? (

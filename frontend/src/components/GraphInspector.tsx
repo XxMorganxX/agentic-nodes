@@ -3,6 +3,7 @@ import type { ChangeEvent } from "react";
 import {
   defaultModelName,
   findProviderDefinition,
+  inferModelResponseMode,
   isWireJunctionNode,
   modelProviderDefinitions,
   providerDefaultConfig,
@@ -122,6 +123,8 @@ export function GraphInspector({
 
   const selectedNode = selectedNodeId ? graph.nodes.find((node) => node.id === selectedNodeId) ?? null : null;
   const selectedEdge = selectedEdgeId ? graph.edges.find((edge) => edge.id === selectedEdgeId) ?? null : null;
+  const selectedModelResponseMode =
+    selectedNode?.kind === "model" ? inferModelResponseMode(graph, selectedNode) : null;
 
   if (selectedNode) {
     if (isWireJunctionNode(selectedNode)) {
@@ -615,24 +618,10 @@ export function GraphInspector({
               </label>
               <label>
                 Response Mode
-                <select
-                  value={String(selectedNode.config.response_mode ?? "message")}
-                  onChange={(event) =>
-                    onGraphChange(
-                      updateNode(graph, selectedNode.id, (node) => ({
-                        ...node,
-                        config: { ...node.config, response_mode: event.target.value },
-                      })),
-                    )
-                  }
-                >
-                  <option value="message">message</option>
-                  <option value="tool_call">tool_call</option>
-                  <option value="auto">auto</option>
-                </select>
+                <input type="text" value={selectedModelResponseMode ?? "message"} readOnly />
                 <small>
-                  API nodes now expose separate Tool Call and Message outputs on the canvas. `auto` is the recommended
-                  compatibility mode for split routing, while `message` and `tool_call` force a single envelope type.
+                  Derived from graph wiring. Tool-call routes make the model tool-capable, both output routes make it
+                  mixed, and message-only routing keeps it in message mode.
                 </small>
               </label>
               <div className="checkbox-grid">
@@ -728,6 +717,9 @@ export function GraphInspector({
           ) : null}
           {selectedNode.kind === "mcp_context_provider" ? (
             <>
+              <div className="inspector-meta">
+                <span>Acts as a source-only context provider. No input connection is required.</span>
+              </div>
               <div className="checkbox-grid">
                 <strong>Registered MCP Tools</strong>
                 {mcpCatalogTools.map((tool) => {

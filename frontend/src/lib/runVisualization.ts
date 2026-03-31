@@ -419,6 +419,9 @@ function buildMilestoneDataSections(
     if ("output" in payload) {
       appendOutputSections(sections, payload.output);
     }
+    if ("route_outputs" in payload) {
+      appendSection(sections, "Route outputs", payload.route_outputs, { allowNull: true });
+    }
     if ("error" in payload) {
       appendSection(sections, "Error", payload.error, { allowNull: true });
     }

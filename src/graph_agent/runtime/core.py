@@ -135,6 +135,7 @@ class NodeExecutionResult:
     error: dict[str, Any] | None = None
     summary: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    route_outputs: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -209,6 +210,73 @@ def _is_message_contract_condition(condition: Condition | None) -> bool:
         and condition.path == "metadata.contract"
         and condition.value == "message_envelope"
     )
+
+
+def _model_has_exposed_tool_context(graph: GraphDefinition, node: BaseNode) -> bool:
+    candidate_node_ids: set[str] = set()
+    configured_target_ids = node.config.get("tool_target_node_ids", [])
+    if isinstance(configured_target_ids, Sequence) and not isinstance(configured_target_ids, (str, bytes)):
+        candidate_node_ids.update(str(node_id).strip() for node_id in configured_target_ids if str(node_id).strip())
+    for edge in graph.get_incoming_edges(node.id):
+        if edge.kind == "binding":
+            candidate_node_ids.add(edge.source_id)
+    for node_id in candidate_node_ids:
+        candidate = graph.nodes.get(node_id)
+        if candidate is None or candidate.kind != "mcp_context_provider":
+            continue
+        if not bool(candidate.config.get("expose_mcp_tools", True)):
+            continue
+        tool_names = candidate.config.get("tool_names", [])
+        if isinstance(tool_names, Sequence) and not isinstance(tool_names, (str, bytes)):
+            if any(str(tool_name).strip() for tool_name in tool_names):
+                return True
+    return False
+
+
+def _model_has_tool_output_route(graph: GraphDefinition, node: BaseNode) -> bool:
+    for edge in graph.get_outgoing_edges(node.id):
+        if edge.kind == "binding":
+            continue
+        if edge.source_handle_id == API_TOOL_CALL_HANDLE_ID:
+            return True
+        if edge.source_handle_id == API_MESSAGE_HANDLE_ID:
+            continue
+        target_node = graph.nodes.get(edge.target_id)
+        if target_node is None:
+            continue
+        if target_node.category == NodeCategory.TOOL or _is_tool_call_contract_condition(edge.condition):
+            return True
+    return False
+
+
+def _model_has_message_output_route(graph: GraphDefinition, node: BaseNode) -> bool:
+    for edge in graph.get_outgoing_edges(node.id):
+        if edge.kind == "binding":
+            continue
+        if edge.source_handle_id == API_MESSAGE_HANDLE_ID:
+            return True
+        if edge.source_handle_id == API_TOOL_CALL_HANDLE_ID:
+            continue
+        target_node = graph.nodes.get(edge.target_id)
+        if target_node is None:
+            continue
+        if _is_message_contract_condition(edge.condition):
+            return True
+        if target_node.category in {NodeCategory.API, NodeCategory.DATA, NodeCategory.END}:
+            return True
+    return False
+
+
+def infer_model_response_mode(graph: GraphDefinition, node: BaseNode) -> str:
+    has_tool_output_route = _model_has_tool_output_route(graph, node)
+    has_message_output_route = _model_has_message_output_route(graph, node)
+    if has_tool_output_route and has_message_output_route:
+        return "auto"
+    if has_tool_output_route:
+        return "tool_call"
+    if _model_has_exposed_tool_context(graph, node) and not has_message_output_route:
+        return "tool_call"
+    return "message"
 
 
 @dataclass
@@ -292,10 +360,12 @@ class RunState:
     agent_id: str | None = None
     parent_run_id: str | None = None
     current_node_id: str | None = None
+    current_edge_id: str | None = None
     status: str = "pending"
     started_at: str = field(default_factory=utc_now_iso)
     ended_at: str | None = None
     node_outputs: dict[str, Any] = field(default_factory=dict)
+    edge_outputs: dict[str, Any] = field(default_factory=dict)
     node_errors: dict[str, Any] = field(default_factory=dict)
     visit_counts: dict[str, int] = field(default_factory=dict)
     transition_history: list[TransitionRecord] = field(default_factory=list)
@@ -311,11 +381,13 @@ class RunState:
             "agent_id": self.agent_id,
             "parent_run_id": self.parent_run_id,
             "current_node_id": self.current_node_id,
+            "current_edge_id": self.current_edge_id,
             "status": self.status,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "input_payload": self.input_payload,
             "node_outputs": self.node_outputs,
+            "edge_outputs": self.edge_outputs,
             "node_errors": self.node_errors,
             "visit_counts": self.visit_counts,
             "transition_history": [transition.to_dict() for transition in self.transition_history],
@@ -342,7 +414,34 @@ class NodeContext:
     services: RuntimeServices
     node_id: str
 
+    def current_input_edge(self) -> Edge | None:
+        current_edge_id = self.state.current_edge_id
+        if not current_edge_id:
+            return None
+        for edge in self.graph.get_incoming_edges(self.node_id):
+            if edge.id == current_edge_id:
+                return edge
+        return None
+
+    def _current_route_output_for_source(self, node_id: str) -> Any:
+        current_edge = self.current_input_edge()
+        if current_edge is None or current_edge.source_id != node_id:
+            return None
+        return self.state.edge_outputs.get(current_edge.id)
+
+    def _binding_sources_in_resolution_order(self, sources: Sequence[Any]) -> list[str]:
+        ordered_sources = [str(source) for source in sources]
+        current_edge = self.current_input_edge()
+        if current_edge is None or current_edge.source_id not in ordered_sources:
+            return ordered_sources
+        prioritized_sources = [current_edge.source_id]
+        prioritized_sources.extend(source for source in ordered_sources if source != current_edge.source_id)
+        return prioritized_sources
+
     def latest_output(self, node_id: str) -> Any:
+        route_output = self._current_route_output_for_source(node_id)
+        if route_output is not None:
+            return route_output
         return self.state.node_outputs.get(node_id)
 
     def latest_error(self, node_id: str) -> Any:
@@ -494,6 +593,9 @@ class NodeContext:
 
     def resolve_binding(self, binding: Mapping[str, Any] | None) -> Any:
         if not binding:
+            current_edge = self.current_input_edge()
+            if current_edge is not None and current_edge.id in self.state.edge_outputs:
+                return self.state.edge_outputs[current_edge.id]
             incoming_edges = self.graph.get_incoming_edges(self.node_id)
             if not incoming_edges:
                 return self.state.input_payload
@@ -515,13 +617,13 @@ class NodeContext:
         if binding_type == "latest_error":
             return self.latest_error(str(binding["source"]))
         if binding_type == "first_available_payload":
-            for source in binding.get("sources", []):
+            for source in self._binding_sources_in_resolution_order(binding.get("sources", [])):
                 payload = self.latest_payload(str(source))
                 if payload is not None:
                     return payload
             return None
         if binding_type == "first_available_envelope":
-            for source in binding.get("sources", []):
+            for source in self._binding_sources_in_resolution_order(binding.get("sources", [])):
                 envelope = self.latest_envelope(str(source))
                 if envelope is not None:
                     return envelope.to_dict()
@@ -930,7 +1032,7 @@ class ModelNode(BaseNode):
             for tool in available_tool_payloads
             if isinstance(tool, Mapping) and isinstance(tool.get("name"), str) and isinstance(tool.get("input_schema"), Mapping)
         ]
-        response_mode = str(self.config.get("response_mode", "message"))
+        response_mode = infer_model_response_mode(context.graph, self)
         mcp_available_tool_names = sorted(
             {
                 str(tool.get("name", "")).strip()
@@ -1003,32 +1105,71 @@ class ModelNode(BaseNode):
                     }
                 ]
         emit_tool_call_envelope = response_mode == "tool_call" or (response_mode == "auto" and bool(normalized_tool_calls))
-        envelope_artifacts: dict[str, Any] = {}
-        if emit_tool_call_envelope and response.content:
-            envelope_artifacts["assistant_message"] = response.content
-        envelope = MessageEnvelope(
+        emit_message_envelope = response_mode == "message" or (
+            response_mode == "auto" and (not normalized_tool_calls or bool(response.content))
+        )
+
+        base_metadata = {
+            "node_kind": self.kind,
+            "provider": provider.name,
+            "prompt_name": self.prompt_name,
+            "response_mode": response_mode,
+            "tool_call_count": len(response.tool_calls),
+            **response.metadata,
+        }
+        route_outputs: dict[str, Any] = {}
+        preserve_tool_artifact_message = emit_tool_call_envelope and not emit_message_envelope
+
+        tool_envelope: MessageEnvelope | None = None
+        if emit_tool_call_envelope:
+            tool_artifacts: dict[str, Any] = {}
+            if preserve_tool_artifact_message and response.content:
+                tool_artifacts["assistant_message"] = response.content
+            tool_envelope = MessageEnvelope(
+                schema_version="1.0",
+                from_node_id=self.id,
+                from_category=self.category.value,
+                payload=None,
+                artifacts=tool_artifacts,
+                tool_calls=normalized_tool_calls,
+                metadata={
+                    "contract": "tool_call_envelope",
+                    **base_metadata,
+                },
+            )
+            route_outputs[API_TOOL_CALL_HANDLE_ID] = tool_envelope.to_dict()
+
+        message_envelope: MessageEnvelope | None = None
+        if emit_message_envelope:
+            message_payload = output if not normalized_tool_calls else response.content
+            message_envelope = MessageEnvelope(
+                schema_version="1.0",
+                from_node_id=self.id,
+                from_category=self.category.value,
+                payload=message_payload,
+                metadata={
+                    "contract": "message_envelope",
+                    **base_metadata,
+                },
+            )
+            route_outputs[API_MESSAGE_HANDLE_ID] = message_envelope.to_dict()
+
+        envelope = tool_envelope or message_envelope or MessageEnvelope(
             schema_version="1.0",
             from_node_id=self.id,
             from_category=self.category.value,
-            payload=None if emit_tool_call_envelope else output,
-            artifacts=envelope_artifacts,
+            payload=output,
             metadata={
-                "contract": "tool_call_envelope" if emit_tool_call_envelope else "message_envelope",
-                "node_kind": self.kind,
-                "provider": provider.name,
-                "prompt_name": self.prompt_name,
-                "response_mode": response_mode,
-                "tool_call_count": len(response.tool_calls),
-                **response.metadata,
+                "contract": "message_envelope",
+                **base_metadata,
             },
         )
-        if emit_tool_call_envelope:
-            envelope.tool_calls = normalized_tool_calls
         return NodeExecutionResult(
             status="success",
             output=envelope.to_dict(),
             summary=f"Model node '{self.label}' completed.",
             metadata=envelope.metadata,
+            route_outputs=route_outputs,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1413,6 +1554,7 @@ class GraphDefinition:
         *,
         description: str = "",
         version: str = "1.0",
+        default_input: str = "",
         env_vars: Mapping[str, Any] | None = None,
     ) -> None:
         node_ids = [node.id for node in nodes]
@@ -1422,6 +1564,7 @@ class GraphDefinition:
         self.name = name
         self.description = description
         self.version = version
+        self.default_input = default_input
         self.start_node_id = start_node_id
         self.env_vars = _normalize_graph_env_vars(env_vars)
         self.nodes = {node.id: node for node in nodes}
@@ -1437,6 +1580,7 @@ class GraphDefinition:
             name=str(payload["name"]),
             description=str(payload.get("description", "")),
             version=str(payload.get("version", "1.0")),
+            default_input=str(payload.get("default_input", "")),
             start_node_id=str(payload["start_node_id"]),
             env_vars=payload.get("env_vars"),
             nodes=nodes,
@@ -1535,11 +1679,7 @@ class GraphDefinition:
                     except (KeyError, ValueError) as exc:
                         raise GraphValidationError(str(exc)) from exc
                 mcp_context_tool_names: list[str] = []
-                response_mode = str(node.config.get("response_mode", "message"))
-                if response_mode not in {"message", "tool_call", "auto"}:
-                    raise GraphValidationError(
-                        f"Model node '{node.id}' uses unsupported response mode '{response_mode}'."
-                    )
+                response_mode = infer_model_response_mode(self, node)
                 candidate_context_nodes: list[McpContextProviderNode] = []
                 seen_context_node_ids: set[str] = set()
                 tool_target_node_ids = node.config.get("tool_target_node_ids", [])
@@ -1685,7 +1825,7 @@ class GraphDefinition:
                                 f"MCP tool executor '{node.id}' references missing source node '{source_id}'."
                             )
                         if isinstance(source_node, ModelNode):
-                            source_response_mode = str(source_node.config.get("response_mode", "message"))
+                            source_response_mode = infer_model_response_mode(self, source_node)
                             if source_response_mode == "message":
                                 raise GraphValidationError(
                                     f"MCP tool executor '{node.id}' must bind to a tool_call model output, but '{source_id}' uses response mode '{source_response_mode}'."
@@ -1704,7 +1844,7 @@ class GraphDefinition:
                         if not isinstance(source_node, ModelNode):
                             valid_tool_call_routes += 1
                             continue
-                        source_response_mode = str(source_node.config.get("response_mode", "message"))
+                        source_response_mode = infer_model_response_mode(self, source_node)
                         if edge.source_handle_id == API_MESSAGE_HANDLE_ID:
                             continue
                         if edge.source_handle_id == API_TOOL_CALL_HANDLE_ID:
@@ -1724,7 +1864,7 @@ class GraphDefinition:
                         source_node = self.nodes.get(edge.source_id)
                         if not isinstance(source_node, ModelNode):
                             continue
-                        source_response_mode = str(source_node.config.get("response_mode", "message"))
+                        source_response_mode = infer_model_response_mode(self, source_node)
                         if edge.source_handle_id == API_MESSAGE_HANDLE_ID:
                             raise GraphValidationError(
                                 f"MCP tool executor '{node.id}' cannot receive api-message output from model node '{source_node.id}'."
@@ -1786,6 +1926,7 @@ class GraphDefinition:
             "name": self.name,
             "description": self.description,
             "version": self.version,
+            "default_input": self.default_input,
             "start_node_id": self.start_node_id,
             "env_vars": dict(self.env_vars),
             "nodes": [node.to_dict() for node in self.nodes.values()],

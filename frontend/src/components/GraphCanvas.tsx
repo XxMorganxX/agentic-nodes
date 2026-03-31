@@ -18,6 +18,7 @@ import type { GraphCanvasEdgeData } from "./GraphCanvasEdge";
 import { GraphInspector } from "./GraphInspector";
 import { GraphCanvasNode } from "./GraphCanvasNode";
 import type { GraphCanvasNodeData } from "./GraphCanvasNode";
+import { DisplayResponseModal } from "./DisplayResponseModal";
 import { ProviderSummary } from "./ProviderSummary";
 import { ProviderDetailsModal } from "./ProviderDetailsModal";
 import { ToolDetailsModal } from "./ToolDetailsModal";
@@ -561,6 +562,7 @@ export function GraphCanvas({
   const [editorMessage, setEditorMessage] = useState<string | null>(null);
   const [toolDetailsNodeId, setToolDetailsNodeId] = useState<string | null>(null);
   const [providerDetailsNodeId, setProviderDetailsNodeId] = useState<string | null>(null);
+  const [displayResponseNodeId, setDisplayResponseNodeId] = useState<string | null>(null);
   const [tooltipNodeId, setTooltipNodeId] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerTab, setDrawerTab] = useState<DrawerTab>("add");
@@ -617,6 +619,20 @@ export function GraphCanvas({
   const dragDiagnosticSessionIdRef = useRef(0);
   const zoomAnimationDuration = 120;
   const vizLocked = panLocked || isCommandHeld;
+  const toolDetailsNode = useMemo(
+    () =>
+      graph?.nodes.find((node) => node.id === toolDetailsNodeId && (node.kind === "tool" || node.kind === "mcp_context_provider")) ??
+      null,
+    [graph, toolDetailsNodeId],
+  );
+  const providerDetailsNode = useMemo(
+    () => graph?.nodes.find((node) => node.id === providerDetailsNodeId && node.kind === "model") ?? null,
+    [graph, providerDetailsNodeId],
+  );
+  const displayResponseNode = useMemo(
+    () => graph?.nodes.find((node) => node.id === displayResponseNodeId && node.provider_id === "core.data_display") ?? null,
+    [displayResponseNodeId, graph],
+  );
 
   useRenderDiagnostics(
     "GraphCanvas",
@@ -991,6 +1007,14 @@ export function GraphCanvas({
     [onSelectionChange],
   );
 
+  const handleOpenDisplayResponse = useCallback(
+    (nodeId: string) => {
+      onSelectionChange(nodeId, null);
+      setDisplayResponseNodeId(nodeId);
+    },
+    [onSelectionChange],
+  );
+
   const handleZoomIn = useCallback(() => {
     void flowInstance?.zoomIn({ duration: zoomAnimationDuration });
   }, [flowInstance]);
@@ -1008,6 +1032,7 @@ export function GraphCanvas({
     setTooltipNodeId(null);
     setToolDetailsNodeId(null);
     setProviderDetailsNodeId(null);
+    setDisplayResponseNodeId(null);
     setDrawerOpen(false);
     setShowHotkeys(false);
   }, [onSelectionChange]);
@@ -2507,6 +2532,7 @@ export function GraphCanvas({
                 onToggleTooltip: handleToggleTooltip,
                 onOpenToolDetails: handleOpenToolDetails,
                 onOpenProviderDetails: handleOpenProviderDetails,
+                onOpenDisplayResponse: handleOpenDisplayResponse,
                 onHandlePointerDown: handleNodeHandlePointerDown,
                 onJunctionPointerDown: handleJunctionPointerDown,
               },
@@ -2560,6 +2586,7 @@ export function GraphCanvas({
         previousData.onToggleTooltip === handleToggleTooltip &&
         previousData.onOpenToolDetails === handleOpenToolDetails &&
         previousData.onOpenProviderDetails === handleOpenProviderDetails &&
+        previousData.onOpenDisplayResponse === handleOpenDisplayResponse &&
         previousData.onHandlePointerDown === handleNodeHandlePointerDown &&
         previousData.onJunctionPointerDown === handleJunctionPointerDown
           ? previousData
@@ -2576,6 +2603,7 @@ export function GraphCanvas({
               onToggleTooltip: handleToggleTooltip,
               onOpenToolDetails: handleOpenToolDetails,
               onOpenProviderDetails: handleOpenProviderDetails,
+              onOpenDisplayResponse: handleOpenDisplayResponse,
               onHandlePointerDown: handleNodeHandlePointerDown,
               onJunctionPointerDown: handleJunctionPointerDown,
             };
@@ -2617,7 +2645,7 @@ export function GraphCanvas({
       recordNodeBuildDiagnostic(performance.now() - diagnosticsStart);
     }
     return nextNodes;
-  }, [catalog, dragDiagnosticsEnabled, dragRenderTick, draftConnection?.sourceNodeId, draftConnectionSnapTargetNodeId, getFlowNodeDimensions, graph, handleJunctionPointerDown, handleNodeHandlePointerDown, handleOpenProviderDetails, handleOpenToolDetails, handleToggleTooltip, isConnecting, isNodeDragActive, recordNodeBuildDiagnostic, runState, selectedNodeId, tooltipNodeId]);
+  }, [catalog, dragDiagnosticsEnabled, dragRenderTick, draftConnection?.sourceNodeId, draftConnectionSnapTargetNodeId, getFlowNodeDimensions, graph, handleJunctionPointerDown, handleNodeHandlePointerDown, handleOpenDisplayResponse, handleOpenProviderDetails, handleOpenToolDetails, handleToggleTooltip, isConnecting, isNodeDragActive, recordNodeBuildDiagnostic, runState, selectedNodeId, tooltipNodeId]);
 
   const edges = useMemo<FlowEdge<GraphCanvasEdgeData>[]>(() => {
     if (!graph) {
@@ -3152,14 +3180,6 @@ export function GraphCanvas({
     return target instanceof HTMLElement && Boolean(target.closest(PLACEMENT_UI_SELECTOR));
   }, []);
 
-  const toolDetailsNode =
-    toolDetailsNodeId && graph
-      ? graph.nodes.find(
-          (node) => node.id === toolDetailsNodeId && (node.kind === "tool" || node.kind === "mcp_context_provider"),
-        ) ?? null
-      : null;
-  const providerDetailsNode =
-    providerDetailsNodeId && graph ? graph.nodes.find((node) => node.id === providerDetailsNodeId && node.kind === "model") ?? null : null;
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
 
   if (!graph) {
@@ -3675,6 +3695,9 @@ export function GraphCanvas({
           onGraphChange={onGraphChange}
           onClose={() => setProviderDetailsNodeId(null)}
         />
+      ) : null}
+      {displayResponseNode ? (
+        <DisplayResponseModal node={displayResponseNode} runState={runState} onClose={() => setDisplayResponseNodeId(null)} />
       ) : null}
     </div>
   );

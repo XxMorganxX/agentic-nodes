@@ -87,7 +87,6 @@ function defaultModelConfig(promptName: string, catalog: EditorCatalog | null): 
     mode: promptName,
     system_prompt: "You are a model node in an editable graph.",
     user_message_template: "{input_payload}",
-    response_mode: "auto",
     allowed_tool_names: [],
     model: typeof defaultConfig.model === "string" ? defaultConfig.model : "mock-default",
   };
@@ -145,6 +144,7 @@ export function createBlankGraph(): GraphDefinition {
     name: "Untitled Agent",
     description: "",
     version: "1.0",
+    default_input: "",
     start_node_id: "",
     env_vars: { ...DEFAULT_GRAPH_ENV_VARS },
     nodes: [],
@@ -366,6 +366,94 @@ export function defaultApiMessageCondition(edgeId: string): GraphEdge["condition
 
 export function isApiOutputHandleId(handleId: string | null | undefined): boolean {
   return handleId === API_TOOL_CALL_HANDLE_ID || handleId === API_MESSAGE_HANDLE_ID;
+}
+
+function hasExposedMcpToolContext(graph: GraphDefinition, node: GraphNode): boolean {
+  const candidateNodeIds = new Set<string>();
+  const configuredTargetIds = Array.isArray(node.config.tool_target_node_ids)
+    ? node.config.tool_target_node_ids.map((nodeId) => String(nodeId))
+    : [];
+  configuredTargetIds.forEach((nodeId) => candidateNodeIds.add(nodeId));
+  graph.edges
+    .filter((edge) => edge.kind === "binding" && edge.target_id === node.id)
+    .forEach((edge) => candidateNodeIds.add(edge.source_id));
+  return [...candidateNodeIds]
+    .map((nodeId) => graph.nodes.find((candidate) => candidate.id === nodeId) ?? null)
+    .some(
+      (candidate) =>
+        candidate?.kind === "mcp_context_provider" &&
+        candidate.config.expose_mcp_tools !== false &&
+        Array.isArray(candidate.config.tool_names) &&
+        candidate.config.tool_names.some((toolName) => String(toolName).trim().length > 0),
+    );
+}
+
+function hasToolOutputRoute(graph: GraphDefinition, node: GraphNode): boolean {
+  return graph.edges.some((edge) => {
+    if (edge.kind === "binding" || edge.source_id !== node.id) {
+      return false;
+    }
+    if (edge.source_handle_id === API_TOOL_CALL_HANDLE_ID) {
+      return true;
+    }
+    if (edge.source_handle_id === API_MESSAGE_HANDLE_ID) {
+      return false;
+    }
+    const targetNode = graph.nodes.find((candidate) => candidate.id === edge.target_id);
+    if (!targetNode) {
+      return false;
+    }
+    return (
+      targetNode.category === "tool" ||
+      (edge.condition?.type === "result_payload_path_equals" &&
+        edge.condition.path === "metadata.contract" &&
+        edge.condition.value === "tool_call_envelope")
+    );
+  });
+}
+
+function hasMessageOutputRoute(graph: GraphDefinition, node: GraphNode): boolean {
+  return graph.edges.some((edge) => {
+    if (edge.kind === "binding" || edge.source_id !== node.id) {
+      return false;
+    }
+    if (edge.source_handle_id === API_MESSAGE_HANDLE_ID) {
+      return true;
+    }
+    if (edge.source_handle_id === API_TOOL_CALL_HANDLE_ID) {
+      return false;
+    }
+    const targetNode = graph.nodes.find((candidate) => candidate.id === edge.target_id);
+    if (!targetNode) {
+      return false;
+    }
+    if (
+      edge.condition?.type === "result_payload_path_equals" &&
+      edge.condition.path === "metadata.contract" &&
+      edge.condition.value === "message_envelope"
+    ) {
+      return true;
+    }
+    return targetNode.category === "api" || targetNode.category === "data" || targetNode.category === "end";
+  });
+}
+
+export function inferModelResponseMode(graph: GraphDefinition | null, node: GraphNode | null | undefined): "message" | "tool_call" | "auto" {
+  if (!graph || !node || node.kind !== "model") {
+    return "message";
+  }
+  const toolOutputRoute = hasToolOutputRoute(graph, node);
+  const messageOutputRoute = hasMessageOutputRoute(graph, node);
+  if (toolOutputRoute && messageOutputRoute) {
+    return "auto";
+  }
+  if (toolOutputRoute) {
+    return "tool_call";
+  }
+  if (hasExposedMcpToolContext(graph, node) && !messageOutputRoute) {
+    return "tool_call";
+  }
+  return "message";
 }
 
 export function inferToolEdgeSourceHandle(edge: GraphEdge, sourceNode: GraphNode | null | undefined): string | null {
