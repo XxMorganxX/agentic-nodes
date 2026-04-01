@@ -390,7 +390,7 @@ export function defaultApiToolCallCondition(edgeId: string): GraphEdge["conditio
 export function defaultApiMessageCondition(edgeId: string): GraphEdge["condition"] {
   return {
     id: `${edgeId}-condition`,
-    label: "Final message output",
+    label: "Message output",
     type: "result_payload_path_equals",
     value: "message_envelope",
     path: "metadata.contract",
@@ -484,6 +484,10 @@ function hasMessageOutputRoute(graph: GraphDefinition, node: GraphNode): boolean
 export function inferModelResponseMode(graph: GraphDefinition | null, node: GraphNode | null | undefined): "message" | "tool_call" | "auto" {
   if (!graph || !node || node.kind !== "model") {
     return "message";
+  }
+  const configuredMode = String(node.config.response_mode ?? "").trim();
+  if (configuredMode === "message" || configuredMode === "tool_call" || configuredMode === "auto") {
+    return configuredMode;
   }
   const toolOutputRoute = hasToolOutputRoute(graph, node);
   const messageOutputRoute = hasMessageOutputRoute(graph, node);

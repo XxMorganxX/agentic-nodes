@@ -50,12 +50,20 @@ SEARCH_CATALOG_TOOL = ModelToolDefinition(
 )
 
 
-def _decision(*, final_message: Any = None, tool_calls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def _decision(
+    *,
+    message: Any = None,
+    final_message: Any = None,
+    need_tool: bool | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     normalized_tool_calls = list(tool_calls or [])
+    resolved_message = message if message is not None else final_message
+    resolved_need_tool = bool(normalized_tool_calls) if need_tool is None else bool(need_tool)
     return {
-        "should_call_tools": bool(normalized_tool_calls),
+        "message": "" if resolved_need_tool and resolved_message is None else resolved_message,
+        "need_tool": resolved_need_tool,
         "tool_calls": normalized_tool_calls,
-        "final_message": None if normalized_tool_calls else final_message,
     }
 
 
@@ -849,13 +857,13 @@ class ModelProviderTests(unittest.TestCase):
 
         assert schema is not None
         self.assertEqual(schema["type"], "object")
-        self.assertEqual(schema["properties"]["should_call_tools"]["type"], "boolean")
+        self.assertEqual(schema["properties"]["need_tool"]["type"], "boolean")
         self.assertEqual(
             schema["properties"]["tool_calls"]["items"]["properties"]["tool_name"]["enum"],
             ["weather_current", "time_current_minute"],
         )
         self.assertEqual(schema["properties"]["tool_calls"]["items"]["properties"]["arguments"]["type"], "object")
-        self.assertEqual(schema["required"], ["should_call_tools", "tool_calls", "final_message"])
+        self.assertEqual(schema["required"], ["message", "need_tool", "tool_calls"])
 
     def test_claude_code_preflight_reports_live_auth_success(self) -> None:
         provider = StubClaudeCodeProvider()
@@ -1656,11 +1664,11 @@ class ModelProviderTests(unittest.TestCase):
                     assert isinstance(payload, dict)
                     self.assertEqual(payload["resolved_location"], "Testville")
                     self.assertEqual(payload["condition"], "Partly cloudy")
-                    self.assertEqual(state.visit_counts["finish"], 1)
+                    self.assertEqual(state.visit_counts["finish"], 2)
                     model_output = state.node_outputs["model"]
                     assert isinstance(model_output, dict)
                     self.assertEqual(model_output["metadata"]["contract"], "tool_call_envelope")
-                    self.assertEqual(model_output["metadata"]["response_mode"], "auto")
+                    self.assertEqual(model_output["metadata"]["response_mode"], "tool_call")
                     self.assertEqual(model_output["artifacts"]["source_input_payload"], {"request": "weather please"})
                     self.assertEqual(model_output["tool_calls"][0]["tool_name"], "weather_current")
                     tool_route_output = state.edge_outputs["edge-model-executor"]
@@ -1668,14 +1676,112 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertEqual(tool_route_output["metadata"]["contract"], "tool_call_envelope")
                     self.assertEqual(tool_route_output["artifacts"]["source_input_payload"], {"request": "weather please"})
                     self.assertEqual(tool_route_output["tool_calls"][0]["tool_name"], "weather_current")
+                    message_route_output = state.edge_outputs["edge-model-finish"]
+                    assert isinstance(message_route_output, dict)
+                    self.assertEqual(message_route_output["metadata"]["contract"], "message_envelope")
+                    self.assertEqual(message_route_output["payload"], "Checking the live weather tool now.")
                     transition_edges = [transition.edge_id for transition in state.transition_history]
                     self.assertIn("edge-model-executor", transition_edges)
+                    self.assertIn("edge-model-finish", transition_edges)
                     finish_outputs = [
                         event.payload["output"]
                         for event in state.event_history
                         if event.event_type == "node.completed" and event.payload.get("node_id") == "finish"
                     ]
+                    self.assertTrue(any(item == "Checking the live weather tool now." for item in finish_outputs))
                     self.assertTrue(any(isinstance(item, dict) and item.get("resolved_location") == "Testville" for item in finish_outputs))
+            finally:
+                manager.stop_background_services()
+
+    def test_tool_call_output_fans_out_to_multiple_parallel_branches(self) -> None:
+        services, runtime, graph_payload = self._build_auto_branch_graph("parallel_tool_call", AutoToolCallProvider())
+        for node in graph_payload["nodes"]:
+            if node["id"] == "model":
+                node["config"]["response_mode"] = "tool_call"
+        graph_payload["nodes"].extend(
+            [
+                {
+                    "id": "tool_display",
+                    "kind": "data",
+                    "category": "data",
+                    "label": "Tool Display",
+                    "provider_id": "core.data_display",
+                    "provider_label": "Envelope Display Node",
+                    "config": {
+                        "mode": "passthrough",
+                        "show_input_envelope": True,
+                        "lock_passthrough": True,
+                    },
+                    "position": {"x": 520, "y": 180},
+                },
+                {
+                    "id": "display_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Display Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_payload", "source": "tool_display"}},
+                    "position": {"x": 760, "y": 180},
+                },
+            ]
+        )
+        graph_payload["edges"].extend(
+            [
+                {
+                    "id": "edge-model-display",
+                    "source_id": "model",
+                    "target_id": "tool_display",
+                    "source_handle_id": "api-tool-call",
+                    "label": "tool call display",
+                    "kind": "conditional",
+                    "priority": 110,
+                    "condition": {
+                        "id": "edge-model-display-condition",
+                        "label": "Tool call output",
+                        "type": "result_payload_path_equals",
+                        "value": "tool_call_envelope",
+                        "path": "metadata.contract",
+                    },
+                },
+                {
+                    "id": "edge-display-finish",
+                    "source_id": "tool_display",
+                    "target_id": "display_finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                },
+            ]
+        )
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-parallel-tool-fanout")
+                    self.assertEqual(state.status, "completed")
+                    payload = state.final_output
+                    assert isinstance(payload, dict)
+                    self.assertEqual(payload["resolved_location"], "Testville")
+                    self.assertEqual(state.visit_counts["executor"], 1)
+                    self.assertEqual(state.visit_counts["tool_display"], 1)
+                    self.assertEqual(state.visit_counts["display_finish"], 1)
+                    transition_edges = [transition.edge_id for transition in state.transition_history]
+                    self.assertIn("edge-model-executor", transition_edges)
+                    self.assertIn("edge-model-display", transition_edges)
+                    display_edge_output = state.edge_outputs["edge-model-display"]
+                    assert isinstance(display_edge_output, dict)
+                    self.assertEqual(display_edge_output["metadata"]["contract"], "tool_call_envelope")
+                    self.assertEqual(display_edge_output["tool_calls"][0]["tool_name"], "weather_current")
+                    display_output = state.node_outputs["tool_display"]
+                    assert isinstance(display_output, dict)
+                    self.assertEqual(display_output["metadata"]["contract"], "tool_call_envelope")
+                    self.assertEqual(display_output["tool_calls"][0]["tool_name"], "weather_current")
             finally:
                 manager.stop_background_services()
 
@@ -1755,6 +1861,45 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertIn("model", state.node_errors)
                     self.assertEqual(state.node_errors["model"]["type"], "structured_api_output_error")
                     self.assertIn("must leave 'tool_calls' empty", state.node_errors["model"]["message"])
+            finally:
+                manager.stop_background_services()
+
+    def test_tool_call_mode_rejects_final_message_decisions(self) -> None:
+        class ToolCallBypassProvider(ModelProvider):
+            name = "tool_call_bypass"
+
+            def generate(self, request: ModelRequest) -> ModelResponse:
+                return ModelResponse(
+                    content="",
+                    structured_output={
+                        "should_call_tools": False,
+                        "tool_calls": [],
+                        "final_message": "I answered directly instead of calling a tool.",
+                    },
+                )
+
+            def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+                return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+        services, runtime, graph_payload = self._build_auto_branch_graph("tool_call_bypass", ToolCallBypassProvider())
+        for node in graph_payload["nodes"]:
+            if node["id"] == "model":
+                node["config"]["response_mode"] = "tool_call"
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-tool-call-bypass")
+                    self.assertEqual(state.status, "failed")
+                    self.assertEqual(state.terminal_error, {"type": "no_matching_edge", "node_id": "model"})
+                    self.assertIn("model", state.node_errors)
+                    self.assertEqual(state.node_errors["model"]["type"], "structured_api_output_error")
+                    self.assertIn("requires 'need_tool' to be true", state.node_errors["model"]["message"])
             finally:
                 manager.stop_background_services()
 

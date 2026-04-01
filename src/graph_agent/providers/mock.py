@@ -19,12 +19,20 @@ def _tool_items(request: ModelRequest) -> list[dict[str, Any]]:
     return []
 
 
-def _decision(*, final_message: Any = None, tool_calls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def _decision(
+    *,
+    message: Any = None,
+    final_message: Any = None,
+    need_tool: bool | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     normalized_tool_calls = list(tool_calls or [])
+    resolved_message = message if message is not None else final_message
+    resolved_need_tool = bool(normalized_tool_calls) if need_tool is None else bool(need_tool)
     return {
-        "should_call_tools": bool(normalized_tool_calls),
+        "message": "" if resolved_need_tool and resolved_message is None else resolved_message,
+        "need_tool": resolved_need_tool,
         "tool_calls": normalized_tool_calls,
-        "final_message": None if normalized_tool_calls else final_message,
     }
 
 

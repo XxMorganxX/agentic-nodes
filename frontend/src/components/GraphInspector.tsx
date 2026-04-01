@@ -870,9 +870,9 @@ export function GraphInspector({
                   <>
                     <input type="text" value={selectedModelResponseMode ?? "message"} readOnly />
                     <small>
-                      Derived from graph wiring. Tool-call routes let the node emit structured tool decisions, both output
-                      routes keep tool decisions and final messages available, and final-message-only wiring keeps it in
-                      message mode.
+                      Uses the node response mode when configured. Otherwise it falls back to graph wiring: tool-call
+                      routes enable structured tool decisions, both outputs allow parsed message and tool branches in
+                      parallel, and message-only wiring keeps it in message mode.
                     </small>
                   </>
                 ) : (
@@ -892,7 +892,7 @@ export function GraphInspector({
                       <option value="tool_call">tool_call</option>
                       <option value="message">message</option>
                     </select>
-                    <small>Controls whether the executor's follow-up model may request another MCP tool, produce a final message, or do either.</small>
+                    <small>Controls whether the executor's follow-up model may request another MCP tool, emit a message, or do either.</small>
                   </>
                 )}
               </label>

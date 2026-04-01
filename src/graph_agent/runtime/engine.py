@@ -144,7 +144,7 @@ class GraphRuntime:
             )
 
             if node.kind == "output":
-                if state.final_output is None:
+                if self._should_promote_output_result(graph, state, node.id, result):
                     state.final_output = result.output
                 if not pending_nodes:
                     state.status = "completed"
@@ -221,7 +221,15 @@ class GraphRuntime:
                 if route_result is None:
                     continue
                 handle_edges = [edge for edge in outgoing if edge.source_handle_id == handle_id]
-                selected_edges.extend(self._select_matching_edges(state, node_id, handle_edges, route_result))
+                selected_edges.extend(
+                    self._select_matching_edges(
+                        state,
+                        node_id,
+                        handle_edges,
+                        route_result,
+                        allow_parallel=True,
+                    )
+                )
             if selected_edges:
                 return selected_edges
             outgoing = [edge for edge in outgoing if edge.source_handle_id not in {API_TOOL_CALL_HANDLE_ID, API_MESSAGE_HANDLE_ID}]
@@ -237,16 +245,46 @@ class GraphRuntime:
         selected = self.select_edges(graph, state, node_id, result)
         return selected[0][0] if selected else None
 
+    def _should_promote_output_result(
+        self,
+        graph: GraphDefinition,
+        state: RunState,
+        node_id: str,
+        result: NodeExecutionResult,
+    ) -> bool:
+        if result.output is None:
+            return False
+        current_edge_id = state.current_edge_id
+        if not current_edge_id:
+            return True
+        incoming_edge = next((edge for edge in graph.get_incoming_edges(node_id) if edge.id == current_edge_id), None)
+        if incoming_edge is None:
+            return True
+        if incoming_edge.source_handle_id == MCP_TERMINAL_OUTPUT_HANDLE_ID:
+            return state.final_output is None
+        if incoming_edge.source_handle_id == API_MESSAGE_HANDLE_ID:
+            edge_output = state.edge_outputs.get(incoming_edge.id)
+            if isinstance(edge_output, dict):
+                metadata = edge_output.get("metadata")
+                if isinstance(metadata, dict) and (
+                    metadata.get("should_call_tools") is True or metadata.get("need_tool") is True
+                ):
+                    return state.final_output is None
+        return True
+
     def _select_matching_edges(
         self,
         state: RunState,
         node_id: str,
         outgoing: list[Edge],
         result: NodeExecutionResult,
+        *,
+        allow_parallel: bool = False,
     ) -> list[tuple[Edge, NodeExecutionResult]]:
         conditional_edges = [edge for edge in outgoing if edge.kind == "conditional"]
         standard_edges = [edge for edge in outgoing if edge.kind == "standard"]
 
+        matched_conditional_edges: list[tuple[Edge, NodeExecutionResult]] = []
         for edge in conditional_edges:
             matched = edge.is_match(state, result)
             self.emit(
@@ -267,9 +305,16 @@ class GraphRuntime:
                         f"Retry path selected through edge '{edge.id}'.",
                         {"edge_id": edge.id, "node_id": node_id, "result_status": result.status},
                     )
-                return [(edge, result)]
+                matched_conditional_edges.append((edge, result))
+                if not allow_parallel:
+                    return matched_conditional_edges
+
+        if matched_conditional_edges:
+            return matched_conditional_edges
 
         if standard_edges:
+            if allow_parallel:
+                return [(edge, result) for edge in standard_edges]
             return [(standard_edges[0], result)]
 
         return []

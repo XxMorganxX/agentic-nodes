@@ -63,9 +63,9 @@ function describeResponseMode(value: string | null | undefined): string {
     return "tool_call (inferred from tool-call routing)";
   }
   if (value === "auto") {
-    return "auto (inferred mixed routing; can emit both tool decisions and final messages)";
+    return "auto (inferred mixed routing; can emit both tool decisions and messages)";
   }
-  return "message (inferred from final-message-only routing)";
+  return "message (inferred from message-only routing)";
 }
 
 function truncate(value: string, limit = 96): string {
@@ -364,8 +364,8 @@ export function buildNodeTooltip(
             { label: "Model", value: asString(node.config.model) ?? "Default" },
             { label: "Prompt", value: asString(node.config.prompt_name) ?? node.prompt_name ?? "Not set" },
             { label: "Response", value: describeResponseMode(responseMode) },
-            { label: "Tool Calls Output", value: "Routes structured tool-call envelopes to tool nodes whenever the decision object requests tools" },
-            { label: "Final Message Output", value: "Routes the decision object's final message payload to api, data, or end nodes when no tools are needed" },
+            { label: "Tool Calls Output", value: "Routes parsed tool-call envelopes to tool nodes whenever the decision object requests tools" },
+            { label: "Message Output", value: "Routes the decision object's message payload to api, data, or end nodes, including alongside tool calls when both are present" },
             { label: "Allowed Tools", value: allowedTools.length > 0 ? formatList(allowedTools) : "None" },
             { label: "Preferred Tool", value: preferredTool ?? "None" },
           ],

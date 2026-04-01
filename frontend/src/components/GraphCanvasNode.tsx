@@ -561,7 +561,7 @@ function GraphCanvasNodeComponent({
             style={apiToolCallHandleStyle}
           />
           <div className="graph-node-output-port graph-node-output-port--message" style={apiMessageHandleStyle} aria-hidden="true">
-            <span className="graph-node-output-port-label">Final Message</span>
+            <span className="graph-node-output-port-label">Message</span>
           </div>
           <Handle
             id={API_FINAL_MESSAGE_HANDLE_ID}

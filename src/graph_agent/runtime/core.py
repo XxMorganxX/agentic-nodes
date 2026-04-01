@@ -15,6 +15,7 @@ from graph_agent.providers.base import (
     ModelRequest,
     ModelToolDefinition,
     api_decision_response_schema,
+    normalize_api_decision_output,
     validate_api_decision_output,
 )
 from graph_agent.runtime.node_providers import (
@@ -443,6 +444,9 @@ def _model_has_message_output_route(graph: GraphDefinition, node: BaseNode) -> b
 
 
 def infer_model_response_mode(graph: GraphDefinition, node: BaseNode) -> str:
+    configured_mode = str(node.config.get("response_mode", "") or "").strip()
+    if configured_mode in {"message", "tool_call", "auto"}:
+        return configured_mode
     has_tool_output_route = _model_has_tool_output_route(graph, node)
     has_message_output_route = _model_has_message_output_route(graph, node)
     if has_tool_output_route and has_message_output_route:
@@ -1606,6 +1610,7 @@ class ModelNode(BaseNode):
             else None,
             available_tools=available_tools,
             allow_tool_calls=bool(available_tools),
+            response_mode=response_mode,
         )
         return ModelRequest(
             prompt_name=self.prompt_name,
@@ -1645,8 +1650,13 @@ class ModelNode(BaseNode):
         response = provider.generate(request)
         try:
             decision_output = validate_api_decision_output(
-                response.structured_output if isinstance(response.structured_output, Mapping) else {},
+                normalize_api_decision_output(
+                    response.structured_output,
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                ),
                 callable_tool_names=callable_tool_names,
+                response_mode=response_mode_hint,
             )
         except ValueError as exc:
             error = {"message": str(exc), "type": "structured_api_output_error"}
@@ -1675,7 +1685,7 @@ class ModelNode(BaseNode):
 
         normalized_tool_calls = list(decision_output["tool_calls"])
         emit_tool_call_envelope = bool(decision_output["should_call_tools"])
-        emit_message_envelope = not emit_tool_call_envelope
+        emit_message_envelope = decision_output.get("message") is not None
 
         base_metadata = {
             "node_kind": self.kind,
@@ -1719,7 +1729,7 @@ class ModelNode(BaseNode):
 
         message_envelope: MessageEnvelope | None = None
         if emit_message_envelope:
-            message_payload = decision_output["final_message"]
+            message_payload = decision_output["message"]
             message_envelope = MessageEnvelope(
                 schema_version="1.0",
                 from_node_id=self.id,
@@ -1736,7 +1746,7 @@ class ModelNode(BaseNode):
             schema_version="1.0",
             from_node_id=self.id,
             from_category=self.category.value,
-            payload=decision_output["final_message"],
+            payload=decision_output["message"],
             metadata={
                 "contract": "message_envelope",
                 **base_metadata,
@@ -2325,6 +2335,7 @@ class McpToolExecutorNode(BaseNode):
             else None,
             available_tools=available_tools,
             allow_tool_calls=response_mode != "message" and bool(available_tools),
+            response_mode=response_mode,
         )
         return ModelRequest(
             prompt_name=str(self.config.get("prompt_name", "mcp_executor_follow_up")),
@@ -2488,12 +2499,17 @@ class McpToolExecutorNode(BaseNode):
             response = provider.generate(request)
             try:
                 decision_output = validate_api_decision_output(
-                    response.structured_output if isinstance(response.structured_output, Mapping) else {},
+                    normalize_api_decision_output(
+                        response.structured_output,
+                        content=response.content,
+                        tool_calls=response.tool_calls,
+                    ),
                     callable_tool_names=callable_tool_names,
+                    response_mode=response_mode,
                 )
             except ValueError as exc:
                 return self._invalid_follow_up_result(str(exc), route_outputs=route_outputs)
-            output = decision_output["final_message"]
+            output = decision_output["message"]
             normalized_tool_calls = [
                 tool_call
                 for tool_call in list(decision_output["tool_calls"])
@@ -2564,12 +2580,17 @@ class McpToolExecutorNode(BaseNode):
                 response = provider.generate(request)
                 try:
                     decision_output = validate_api_decision_output(
-                        response.structured_output if isinstance(response.structured_output, Mapping) else {},
+                        normalize_api_decision_output(
+                            response.structured_output,
+                            content=response.content,
+                            tool_calls=response.tool_calls,
+                        ),
                         callable_tool_names=None,
+                        response_mode=request.response_mode,
                     )
                 except ValueError as exc:
                     return self._invalid_follow_up_result(str(exc), route_outputs=route_outputs)
-                output = decision_output["final_message"]
+                output = decision_output["message"]
                 base_metadata = {
                     "node_kind": self.kind,
                     "provider": provider.name,
@@ -2950,16 +2971,6 @@ class GraphDefinition:
                         f"Model node '{node.id}' prefers tool '{preferred_tool_name}', but it is not exposed to the node."
                     )
                 model_outgoing_edges = [edge for edge in self.get_outgoing_edges(node.id) if edge.kind != "binding"]
-                api_tool_call_edges = [edge for edge in model_outgoing_edges if edge.source_handle_id == API_TOOL_CALL_HANDLE_ID]
-                api_message_edges = [edge for edge in model_outgoing_edges if edge.source_handle_id == API_MESSAGE_HANDLE_ID]
-                if len(api_tool_call_edges) > 1:
-                    raise GraphValidationError(
-                        f"Model node '{node.id}' can only declare one api-tool-call route."
-                    )
-                if len(api_message_edges) > 1:
-                    raise GraphValidationError(
-                        f"Model node '{node.id}' can only declare one api-message route."
-                    )
                 for edge in model_outgoing_edges:
                     target_node = self.nodes.get(edge.target_id)
                     if target_node is None:

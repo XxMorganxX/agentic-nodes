@@ -1886,6 +1886,12 @@ export function GraphCanvas({
       if (isBindingConnection) {
         return { effectiveSourceHandleId, effectiveTargetHandleId, duplicateEdgeId, conflictingEdgeIds: [] as string[] };
       }
+      const allowParallelApiFanOut =
+        isApiModelNode(sourceNode) &&
+        (effectiveSourceHandleId === API_TOOL_CALL_HANDLE_ID || effectiveSourceHandleId === API_FINAL_MESSAGE_HANDLE_ID);
+      if (allowParallelApiFanOut) {
+        return { effectiveSourceHandleId, effectiveTargetHandleId, duplicateEdgeId, conflictingEdgeIds: [] as string[] };
+      }
       const conflictingEdgeIds = Array.from(
         new Set(
           baseGraph.edges
@@ -2161,22 +2167,12 @@ export function GraphCanvas({
         };
       }
       if (isApiModelNode(sourceNode) && isApiOutputHandleId(effectiveSourceHandleId)) {
-        const hasToolCallOutgoing = sourceEdges.some(
-          (edge) => inferToolEdgeSourceHandle(edge, sourceNode) === API_TOOL_CALL_HANDLE_ID,
-        );
-        const hasMessageOutgoing = sourceEdges.some(
-          (edge) => inferToolEdgeSourceHandle(edge, sourceNode) === API_FINAL_MESSAGE_HANDLE_ID,
-        );
         if (effectiveSourceHandleId === API_TOOL_CALL_HANDLE_ID) {
           if (
             targetNode?.category !== "tool" &&
             !(targetNode?.category === "data" && targetNode.provider_id === "core.data_display")
           ) {
             setEditorMessage("API tool-call output can only connect to tool nodes or Envelope Display nodes.");
-            return null;
-          }
-          if (hasToolCallOutgoing) {
-            setEditorMessage("API nodes can only have one tool-call route.");
             return null;
           }
           return {
@@ -2196,17 +2192,13 @@ export function GraphCanvas({
           setEditorMessage("API message output cannot connect directly to tool nodes.");
           return null;
         }
-        if (hasMessageOutgoing) {
-          setEditorMessage("API nodes can only have one final-message route.");
-          return null;
-        }
         return {
           id: nextEdgeId,
           source_id: sourceId,
           target_id: targetId,
           source_handle_id: API_FINAL_MESSAGE_HANDLE_ID,
           target_handle_id: effectiveTargetHandleId,
-          label: "final message",
+          label: "message",
           kind: "conditional",
           priority: 20,
           waypoints,
