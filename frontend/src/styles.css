@@ -1102,6 +1102,7 @@ pre {
   color: inherit;
   text-align: left;
   cursor: pointer;
+  position: relative;
 }
 
 .environment-agent-chip.is-selected {
@@ -1119,9 +1120,107 @@ pre {
 .environment-agent-chip-meta {
   display: flex;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 0.75rem;
   color: #9aa0c7;
   font-size: 0.8rem;
+}
+
+.run-error-hover {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.run-error-hover--empty {
+  color: inherit;
+}
+
+.run-error-hover-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: #fca5a5;
+  font-weight: 700;
+  cursor: help;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 0.16rem;
+}
+
+.run-error-hover-popup {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 0.7rem);
+  transform: translate(-50%, 0.3rem);
+  width: min(360px, calc(100vw - 3rem));
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(39, 17, 22, 0.98), rgba(25, 12, 16, 0.98));
+  box-shadow: 0 20px 44px rgba(0, 0, 0, 0.36);
+  color: #f7d4d4;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 140ms ease,
+    transform 140ms ease;
+  z-index: 30;
+}
+
+.run-error-hover:hover .run-error-hover-popup,
+.run-error-hover:focus-within .run-error-hover-popup {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+.run-error-hover-popup strong {
+  color: #fff1f2;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.run-error-hover-item {
+  display: grid;
+  gap: 0.16rem;
+  padding-top: 0.55rem;
+  border-top: 1px solid rgba(248, 113, 113, 0.14);
+}
+
+.run-error-hover-item:first-of-type {
+  padding-top: 0;
+  border-top: none;
+}
+
+.run-error-hover-item-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.55rem;
+  color: #ffe4e6;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.run-error-hover-item-header span:last-child {
+  color: #fda4af;
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
+.run-error-hover-item-message {
+  color: #fecdd3;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.run-error-hover-item-meta,
+.run-error-hover-more {
+  color: #f9a8d4;
+  font-size: 0.7rem;
 }
 
 .environment-agent-chip-status {
@@ -2926,6 +3025,10 @@ pre {
   min-width: 0;
 }
 
+.provider-details-grid-full {
+  grid-column: 1 / -1;
+}
+
 .graph-edge .react-flow__edge-path {
   stroke-linecap: round;
   filter: drop-shadow(0 0 7px rgba(111, 133, 255, 0.18));
@@ -3000,6 +3103,13 @@ pre {
     0 0 0 1px rgba(255, 255, 255, 0.04),
     0 0 14px rgba(134, 125, 255, 0.16),
     0 10px 20px rgba(0, 0, 0, 0.25);
+}
+
+.graph-edge-label.is-active {
+  box-shadow:
+    0 0 0 1px rgba(147, 197, 253, 0.18),
+    0 0 18px rgba(96, 165, 250, 0.22),
+    0 10px 24px rgba(2, 6, 23, 0.3);
 }
 
 .graph-edge-waypoint {
@@ -3623,6 +3733,11 @@ pre {
   border: 1px solid #2a2d49;
 }
 
+.mcp-server-card--editor {
+  background: #16192c;
+  border-color: #3a3f63;
+}
+
 .mcp-server-card-header {
   display: flex;
   justify-content: space-between;
@@ -3634,6 +3749,25 @@ pre {
   color: #8486a5;
   font-size: 0.82rem;
   line-height: 1.45;
+}
+
+.mcp-server-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+}
+
+.mcp-server-meta code,
+.mcp-server-meta span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #aeb4d7;
+  font-size: 0.72rem;
 }
 
 .mcp-server-actions {
@@ -3670,6 +3804,35 @@ pre {
 .mcp-tool-list {
   display: grid;
   gap: 0.45rem;
+}
+
+.mcp-server-form-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.mcp-server-form-grid label {
+  display: grid;
+  gap: 0.35rem;
+  color: #b4b6d0;
+  font-weight: 600;
+}
+
+.mcp-server-form-grid label small {
+  color: #7c7e9c;
+  font-size: 0.72rem;
+  font-weight: 400;
+}
+
+.mcp-server-form-grid--full {
+  grid-column: 1 / -1;
+}
+
+.mcp-server-message {
+  margin: 0;
+  color: #8be0b0;
+  font-size: 0.82rem;
 }
 
 .mcp-tool-option {

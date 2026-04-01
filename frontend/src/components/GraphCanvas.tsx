@@ -25,7 +25,7 @@ import { ProviderSummary } from "./ProviderSummary";
 import { ProviderDetailsModal } from "./ProviderDetailsModal";
 import { ToolDetailsModal } from "./ToolDetailsModal";
 import {
-  API_MESSAGE_HANDLE_ID,
+  API_FINAL_MESSAGE_HANDLE_ID,
   API_TOOL_CALL_HANDLE_ID,
   API_TOOL_CONTEXT_HANDLE_ID,
   canConnectNodes,
@@ -148,7 +148,8 @@ type PlacementState =
     };
 
 type NodeClipboardState = {
-  node: GraphNode;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
   pasteCount: number;
 };
 
@@ -185,7 +186,6 @@ const KIND_COLORS: Record<string, string> = {
   tool: "#a78bfa",
   mcp_context_provider: "#5aa7ff",
   mcp_tool_executor: "#a78bfa",
-  mcp_recheck: "#8b5cf6",
   data: "#2dd4bf",
   output: "#4ade80",
 };
@@ -197,7 +197,6 @@ const KIND_LABELS: Record<string, string> = {
   tool: "FX",
   mcp_context_provider: "MC",
   mcp_tool_executor: "MX",
-  mcp_recheck: "MR",
   data: "DB",
   output: "OUT",
 };
@@ -309,6 +308,15 @@ type GraphCanvasRuntimeNodeData = GraphCanvasNodeData & {
   isConnectionMagnetized?: boolean;
 };
 
+function completedNodeIdSet(runState: RunState | null): Set<string> {
+  return new Set(
+    (runState?.event_history ?? [])
+      .filter((event) => event.event_type === "node.completed")
+      .map((event) => (typeof event.payload.node_id === "string" ? event.payload.node_id : ""))
+      .filter((nodeId) => nodeId.length > 0),
+  );
+}
+
 type DragDiagnosticSession = {
   active: boolean;
   sessionId: number;
@@ -347,6 +355,14 @@ function createDragDiagnosticSession(): DragDiagnosticSession {
 
 function roundDiagnosticValue(value: number) {
   return Number(value.toFixed(2));
+}
+
+function cloneClipboardNodes(nodes: GraphNode[]) {
+  return JSON.parse(JSON.stringify(nodes)) as GraphNode[];
+}
+
+function cloneClipboardEdges(edges: GraphEdge[]) {
+  return JSON.parse(JSON.stringify(edges)) as GraphEdge[];
 }
 
 function normalizeSelectionRect(start: GraphPosition, end: GraphPosition): SelectionRect {
@@ -606,7 +622,7 @@ const QUICK_ADD_SLOTS: QuickAddSlot[] = [
     label: "Tool",
     description: "Create a tool or MCP node.",
     category: "tool",
-    preferredProviderIds: ["tool.mcp_context_provider", "tool.mcp_tool_executor", "tool.mcp_recheck", "tool.registry"],
+    preferredProviderIds: ["tool.mcp_context_provider", "tool.mcp_tool_executor", "tool.registry"],
   },
   {
     hotkey: "4",
@@ -644,6 +660,15 @@ function resolveQuickAddProvider(
     }
   }
   return providers.find((provider) => provider.category === slot.category) ?? null;
+}
+
+function participatesInExecutionRoute(graph: GraphDefinition, node: GraphNode): boolean {
+  if (node.category === "start") {
+    return true;
+  }
+  return graph.edges.some(
+    (edge) => edge.kind !== "binding" && (edge.source_id === node.id || edge.target_id === node.id),
+  );
 }
 
 type DrawerActionButtonProps = {
@@ -1667,16 +1692,22 @@ export function GraphCanvas({
         ) {
           return;
         }
-        if (isApiModelNode(sourceNode) && sourceHandleId === API_MESSAGE_HANDLE_ID && node.category === "tool") {
+        if (isApiModelNode(sourceNode) && sourceHandleId === API_FINAL_MESSAGE_HANDLE_ID && node.category === "tool") {
           return;
         }
         const targetHandleId =
           sourceHandleId === TOOL_CONTEXT_HANDLE_ID
             ? node.kind === "model"
               ? API_TOOL_CONTEXT_HANDLE_ID
+              : node.kind === "mcp_tool_executor"
+                ? null
               : null
             : null;
-        if (sourceHandleId === TOOL_CONTEXT_HANDLE_ID && targetHandleId === null) {
+        if (
+          sourceHandleId === TOOL_CONTEXT_HANDLE_ID &&
+          targetHandleId === null &&
+          node.kind !== "mcp_tool_executor"
+        ) {
           return;
         }
         const anchor = getTargetAnchorPosition(node.id, targetHandleId);
@@ -1769,8 +1800,8 @@ export function GraphCanvas({
         return TOOL_CONTEXT_HANDLE_ID;
       }
       if (isApiModelNode(sourceNode)) {
-        if (sourceHandleId === API_MESSAGE_HANDLE_ID) {
-          return API_MESSAGE_HANDLE_ID;
+        if (sourceHandleId === API_FINAL_MESSAGE_HANDLE_ID) {
+          return API_FINAL_MESSAGE_HANDLE_ID;
         }
         if (sourceHandleId === API_TOOL_CALL_HANDLE_ID) {
           return API_TOOL_CALL_HANDLE_ID;
@@ -1807,15 +1838,21 @@ export function GraphCanvas({
       targetHandleId: string | null,
     ) =>
       isMcpContextProviderNode(sourceNode) &&
-      targetNode?.kind === "model" &&
       sourceHandleId === TOOL_CONTEXT_HANDLE_ID &&
-      targetHandleId === API_TOOL_CONTEXT_HANDLE_ID,
+      ((targetNode?.kind === "model" && targetHandleId === API_TOOL_CONTEXT_HANDLE_ID) ||
+        (targetNode?.kind === "mcp_tool_executor" && targetHandleId === null)),
     [],
   );
 
   const isPromptBlockBindingConnection = useCallback(
     (sourceNode: GraphNode | undefined, targetNode: GraphNode | undefined) =>
       isPromptBlockNode(sourceNode) && (targetNode?.kind === "model" || targetNode?.kind === "data"),
+    [],
+  );
+
+  const isDisplayContextBuilderBindingConnection = useCallback(
+    (sourceNode: GraphNode | undefined, targetNode: GraphNode | undefined) =>
+      sourceNode?.provider_id === "core.data_display" && targetNode?.provider_id === "core.context_builder",
     [],
   );
 
@@ -1833,7 +1870,8 @@ export function GraphCanvas({
       const effectiveTargetHandleId = getEffectiveTargetHandleId(targetNode, targetHandleId);
       const isBindingConnection =
         isToolContextBindingConnection(sourceNode, targetNode, effectiveSourceHandleId, effectiveTargetHandleId) ||
-        isPromptBlockBindingConnection(sourceNode, targetNode);
+        isPromptBlockBindingConnection(sourceNode, targetNode) ||
+        isDisplayContextBuilderBindingConnection(sourceNode, targetNode);
       const duplicateEdgeId =
         baseGraph.edges.find((edge) => {
           if (edge.source_id !== sourceId || edge.target_id !== targetId) {
@@ -1868,7 +1906,13 @@ export function GraphCanvas({
       );
       return { effectiveSourceHandleId, effectiveTargetHandleId, duplicateEdgeId, conflictingEdgeIds };
     },
-    [getEffectiveSourceHandleId, getEffectiveTargetHandleId, isPromptBlockBindingConnection, isToolContextBindingConnection],
+    [
+      getEffectiveSourceHandleId,
+      getEffectiveTargetHandleId,
+      isDisplayContextBuilderBindingConnection,
+      isPromptBlockBindingConnection,
+      isToolContextBindingConnection,
+    ],
   );
 
   const flowToViewportPosition = useCallback(
@@ -1996,21 +2040,35 @@ export function GraphCanvas({
         (effectiveSourceHandleId === TOOL_CONTEXT_HANDLE_ID || effectiveTargetHandleId === API_TOOL_CONTEXT_HANDLE_ID) &&
         !isToolContextBindingConnection(sourceNode, targetNode, effectiveSourceHandleId, effectiveTargetHandleId)
       ) {
-        setEditorMessage("Tool context wires can only connect from a tool context port into an API node tool-context port.");
+        setEditorMessage("Tool context wires can only connect from a tool context port into an API node or MCP executor.");
         return null;
       }
       if (isMcpContextProviderNode(sourceNode) && !isToolContextBindingConnection(sourceNode, targetNode, effectiveSourceHandleId, effectiveTargetHandleId)) {
-        setEditorMessage("MCP context providers can only create tool-context bindings into API nodes.");
+        setEditorMessage("MCP context providers can only create tool-context bindings into API nodes or MCP executors.");
         return null;
       }
       if (isPromptBlockNode(sourceNode) && !isPromptBlockBindingConnection(sourceNode, targetNode)) {
         setEditorMessage("Prompt Block nodes can only create binding connections into model or data nodes.");
         return null;
       }
+      const nextEdgeId = `edge-${sourceId}-${targetId}-${Date.now()}`;
+      if (sourceNode?.provider_id === "core.data_display" && targetNode?.provider_id === "core.context_builder") {
+        return {
+          id: nextEdgeId,
+          source_id: sourceId,
+          target_id: targetId,
+          source_handle_id: effectiveSourceHandleId,
+          target_handle_id: effectiveTargetHandleId,
+          label: "display input",
+          kind: "binding",
+          priority: 0,
+          waypoints,
+          condition: null,
+        };
+      }
       const remainingGraph = removeEdgesAndPruneJunctions(baseGraph, conflictingEdgeIds);
       const sourceEdges = remainingGraph.edges.filter((edge) => edge.source_id === sourceId && edge.kind !== "binding");
       const hasStandardOutgoing = sourceEdges.some((edge) => edge.kind === "standard");
-      const nextEdgeId = `edge-${sourceId}-${targetId}-${Date.now()}`;
       if (isToolContextBindingConnection(sourceNode, targetNode, effectiveSourceHandleId, effectiveTargetHandleId)) {
         return {
           id: nextEdgeId,
@@ -2069,11 +2127,19 @@ export function GraphCanvas({
           (edge) => inferToolEdgeSourceHandle(edge, sourceNode) === TOOL_FAILURE_HANDLE_ID,
         );
         if (effectiveHandleId === TOOL_SUCCESS_HANDLE_ID && hasSuccessOutgoing) {
-          setEditorMessage("Run Tool already has an on success route.");
+          setEditorMessage(
+            sourceNode?.kind === "mcp_tool_executor"
+              ? "MCP Tool Executor already has an on finish route."
+              : "Run Tool already has an on success route.",
+          );
           return null;
         }
         if (effectiveHandleId === TOOL_FAILURE_HANDLE_ID && hasFailureOutgoing) {
-          setEditorMessage("Run Tool already has an on failure route.");
+          setEditorMessage(
+            sourceNode?.kind === "mcp_tool_executor"
+              ? "MCP Tool Executor already has an on failure route."
+              : "Run Tool already has an on failure route.",
+          );
           return null;
         }
         return {
@@ -2082,7 +2148,12 @@ export function GraphCanvas({
           target_id: targetId,
           source_handle_id: effectiveHandleId,
           target_handle_id: effectiveTargetHandleId,
-          label: effectiveHandleId === TOOL_FAILURE_HANDLE_ID ? "on failure" : "on success",
+          label:
+            effectiveHandleId === TOOL_FAILURE_HANDLE_ID
+              ? "on failure"
+              : sourceNode?.kind === "mcp_tool_executor"
+                ? "on finish"
+                : "on success",
           kind: effectiveHandleId === TOOL_FAILURE_HANDLE_ID ? "conditional" : "standard",
           priority: effectiveHandleId === TOOL_FAILURE_HANDLE_ID ? 10 : 100,
           waypoints,
@@ -2094,7 +2165,7 @@ export function GraphCanvas({
           (edge) => inferToolEdgeSourceHandle(edge, sourceNode) === API_TOOL_CALL_HANDLE_ID,
         );
         const hasMessageOutgoing = sourceEdges.some(
-          (edge) => inferToolEdgeSourceHandle(edge, sourceNode) === API_MESSAGE_HANDLE_ID,
+          (edge) => inferToolEdgeSourceHandle(edge, sourceNode) === API_FINAL_MESSAGE_HANDLE_ID,
         );
         if (effectiveSourceHandleId === API_TOOL_CALL_HANDLE_ID) {
           if (
@@ -2126,16 +2197,16 @@ export function GraphCanvas({
           return null;
         }
         if (hasMessageOutgoing) {
-          setEditorMessage("API nodes can only have one message route.");
+          setEditorMessage("API nodes can only have one final-message route.");
           return null;
         }
         return {
           id: nextEdgeId,
           source_id: sourceId,
           target_id: targetId,
-          source_handle_id: API_MESSAGE_HANDLE_ID,
+          source_handle_id: API_FINAL_MESSAGE_HANDLE_ID,
           target_handle_id: effectiveTargetHandleId,
-          label: "message",
+          label: "final message",
           kind: "conditional",
           priority: 20,
           waypoints,
@@ -2155,7 +2226,14 @@ export function GraphCanvas({
         condition: hasStandardOutgoing ? defaultConditionalCondition(nextEdgeId) : null,
       };
     },
-    [catalog, getConnectionConflictState, isPromptBlockBindingConnection, isToolContextBindingConnection, removeEdgesAndPruneJunctions],
+    [
+      catalog,
+      getConnectionConflictState,
+      isDisplayContextBuilderBindingConnection,
+      isPromptBlockBindingConnection,
+      isToolContextBindingConnection,
+      removeEdgesAndPruneJunctions,
+    ],
   );
 
   const commitEdge = useCallback(
@@ -2795,21 +2873,49 @@ export function GraphCanvas({
   );
 
   const copySelectedNodeToClipboard = useCallback(() => {
-    if (!graph || !selectedNodeId) {
-      setEditorMessage("Select a node to copy.");
+    if (!graph) {
+      setEditorMessage("Select nodes to copy.");
       return;
     }
-    const selectedNode = graph.nodes.find((node) => node.id === selectedNodeId);
-    if (!selectedNode) {
-      setEditorMessage("Select a node to copy.");
+
+    const selectedNodeIdSet = new Set(selectedNodeIds);
+    selectedEdgeIds.forEach((edgeId) => {
+      const edge = graph.edges.find((candidate) => candidate.id === edgeId);
+      if (!edge) {
+        return;
+      }
+      selectedNodeIdSet.add(edge.source_id);
+      selectedNodeIdSet.add(edge.target_id);
+    });
+
+    const copiedNodes = graph.nodes.filter((node) => selectedNodeIdSet.has(node.id));
+    if (copiedNodes.length === 0) {
+      setEditorMessage("Select nodes to copy.");
       return;
     }
+
+    const copiedNodeIdSet = new Set(copiedNodes.map((node) => node.id));
+    const selectedEdgeIdSet = new Set(selectedEdgeIds);
+    const copiedEdges = graph.edges.filter(
+      (edge) =>
+        copiedNodeIdSet.has(edge.source_id) &&
+        copiedNodeIdSet.has(edge.target_id) &&
+        (selectedEdgeIdSet.size === 0 || selectedEdgeIdSet.has(edge.id) || (selectedNodeIdSet.has(edge.source_id) && selectedNodeIdSet.has(edge.target_id))),
+    );
+
     nodeClipboardRef.current = {
-      node: JSON.parse(JSON.stringify(selectedNode)) as GraphNode,
+      nodes: cloneClipboardNodes(copiedNodes),
+      edges: cloneClipboardEdges(copiedEdges),
       pasteCount: 0,
     };
-    setEditorMessage(`Copied ${selectedNode.label}.`);
-  }, [graph, selectedNodeId]);
+    if (copiedNodes.length === 1 && copiedEdges.length === 0) {
+      setEditorMessage(`Copied ${copiedNodes[0].label}.`);
+      return;
+    }
+    setEditorMessage(
+      `Copied ${copiedNodes.length} node${copiedNodes.length === 1 ? "" : "s"} and ${copiedEdges.length} edge${copiedEdges.length === 1 ? "" : "s"}.`,
+    );
+  }, [graph, selectedEdgeIds, selectedNodeIds]);
 
   const pasteNodeFromClipboard = useCallback(() => {
     if (!graph) {
@@ -2825,28 +2931,76 @@ export function GraphCanvas({
       return;
     }
     const pasteCount = clipboard.pasteCount + 1;
-    const nextNode = duplicateGraphNode(graph, clipboard.node, {
-      position: {
-        x: clipboard.node.position.x + NODE_CLIPBOARD_PASTE_OFFSET * pasteCount,
-        y: clipboard.node.position.y + NODE_CLIPBOARD_PASTE_OFFSET * pasteCount,
-      },
+    let nextGraph = graph;
+    const nodeIdMap = new Map<string, string>();
+    const pastedNodeIds: string[] = [];
+    const pastedEdgeIds: string[] = [];
+
+    clipboard.nodes.forEach((clipboardNode) => {
+      const nextNode = duplicateGraphNode(nextGraph, clipboardNode, {
+        position: {
+          x: clipboardNode.position.x + NODE_CLIPBOARD_PASTE_OFFSET * pasteCount,
+          y: clipboardNode.position.y + NODE_CLIPBOARD_PASTE_OFFSET * pasteCount,
+        },
+      });
+      nodeIdMap.set(clipboardNode.id, nextNode.id);
+      pastedNodeIds.push(nextNode.id);
+      nextGraph = {
+        ...nextGraph,
+        start_node_id: !nextGraph.start_node_id && nextNode.category === "start" ? nextNode.id : nextGraph.start_node_id,
+        nodes: [...nextGraph.nodes, nextNode],
+      };
     });
+
+    clipboard.edges.forEach((clipboardEdge, index) => {
+      const nextSourceId = nodeIdMap.get(clipboardEdge.source_id);
+      const nextTargetId = nodeIdMap.get(clipboardEdge.target_id);
+      if (!nextSourceId || !nextTargetId) {
+        return;
+      }
+      const nextEdgeId = `edge-${nextSourceId}-${nextTargetId}-${Date.now()}-${index}`;
+      const nextEdge: GraphEdge = {
+        ...cloneClipboardEdges([clipboardEdge])[0],
+        id: nextEdgeId,
+        source_id: nextSourceId,
+        target_id: nextTargetId,
+        waypoints: clipboardEdge.waypoints?.map((waypoint) => ({
+          x: waypoint.x + NODE_CLIPBOARD_PASTE_OFFSET * pasteCount,
+          y: waypoint.y + NODE_CLIPBOARD_PASTE_OFFSET * pasteCount,
+        })),
+        condition: clipboardEdge.condition
+          ? {
+              ...clipboardEdge.condition,
+              id: `${nextEdgeId}-condition`,
+            }
+          : null,
+      };
+      pastedEdgeIds.push(nextEdgeId);
+      nextGraph = {
+        ...nextGraph,
+        edges: [...nextGraph.edges, nextEdge],
+      };
+    });
+
     nodeClipboardRef.current = {
       ...clipboard,
       pasteCount,
     };
-    onGraphChange({
-      ...graph,
-      start_node_id: !graph.start_node_id && nextNode.category === "start" ? nextNode.id : graph.start_node_id,
-      nodes: [...graph.nodes, nextNode],
-    });
-    onSelectionChange(nextNode.id, null);
+    onGraphChange(nextGraph);
+    setCanvasSelection({ nodeIds: pastedNodeIds, edgeIds: pastedEdgeIds });
     setTooltipNodeId(null);
     setToolDetailsNodeId(null);
     setProviderDetailsNodeId(null);
     setPromptBlockDetailsNodeId(null);
-    setEditorMessage(`Pasted ${nextNode.label}.`);
-  }, [draftConnection, graph, onGraphChange, onSelectionChange, pendingPlacement]);
+    if (pastedNodeIds.length === 1 && pastedEdgeIds.length === 0) {
+      const pastedNode = nextGraph.nodes.find((node) => node.id === pastedNodeIds[0]);
+      setEditorMessage(`Pasted ${pastedNode?.label ?? "node"}.`);
+      return;
+    }
+    setEditorMessage(
+      `Pasted ${pastedNodeIds.length} node${pastedNodeIds.length === 1 ? "" : "s"} and ${pastedEdgeIds.length} edge${pastedEdgeIds.length === 1 ? "" : "s"}.`,
+    );
+  }, [draftConnection, graph, onGraphChange, pendingPlacement, setCanvasSelection]);
 
   const handleDeleteSavedNode = useCallback(
     (id: string) => {
@@ -2963,7 +3117,7 @@ export function GraphCanvas({
     if (draftConnection.sourceHandleId === API_TOOL_CALL_HANDLE_ID) {
       return " graph-draft-wire-path--api-tool-call";
     }
-    if (draftConnection.sourceHandleId === API_MESSAGE_HANDLE_ID) {
+    if (draftConnection.sourceHandleId === API_FINAL_MESSAGE_HANDLE_ID) {
       return " graph-draft-wire-path--api-message";
     }
     return draftConnection.sourceHandleId === TOOL_FAILURE_HANDLE_ID
@@ -3163,13 +3317,15 @@ export function GraphCanvas({
     }
     const isRoutingDraftWire = draftConnection !== null && !isConnecting;
     const snapTargetNodeId = isRoutingDraftWire ? draftConnectionSnapTargetNodeId : null;
+  const completedNodeIds = completedNodeIdSet(runState);
     const nextNodeDataCache = new Map<string, GraphCanvasRuntimeNodeData>();
     const nextFlowNodeCache = new Map<string, FlowNode<GraphCanvasRuntimeNodeData>>();
     const nextNodes = graph.nodes.map((node): FlowNode<GraphCanvasRuntimeNodeData> => {
       const isActive = runState?.current_node_id === node.id;
       const hasError = Boolean(runState?.node_errors?.[node.id]);
-      const wasVisited = (runState?.visit_counts?.[node.id] ?? 0) > 0;
+    const wasVisited = completedNodeIds.has(node.id);
       const didLastRunFinish = runState?.status === "completed" || runState?.status === "failed";
+      const expectsExecutionStatus = participatesInExecutionRoute(graph, node);
       const isConnectionMagnetized = isRoutingDraftWire && snapTargetNodeId === node.id;
       const kindColor = KIND_COLORS[node.kind] ?? "#8486a5";
       const status: GraphCanvasNodeData["status"] = hasError
@@ -3178,7 +3334,7 @@ export function GraphCanvas({
           ? "active"
           : wasVisited
             ? "success"
-            : didLastRunFinish
+            : didLastRunFinish && expectsExecutionStatus
               ? "unreached"
               : "idle";
       const tooltipVisible = tooltipNodeId === node.id;
@@ -3390,10 +3546,11 @@ export function GraphCanvas({
           : isApiModelNode(sourceNode)
             ? sourceHandleId === API_TOOL_CALL_HANDLE_ID
               ? API_EDGE_TONES.toolCall
-              : sourceHandleId === API_MESSAGE_HANDLE_ID
+              : sourceHandleId === API_FINAL_MESSAGE_HANDLE_ID
                 ? API_EDGE_TONES.message
                 : null
           : null;
+      const isActiveEdge = runState?.current_edge_id === edge.id;
       const siblingIndex = siblingEdges.findIndex((candidate) => candidate.id === edge.id);
       const overlappingIndex = overlappingEdges.findIndex((candidate) => candidate.id === edge.id);
       const siblingLaneOffset = (siblingIndex - (siblingEdges.length - 1) / 2) * EDGE_SIBLING_SPACING;
@@ -3462,6 +3619,7 @@ export function GraphCanvas({
         animated: false,
         data: {
           kind: edge.kind,
+          isActive: isActiveEdge,
           routePoints,
           sourceColor: toolEdgeTone?.sourceColor ?? KIND_COLORS[sourceNode?.kind ?? ""] ?? "#6ea8ff",
           targetColor: toolEdgeTone?.targetColor ?? KIND_COLORS[targetNode?.kind ?? ""] ?? "#6ea8ff",
@@ -3477,10 +3635,16 @@ export function GraphCanvas({
           onWaypointPointerDown: handleWaypointPointerDown,
         },
         style: {
-          strokeWidth: selectedEdgeIdSet.has(edge.id) ? SELECTED_EDGE_STROKE_WIDTH : EDGE_STROKE_WIDTH,
+          strokeWidth: isActiveEdge
+            ? SELECTED_EDGE_STROKE_WIDTH
+            : selectedEdgeIdSet.has(edge.id)
+              ? SELECTED_EDGE_STROKE_WIDTH
+              : EDGE_STROKE_WIDTH,
           strokeLinecap: "round" as const,
           filter:
-            selectedEdgeIdSet.has(edge.id)
+            isActiveEdge
+              ? "drop-shadow(0 0 7px rgba(96, 165, 250, 0.45)) drop-shadow(0 0 12px rgba(125, 211, 252, 0.28))"
+              : selectedEdgeIdSet.has(edge.id)
               ? "drop-shadow(0 0 7px rgba(255, 99, 196, 0.25)) drop-shadow(0 0 10px rgba(92, 146, 255, 0.22))"
               : "drop-shadow(0 0 7px rgba(111, 133, 255, 0.18))",
         },
@@ -3521,7 +3685,7 @@ export function GraphCanvas({
       cachedEdgesRef.current = result;
     }
     return result;
-  }, [dragRenderTick, getNodeDimensions, graph, handleWaypointPointerDown, isNodeDragActive, junctionDrag, selectedEdgeIdSet, waypointDrag]);
+  }, [dragRenderTick, getNodeDimensions, graph, handleWaypointPointerDown, isNodeDragActive, junctionDrag, runState?.current_edge_id, selectedEdgeIdSet, waypointDrag]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {

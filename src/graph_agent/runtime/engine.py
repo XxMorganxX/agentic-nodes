@@ -72,6 +72,12 @@ class GraphRuntime:
             state.current_node_id = current_node_id
             incoming_edge_id = frame.get("incoming_edge_id")
             state.current_edge_id = str(incoming_edge_id) if incoming_edge_id is not None else None
+            node = graph.get_node(current_node_id)
+            context = NodeContext(graph=graph, state=state, services=self.services, node_id=node.id)
+            if not node.is_ready(context):
+                pending_nodes.append(frame)
+                step += 1
+                continue
             visit_count = state.visit_counts.get(current_node_id, 0) + 1
             state.visit_counts[current_node_id] = visit_count
 
@@ -86,8 +92,6 @@ class GraphRuntime:
                     },
                 )
 
-            node = graph.get_node(current_node_id)
-            context = NodeContext(graph=graph, state=state, services=self.services, node_id=node.id)
             try:
                 received_input = node.runtime_input_preview(context)
             except Exception:  # noqa: BLE001

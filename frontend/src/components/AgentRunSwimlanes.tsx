@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { KeyboardEvent } from "react";
 
 import { formatRunStatusLabel, type AgentRunLane } from "../lib/runVisualization";
+import { RunErrorHover } from "./RunErrorHover";
 
 type AgentRunSwimlanesProps = {
   lanes: AgentRunLane[];
@@ -200,7 +201,7 @@ export function AgentRunSwimlanes({
                   <span>{lane.completedNodes}/{lane.totalNodes} nodes</span>
                   <span>{lane.transitionCount} transitions</span>
                   <span>{lane.retryCount} retries</span>
-                  <span>{lane.errorCount} errors</span>
+                  <RunErrorHover count={lane.errorCount} summaries={lane.errorSummaries} />
                   <span>{lane.elapsedLabel}</span>
                 </div>
                 <div className="agent-swimlane-current">Current: {lane.currentNodeLabel}</div>

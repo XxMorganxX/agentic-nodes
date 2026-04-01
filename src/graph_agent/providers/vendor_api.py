@@ -16,6 +16,7 @@ from graph_agent.providers.base import (
     ModelToolCall,
     ModelToolDefinition,
     ProviderPreflightResult,
+    normalize_api_decision_output,
 )
 
 
@@ -287,14 +288,28 @@ class OpenAIChatModelProvider(VendorAPIModelProvider):
                     )
                 )
 
-        structured_output = normalized_tool_calls[0].arguments if normalized_tool_calls else None
+        structured_output = None
         if structured_output is None and response_schema is not None and content_text.strip():
             structured_output = json.loads(content_text)
+        decision_output = normalize_api_decision_output(
+            structured_output,
+            content=content_text,
+            tool_calls=normalized_tool_calls,
+        )
+        normalized_decision_tool_calls = [
+            ModelToolCall(
+                tool_name=str(tool_call["tool_name"]),
+                arguments=tool_call.get("arguments"),
+                provider_tool_id=tool_call.get("provider_tool_id"),
+                metadata=dict(tool_call.get("metadata", {})),
+            )
+            for tool_call in decision_output["tool_calls"]
+        ]
 
         return ModelResponse(
             content=content_text,
-            structured_output=structured_output,
-            tool_calls=normalized_tool_calls,
+            structured_output=decision_output,
+            tool_calls=normalized_decision_tool_calls,
             metadata={
                 "latency_ms": latency_ms,
                 "vendor_model": payload.get("model"),
@@ -392,14 +407,28 @@ class ClaudeMessagesModelProvider(VendorAPIModelProvider):
                     )
 
         content_text = "\n".join(part for part in text_parts if part)
-        structured_output = normalized_tool_calls[0].arguments if normalized_tool_calls else None
+        structured_output = None
         if structured_output is None and response_schema is not None and content_text.strip():
             structured_output = json.loads(content_text)
+        decision_output = normalize_api_decision_output(
+            structured_output,
+            content=content_text,
+            tool_calls=normalized_tool_calls,
+        )
+        normalized_decision_tool_calls = [
+            ModelToolCall(
+                tool_name=str(tool_call["tool_name"]),
+                arguments=tool_call.get("arguments"),
+                provider_tool_id=tool_call.get("provider_tool_id"),
+                metadata=dict(tool_call.get("metadata", {})),
+            )
+            for tool_call in decision_output["tool_calls"]
+        ]
 
         return ModelResponse(
             content=content_text,
-            structured_output=structured_output,
-            tool_calls=normalized_tool_calls,
+            structured_output=decision_output,
+            tool_calls=normalized_decision_tool_calls,
             metadata={
                 "latency_ms": latency_ms,
                 "vendor_model": payload.get("model"),

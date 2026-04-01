@@ -42,6 +42,20 @@ class ToolToggleRequest(BaseModel):
     enabled: bool
 
 
+class McpServerPayload(BaseModel):
+    server_id: str
+    display_name: str
+    description: str = ""
+    transport: str = "stdio"
+    command: list[str] = []
+    cwd: Optional[str] = None
+    env: Optional[dict[str, str]] = None
+    base_url: Optional[str] = None
+    timeout_seconds: int = 15
+    auto_boot: bool = False
+    persistent: bool = True
+
+
 app = FastAPI(title="Graph Agent API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -161,6 +175,45 @@ def refresh_mcp_server(server_id: str) -> dict[str, Any]:
         return manager.refresh_mcp_server(server_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Unknown MCP server '{server_id}'.") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/editor/mcp/servers")
+def create_mcp_server(server: McpServerPayload) -> dict[str, Any]:
+    try:
+        return manager.create_mcp_server(server.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/editor/mcp/servers/{server_id}")
+def update_mcp_server(server_id: str, server: McpServerPayload) -> dict[str, Any]:
+    try:
+        return manager.update_mcp_server(server_id, server.model_dump())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown MCP server '{server_id}'.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/editor/mcp/servers/{server_id}")
+def delete_mcp_server(server_id: str) -> dict[str, str]:
+    try:
+        manager.delete_mcp_server(server_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown MCP server '{server_id}'.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"deleted": server_id}
+
+
+@app.post("/api/editor/mcp/servers/test")
+def test_mcp_server(server: McpServerPayload) -> dict[str, Any]:
+    try:
+        return manager.test_mcp_server(server.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

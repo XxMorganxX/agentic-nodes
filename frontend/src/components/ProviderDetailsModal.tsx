@@ -207,7 +207,7 @@ export function ProviderDetailsModal({
   }
 
   function handleTextInputChange(key: string) {
-    return (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+    return (event: ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
       updateProviderConfig(key, event.target.value);
     };
   }
@@ -297,7 +297,7 @@ export function ProviderDetailsModal({
             </h3>
             <p>
               Required provider selection stays on the API node. Use this modal to review provider capabilities and tune
-              optional provider parameters for the selected API step.
+              optional provider parameters and prompt instructions for the selected API step.
             </p>
           </div>
           <button type="button" className="secondary-button" onClick={onClose}>
@@ -413,6 +413,16 @@ export function ProviderDetailsModal({
                   );
                 })}
               </select>
+            </label>
+            <label className="provider-details-grid-full">
+              System Prompt
+              <textarea
+                rows={7}
+                value={String(node.config.system_prompt ?? "")}
+                placeholder="You are a helpful model node."
+                onChange={handleTextInputChange("system_prompt")}
+              />
+              <small>This prompt stays on the API node and is sent as the system message for the selected provider.</small>
             </label>
             {providerConfigFields.map((field) => (
               <label key={field.key}>

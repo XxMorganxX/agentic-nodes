@@ -43,6 +43,7 @@ def _weather_mcp_server_definition() -> McpServerDefinition:
         env=_mcp_python_path_env(),
         auto_boot=False,
         persistent=True,
+        source="builtin",
     )
 
 
@@ -55,10 +56,11 @@ def _time_mcp_server_definition() -> McpServerDefinition:
         env=_mcp_python_path_env(),
         auto_boot=False,
         persistent=True,
+        source="builtin",
     )
 
 
-def build_example_services() -> RuntimeServices:
+def build_example_services(*, include_user_mcp_servers: bool = False) -> RuntimeServices:
     registry = ToolRegistry()
     registry.register(build_search_catalog_tool())
     registry.register(
@@ -97,6 +99,8 @@ def build_example_services() -> RuntimeServices:
     mcp_server_manager = McpServerManager(registry)
     mcp_server_manager.register_server(_weather_mcp_server_definition())
     mcp_server_manager.register_server(_time_mcp_server_definition())
+    if include_user_mcp_servers:
+        mcp_server_manager.load_user_servers()
     node_providers = NodeProviderRegistry()
     node_providers.register(
         NodeProviderDefinition(
@@ -292,18 +296,27 @@ def build_example_services() -> RuntimeServices:
             display_name="MCP Tool Executor",
             category=NodeCategory.TOOL,
             node_kind="mcp_tool_executor",
-            description="Consumes an API tool-call envelope and dispatches the selected MCP tool with success and failure routes.",
-            capabilities=["mcp tool dispatch", "success routing", "failure routing"],
-        )
-    )
-    node_providers.register(
-        NodeProviderDefinition(
-            provider_id="tool.mcp_recheck",
-            display_name="MCP Recheck Node",
-            category=NodeCategory.TOOL,
-            node_kind="mcp_recheck",
-            description="Packages the latest MCP execution details into a follow-up envelope so a downstream API node can decide whether more tools are needed.",
-            capabilities=["mcp execution appendix", "follow-up tool loop context", "terminal output intake"],
+            description="Dispatches MCP tool calls and can optionally run a model-guided follow-up loop to decide whether another exposed MCP tool is needed or the work is complete.",
+            capabilities=["mcp tool dispatch", "success routing", "failure routing", "follow-up tool decision"],
+            default_config={
+                "enable_follow_up_decision": False,
+                "provider_name": "claude_code",
+                "prompt_name": "mcp_executor_follow_up",
+                "mode": "mcp_executor_follow_up",
+                "system_prompt": (
+                    "Review the original request and tool history in the input payload. "
+                    "If the last MCP tool call failed, do not request another tool call. "
+                    "If more live MCP data is still required, call exactly one exposed MCP tool. "
+                    "Otherwise return the final answer."
+                ),
+                "user_message_template": "{input_payload}",
+                "response_mode": "auto",
+                "validate_last_tool_success": True,
+                "model": "sonnet",
+                "cli_path": "claude",
+                "timeout_seconds": 90,
+                "max_turns": 3,
+            },
         )
     )
     node_providers.register(

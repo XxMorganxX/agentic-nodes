@@ -213,9 +213,12 @@ export function createNodeFromProvider(
   }
 
   if (provider.node_kind === "mcp_tool_executor") {
+    const defaultConfig = provider.default_config && typeof provider.default_config === "object" ? provider.default_config : {};
     return {
       ...baseNode,
-      config: {},
+      config: {
+        ...defaultConfig,
+      },
     };
   }
 
@@ -339,7 +342,7 @@ export function isWireJunctionNode(node: GraphNode | null | undefined): boolean 
 }
 
 export function isRoutableToolNode(node: GraphNode | null | undefined): boolean {
-  return Boolean(node && (node.kind === "tool" || node.kind === "mcp_tool_executor" || node.kind === "mcp_recheck"));
+  return Boolean(node && (node.kind === "tool" || node.kind === "mcp_tool_executor"));
 }
 
 export function isMcpContextProviderNode(node: GraphNode | null | undefined): boolean {
@@ -359,7 +362,8 @@ export const TOOL_FAILURE_HANDLE_ID = "tool-failure";
 export const TOOL_CONTEXT_HANDLE_ID = "tool-context";
 export const API_TOOL_CONTEXT_HANDLE_ID = "api-tool-context";
 export const API_TOOL_CALL_HANDLE_ID = "api-tool-call";
-export const API_MESSAGE_HANDLE_ID = "api-message";
+export const API_FINAL_MESSAGE_HANDLE_ID = "api-message";
+export const API_MESSAGE_HANDLE_ID = API_FINAL_MESSAGE_HANDLE_ID;
 export const MCP_TERMINAL_OUTPUT_HANDLE_ID = "mcp-terminal-output";
 export const PROMPT_BLOCK_PROVIDER_ID = "core.prompt_block";
 
@@ -376,7 +380,7 @@ export function defaultToolFailureCondition(edgeId: string): GraphEdge["conditio
 export function defaultApiToolCallCondition(edgeId: string): GraphEdge["condition"] {
   return {
     id: `${edgeId}-condition`,
-    label: "Tool call output",
+    label: "Tool calls output",
     type: "result_payload_path_equals",
     value: "tool_call_envelope",
     path: "metadata.contract",
@@ -386,7 +390,7 @@ export function defaultApiToolCallCondition(edgeId: string): GraphEdge["conditio
 export function defaultApiMessageCondition(edgeId: string): GraphEdge["condition"] {
   return {
     id: `${edgeId}-condition`,
-    label: "Message output",
+    label: "Final message output",
     type: "result_payload_path_equals",
     value: "message_envelope",
     path: "metadata.contract",
@@ -404,7 +408,7 @@ export function defaultMcpTerminalOutputCondition(edgeId: string): GraphEdge["co
 }
 
 export function isApiOutputHandleId(handleId: string | null | undefined): boolean {
-  return handleId === API_TOOL_CALL_HANDLE_ID || handleId === API_MESSAGE_HANDLE_ID;
+  return handleId === API_TOOL_CALL_HANDLE_ID || handleId === API_FINAL_MESSAGE_HANDLE_ID;
 }
 
 function hasExposedMcpToolContext(graph: GraphDefinition, node: GraphNode): boolean {
@@ -435,7 +439,7 @@ function hasToolOutputRoute(graph: GraphDefinition, node: GraphNode): boolean {
     if (edge.source_handle_id === API_TOOL_CALL_HANDLE_ID) {
       return true;
     }
-    if (edge.source_handle_id === API_MESSAGE_HANDLE_ID) {
+    if (edge.source_handle_id === API_FINAL_MESSAGE_HANDLE_ID) {
       return false;
     }
     const targetNode = graph.nodes.find((candidate) => candidate.id === edge.target_id);
@@ -456,7 +460,7 @@ function hasMessageOutputRoute(graph: GraphDefinition, node: GraphNode): boolean
     if (edge.kind === "binding" || edge.source_id !== node.id) {
       return false;
     }
-    if (edge.source_handle_id === API_MESSAGE_HANDLE_ID) {
+    if (edge.source_handle_id === API_FINAL_MESSAGE_HANDLE_ID) {
       return true;
     }
     if (edge.source_handle_id === API_TOOL_CALL_HANDLE_ID) {
@@ -500,7 +504,7 @@ export function inferToolEdgeSourceHandle(edge: GraphEdge, sourceNode: GraphNode
     return edge.source_handle_id ?? null;
   }
   if (isApiModelNode(sourceNode)) {
-    if (edge.source_handle_id === API_TOOL_CALL_HANDLE_ID || edge.source_handle_id === API_MESSAGE_HANDLE_ID) {
+    if (edge.source_handle_id === API_TOOL_CALL_HANDLE_ID || edge.source_handle_id === API_FINAL_MESSAGE_HANDLE_ID) {
       return edge.source_handle_id;
     }
     if (
@@ -515,7 +519,7 @@ export function inferToolEdgeSourceHandle(edge: GraphEdge, sourceNode: GraphNode
       edge.condition.path === "metadata.contract" &&
       edge.condition.value === "message_envelope"
     ) {
-      return API_MESSAGE_HANDLE_ID;
+      return API_FINAL_MESSAGE_HANDLE_ID;
     }
     return edge.source_handle_id ?? null;
   }
@@ -539,7 +543,7 @@ export function getToolSourceHandleAnchorRatio(handleId: string | null | undefin
   if (handleId === API_TOOL_CALL_HANDLE_ID) {
     return 0.4;
   }
-  if (handleId === API_MESSAGE_HANDLE_ID) {
+  if (handleId === API_FINAL_MESSAGE_HANDLE_ID) {
     return 0.68;
   }
   if (handleId === TOOL_CONTEXT_HANDLE_ID) {
@@ -594,13 +598,13 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
       target_handle_id: edge.target_handle_id ?? null,
       waypoints: edge.waypoints?.map((waypoint) => ({ ...waypoint })),
       kind:
-        edge.source_handle_id === API_TOOL_CALL_HANDLE_ID || edge.source_handle_id === API_MESSAGE_HANDLE_ID
+        edge.source_handle_id === API_TOOL_CALL_HANDLE_ID || edge.source_handle_id === API_FINAL_MESSAGE_HANDLE_ID
           ? "conditional"
           : edge.kind,
       condition:
         edge.source_handle_id === API_TOOL_CALL_HANDLE_ID
           ? edge.condition ?? defaultApiToolCallCondition(edge.id)
-          : edge.source_handle_id === API_MESSAGE_HANDLE_ID
+          : edge.source_handle_id === API_FINAL_MESSAGE_HANDLE_ID
             ? edge.condition ?? defaultApiMessageCondition(edge.id)
             : edge.source_handle_id === MCP_TERMINAL_OUTPUT_HANDLE_ID
               ? edge.condition ?? defaultMcpTerminalOutputCondition(edge.id)

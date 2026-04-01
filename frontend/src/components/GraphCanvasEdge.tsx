@@ -12,6 +12,7 @@ type GraphPosition = {
 
 export type GraphCanvasEdgeData = {
   kind: string;
+  isActive?: boolean;
   labelOffset?: number;
   labelShiftX?: number;
   labelShiftY?: number;
@@ -478,6 +479,8 @@ function GraphCanvasEdgeComponent({
               data?.routeTone ? `graph-edge-label--${data.routeTone}` : ""
             } ${
               selected ? "is-selected" : ""
+            } ${
+              data?.isActive ? "is-active" : ""
             }`}
             style={labelStyle}
           >

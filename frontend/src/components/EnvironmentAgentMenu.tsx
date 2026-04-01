@@ -1,4 +1,5 @@
 import { formatRunStatusLabel, type AgentRunLane } from "../lib/runVisualization";
+import { RunErrorHover } from "./RunErrorHover";
 
 type EnvironmentAgentMenuProps = {
   agents: AgentRunLane[];
@@ -50,6 +51,7 @@ export function EnvironmentAgentMenu({
               </div>
               <div className="environment-agent-chip-meta">
                 <span>{agent.completedNodes}/{agent.totalNodes} nodes</span>
+                <RunErrorHover count={agent.errorCount} summaries={agent.errorSummaries} emptyLabel="No errors" />
                 <span>{agent.elapsedLabel}</span>
               </div>
             </button>

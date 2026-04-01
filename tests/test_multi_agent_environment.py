@@ -59,6 +59,7 @@ class MultiAgentEnvironmentTests(unittest.TestCase):
             self.assertEqual(agent_state["parent_run_id"], run_id)
             self.assertEqual(agent_state["status"], "completed")
             self.assertIsNotNone(agent_state["run_id"])
+            self.assertEqual(agent_state["node_errors"], {})
 
         agent_events = [event for event in state["event_history"] if event.get("agent_id")]
         self.assertTrue(agent_events)

@@ -18,6 +18,7 @@ from graph_agent.runtime.core import GraphDefinition, resolve_graph_process_env,
 from graph_agent.runtime.documents import AgentDefinition, TestEnvironmentDefinition, load_graph_document
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.serialization import serialize_run_state
+from graph_agent.tools.mcp import McpServerDefinition
 
 
 LOGGER = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ class GraphRunManager:
         run_log_store: RunLogStore | None = None,
         discord_service: DiscordTriggerService | None = None,
     ) -> None:
-        self._services = services or build_example_services()
+        self._services = services or build_example_services(include_user_mcp_servers=True)
         self._store = store or GraphStore(self._services)
         self._lock = Lock()
         self._run_states: dict[str, dict[str, Any]] = {}
@@ -114,6 +115,29 @@ class GraphRunManager:
         if self._services.mcp_server_manager is None:
             raise RuntimeError("MCP server manager is not configured.")
         return self._services.mcp_server_manager.set_tool_enabled(tool_name, enabled)
+
+    def create_mcp_server(self, server_payload: dict[str, Any]) -> dict[str, Any]:
+        if self._services.mcp_server_manager is None:
+            raise RuntimeError("MCP server manager is not configured.")
+        definition = McpServerDefinition.from_dict(server_payload)
+        return self._services.mcp_server_manager.create_server(definition)
+
+    def update_mcp_server(self, server_id: str, server_payload: dict[str, Any]) -> dict[str, Any]:
+        if self._services.mcp_server_manager is None:
+            raise RuntimeError("MCP server manager is not configured.")
+        definition = McpServerDefinition.from_dict(server_payload)
+        return self._services.mcp_server_manager.update_server(server_id, definition)
+
+    def delete_mcp_server(self, server_id: str) -> None:
+        if self._services.mcp_server_manager is None:
+            raise RuntimeError("MCP server manager is not configured.")
+        self._services.mcp_server_manager.delete_server(server_id)
+
+    def test_mcp_server(self, server_payload: dict[str, Any]) -> dict[str, Any]:
+        if self._services.mcp_server_manager is None:
+            raise RuntimeError("MCP server manager is not configured.")
+        definition = McpServerDefinition.from_dict(server_payload)
+        return self._services.mcp_server_manager.validate_server(definition)
 
     def preflight_provider(
         self,
@@ -502,6 +526,8 @@ class GraphRunManager:
             state["current_node_id"] = payload["node_id"]
             state["visit_counts"][payload["node_id"]] = payload["visit_count"]
         elif event_type == "node.completed":
+            if state.get("current_node_id") == payload["node_id"]:
+                state["current_node_id"] = None
             if payload.get("output") is not None:
                 state["node_outputs"][payload["node_id"]] = payload["output"]
             if payload.get("error") is not None:
@@ -517,10 +543,12 @@ class GraphRunManager:
             )
         elif event_type == "run.completed":
             state["status"] = "completed"
+            state["current_node_id"] = None
             state["final_output"] = payload["final_output"]
             state["ended_at"] = event["timestamp"]
         elif event_type == "run.failed":
             state["status"] = "failed"
+            state["current_node_id"] = None
             state["terminal_error"] = payload["error"]
             if "final_output" in payload:
                 state["final_output"] = payload["final_output"]

@@ -281,8 +281,15 @@ export function GraphInspector({
 
   const selectedNode = selectedNodeId ? graph.nodes.find((node) => node.id === selectedNodeId) ?? null : null;
   const selectedEdge = selectedEdgeId ? graph.edges.find((edge) => edge.id === selectedEdgeId) ?? null : null;
+  const executorFollowUpEnabled =
+    selectedNode?.kind === "mcp_tool_executor" && Boolean(selectedNode.config.enable_follow_up_decision);
+  const isPromptDrivenNode = selectedNode?.kind === "model" || executorFollowUpEnabled;
   const selectedModelResponseMode =
-    selectedNode?.kind === "model" ? inferModelResponseMode(graph, selectedNode) : null;
+    selectedNode?.kind === "model"
+      ? inferModelResponseMode(graph, selectedNode)
+      : executorFollowUpEnabled
+        ? String(selectedNode.config.response_mode ?? "auto")
+        : null;
 
   if (selectedNode) {
     if (isWireJunctionNode(selectedNode)) {
@@ -352,9 +359,9 @@ export function GraphInspector({
     const selectedMcpToolNames = Array.isArray(selectedNode.config.tool_names)
       ? (selectedNode.config.tool_names as string[])
       : [];
-    const mcpContextProvidersForModel = selectedNode.kind === "model" ? getModelMcpContextNodes(graph, selectedNode) : [];
+    const mcpContextProvidersForModel = isPromptDrivenNode ? getModelMcpContextNodes(graph, selectedNode) : [];
     const modelCallableMcpTools =
-      selectedNode.kind === "model"
+      isPromptDrivenNode
         ? mcpContextProvidersForModel.flatMap((node) => {
             const nodeToolNames = Array.isArray(node.config.tool_names)
               ? node.config.tool_names.map((toolName) => String(toolName)).filter((toolName) => toolName.trim().length > 0)
@@ -370,7 +377,7 @@ export function GraphInspector({
           })
         : [];
     const modelPromptContextProviders =
-      selectedNode.kind === "model"
+      isPromptDrivenNode
         ? uniqueStrings(
             mcpContextProvidersForModel
               .filter((node) => Boolean(node.config.include_mcp_tool_context))
@@ -378,13 +385,14 @@ export function GraphInspector({
           )
         : [];
     const modelTargetedMcpNodeIds =
-      selectedNode.kind === "model" && Array.isArray(selectedNode.config.tool_target_node_ids)
+      isPromptDrivenNode && Array.isArray(selectedNode.config.tool_target_node_ids)
         ? uniqueStrings(selectedNode.config.tool_target_node_ids.map((nodeId) => String(nodeId)))
         : [];
     const modelPromptBlockNodes = selectedNode.kind === "model" ? getModelPromptBlockNodes(graph, selectedNode) : [];
     const mcpToolExposureEnabled = selectedNode.kind === "mcp_context_provider" ? selectedNode.config.expose_mcp_tools !== false : false;
     const executorBindingSummary = selectedNode.kind === "mcp_tool_executor" ? describeMcpExecutorBinding(selectedNode.config.input_binding) : "";
-    const recheckBindingSummary = selectedNode.kind === "mcp_recheck" ? describeMcpExecutorBinding(selectedNode.config.input_binding) : "";
+    const executorFollowUpResponseMode =
+      selectedNode.kind === "mcp_tool_executor" ? String(selectedNode.config.response_mode ?? "auto") : "auto";
     const isDiscordStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.discord_message";
     const isManualStartNode =
       selectedNode.kind === "input" &&
@@ -639,7 +647,7 @@ export function GraphInspector({
               ) : null}
             </>
           ) : null}
-          {selectedNode.kind === "model" ? (
+          {isPromptDrivenNode ? (
             <>
               <label>
                 Model Provider
@@ -858,11 +866,35 @@ export function GraphInspector({
               </label>
               <label>
                 Response Mode
-                <input type="text" value={selectedModelResponseMode ?? "message"} readOnly />
-                <small>
-                  Derived from graph wiring. Tool-call routes make the model tool-capable, both output routes make it
-                  mixed, and message-only routing keeps it in message mode.
-                </small>
+                {selectedNode.kind === "model" ? (
+                  <>
+                    <input type="text" value={selectedModelResponseMode ?? "message"} readOnly />
+                    <small>
+                      Derived from graph wiring. Tool-call routes let the node emit structured tool decisions, both output
+                      routes keep tool decisions and final messages available, and final-message-only wiring keeps it in
+                      message mode.
+                    </small>
+                  </>
+                ) : (
+                  <>
+                    <select
+                      value={executorFollowUpResponseMode}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: { ...node.config, response_mode: event.target.value },
+                          })),
+                        )
+                      }
+                    >
+                      <option value="auto">auto</option>
+                      <option value="tool_call">tool_call</option>
+                      <option value="message">message</option>
+                    </select>
+                    <small>Controls whether the executor's follow-up model may request another MCP tool, produce a final message, or do either.</small>
+                  </>
+                )}
               </label>
               <div className="checkbox-grid">
                 <strong>Direct Registry Tools</strong>
@@ -914,16 +946,18 @@ export function GraphInspector({
                   <span>MCP tools are supplied through connected or targeted MCP Context Provider nodes.</span>
                 )}
               </div>
-              <div className="contract-card">
-                <strong>Bound Prompt Blocks</strong>
-                <span>
-                  Direct prompt messages:{" "}
-                  {modelPromptBlockNodes.length > 0
-                    ? modelPromptBlockNodes.map((node) => `${node.label} (${String(node.config.role ?? "user")})`).join(", ")
-                    : "None"}
-                </span>
-                <span>Bind Prompt Block nodes into the model to inject additional system, user, or assistant messages before the standard user template.</span>
-              </div>
+              {selectedNode.kind === "model" ? (
+                <div className="contract-card">
+                  <strong>Bound Prompt Blocks</strong>
+                  <span>
+                    Direct prompt messages:{" "}
+                    {modelPromptBlockNodes.length > 0
+                      ? modelPromptBlockNodes.map((node) => `${node.label} (${String(node.config.role ?? "user")})`).join(", ")
+                      : "None"}
+                  </span>
+                  <span>Bind Prompt Block nodes into the model to inject additional system, user, or assistant messages before the standard user template.</span>
+                </div>
+              ) : null}
               <label>
                 Preferred Tool Name
                 <input
@@ -1049,18 +1083,60 @@ export function GraphInspector({
             </>
           ) : null}
           {selectedNode.kind === "mcp_tool_executor" ? (
-            <div className="inspector-meta">
-              <span>Dispatch mode: single MCP tool call from upstream API output</span>
-              <span>Input binding: {executorBindingSummary}</span>
-              <span>Routes: on success / on failure / terminal output</span>
-            </div>
-          ) : null}
-          {selectedNode.kind === "mcp_recheck" ? (
-            <div className="inspector-meta">
-              <span>Appendix mode: packages the last MCP tool execution for a follow-up API node</span>
-              <span>Input binding: {recheckBindingSummary}</span>
-              <span>Includes: tool call, tool result, status, errors, and preserved terminal output</span>
-            </div>
+            <>
+              <label className="checkbox-option">
+                <input
+                  type="checkbox"
+                  checked={executorFollowUpEnabled}
+                  onChange={(event) =>
+                    onGraphChange(
+                      updateNode(graph, selectedNode.id, (node) => ({
+                        ...node,
+                        config: {
+                          ...node.config,
+                          enable_follow_up_decision: event.target.checked,
+                        },
+                      })),
+                    )
+                  }
+                />
+                <span>
+                  Enable Follow-Up Decision
+                  <small>Let the executor inspect each MCP result with a model and decide whether to stop or call another exposed MCP tool.</small>
+                </span>
+              </label>
+              {executorFollowUpEnabled ? (
+                <label className="checkbox-option">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(selectedNode.config.validate_last_tool_success ?? true)}
+                    onChange={(event) =>
+                      onGraphChange(
+                        updateNode(graph, selectedNode.id, (node) => ({
+                          ...node,
+                          config: {
+                            ...node.config,
+                            validate_last_tool_success: event.target.checked,
+                          },
+                        })),
+                      )
+                    }
+                  />
+                  <span>
+                    Stop On Failed Tool Result
+                    <small>When enabled, the executor will not ask the follow-up model for another MCP tool after a failed tool execution.</small>
+                  </span>
+                </label>
+              ) : null}
+              <div className="inspector-meta">
+                <span>Dispatch mode: single MCP tool call from upstream API output</span>
+                <span>Input binding: {executorBindingSummary}</span>
+                <span>
+                  Follow-up decision: {executorFollowUpEnabled ? "enabled via internal model loop" : "disabled"}
+                </span>
+                <span>Routes: on finish / on failure / terminal output</span>
+              </div>
+            </>
           ) : null}
           {selectedNode.kind === "data" ? (
             <>

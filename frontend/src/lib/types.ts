@@ -120,12 +120,41 @@ export type ToolDefinition = {
   managed?: boolean;
 };
 
+export type McpTransport = "stdio" | "http";
+
+export type McpServerConfig = {
+  command?: string[];
+  cwd?: string | null;
+  env?: Record<string, string>;
+  base_url?: string | null;
+  timeout_seconds?: number | null;
+};
+
+export type McpServerDraft = {
+  server_id: string;
+  display_name: string;
+  description: string;
+  transport: McpTransport;
+  command: string[];
+  cwd?: string | null;
+  env: Record<string, string>;
+  base_url?: string | null;
+  timeout_seconds: number;
+  auto_boot: boolean;
+  persistent: boolean;
+};
+
 export type McpServerStatus = {
   server_id: string;
   display_name: string;
   description: string;
+  transport: McpTransport;
   auto_boot: boolean;
   persistent: boolean;
+  source?: string;
+  editable?: boolean;
+  config?: McpServerConfig;
+  config_summary?: string;
   running: boolean;
   tool_names: string[];
   error: string;
@@ -199,6 +228,7 @@ export type RunState = {
   started_at: string | null;
   ended_at: string | null;
   input_payload: unknown;
+  node_inputs?: Record<string, unknown>;
   node_outputs: Record<string, unknown>;
   edge_outputs?: Record<string, unknown>;
   node_errors: Record<string, unknown>;

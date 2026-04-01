@@ -46,6 +46,15 @@ export type AgentRunMilestoneDataSection = {
   value: unknown;
 };
 
+export type AgentRunErrorSummary = {
+  id: string;
+  nodeId: string | null;
+  nodeLabel: string;
+  errorTypeLabel: string | null;
+  message: string;
+  metadata: string[];
+};
+
 export type AgentRunLane = {
   agentId: string;
   agentName: string;
@@ -57,6 +66,7 @@ export type AgentRunLane = {
   totalNodes: number;
   transitionCount: number;
   errorCount: number;
+  errorSummaries: AgentRunErrorSummary[];
   retryCount: number;
   elapsedLabel: string;
   milestones: AgentRunMilestone[];
@@ -109,8 +119,132 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function cleanInlineText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function truncateText(value: string, limit = 220): string {
+  return value.length > limit ? `${value.slice(0, limit - 1)}...` : value;
+}
+
+function firstNonEmptyString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string") {
+      const cleaned = cleanInlineText(value);
+      if (cleaned.length > 0) {
+        return cleaned;
+      }
+    }
+  }
+  return null;
+}
+
+function formatIdentifierLabel(value: string): string {
+  const ACRONYMS = new Set(["api", "http", "https", "id", "json", "mcp", "sse", "stderr", "stdout", "ui", "url"]);
+  return value
+    .split(/[.\s_-]+/)
+    .filter(Boolean)
+    .map((word) => {
+      const normalized = word.toLowerCase();
+      if (ACRONYMS.has(normalized)) {
+        return normalized.toUpperCase();
+      }
+      return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+    })
+    .join(" ");
+}
+
+function stringifyCompactValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function extractErrorMessage(value: unknown): string | null {
+  if (typeof value === "string") {
+    return firstNonEmptyString(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => extractErrorMessage(entry)).find((entry): entry is string => Boolean(entry)) ?? null;
+  }
+  if (isRecord(value)) {
+    return (
+      firstNonEmptyString(value.message, value.detail, value.reason, value.stderr, value.stdout, value.summary) ??
+      extractErrorMessage(value.error) ??
+      extractErrorMessage(value.errors)
+    );
+  }
+  return null;
+}
+
+function buildErrorMetadata(error: Record<string, unknown>): string[] {
+  const metadata = [
+    typeof error.tool_name === "string" ? `Tool ${error.tool_name}` : null,
+    typeof error.result_status === "string" ? `Status ${formatIdentifierLabel(error.result_status)}` : null,
+  ].filter((entry): entry is string => Boolean(entry));
+  return [...new Set(metadata)];
+}
+
+function summarizeErrorEntry(nodeId: string, nodeLabel: string, value: unknown): AgentRunErrorSummary {
+  if (isRecord(value)) {
+    const message =
+      extractErrorMessage(value) ?? truncateText(cleanInlineText(stringifyCompactValue(value)), 220);
+    return {
+      id: `${nodeId}-${message}`,
+      nodeId,
+      nodeLabel,
+      errorTypeLabel: typeof value.type === "string" ? formatIdentifierLabel(value.type) : null,
+      message,
+      metadata: buildErrorMetadata(value),
+    };
+  }
+  const message = extractErrorMessage(value) ?? truncateText(cleanInlineText(stringifyCompactValue(value)), 220);
+  return {
+    id: `${nodeId}-${message}`,
+    nodeId,
+    nodeLabel,
+    errorTypeLabel: null,
+    message,
+    metadata: [],
+  };
+}
+
+function summarizeNodeErrors(nodeErrors: Record<string, unknown>, labels: Map<string, string>): AgentRunErrorSummary[] {
+  const seen = new Set<string>();
+  return Object.entries(nodeErrors).flatMap(([nodeId, value]) => {
+    const nodeLabel = labels.get(nodeId) ?? nodeId;
+    const entries = Array.isArray(value) ? value : [value];
+    return entries.flatMap((entry, index) => {
+      if (entry == null) {
+        return [];
+      }
+      const summary = summarizeErrorEntry(nodeId, nodeLabel, entry);
+      const key = `${nodeId}:${summary.errorTypeLabel ?? "none"}:${summary.message}`;
+      if (seen.has(key)) {
+        return [];
+      }
+      seen.add(key);
+      return [{ ...summary, id: `${nodeId}-${index}-${summary.message}` }];
+    });
+  });
+}
+
 function nodeLabelMap(graph: GraphDefinition | null): Map<string, string> {
   return new Map((graph?.nodes ?? []).map((node) => [node.id, node.label]));
+}
+
+function completedNodeIds(events: RuntimeEvent[]): Set<string> {
+  return new Set(
+    events
+      .filter((event) => normalizeEventType(event.event_type) === "node.completed")
+      .map((event) => (typeof event.payload.node_id === "string" ? event.payload.node_id : ""))
+      .filter((nodeId) => nodeId.length > 0),
+  );
 }
 
 function graphByAgent(environment: TestEnvironmentDefinition): Map<string, GraphDefinition> {
@@ -517,6 +651,8 @@ export function buildAgentRunLanes(
     const agentEvents = events
       .filter((event) => event.agent_id === agent.agent_id)
       .map((event) => ({ ...event, event_type: normalizeEventType(event.event_type) }));
+    const completedAgentNodeIds = completedNodeIds(agentEvents);
+    const errorSummaries = summarizeNodeErrors(agentState?.node_errors ?? {}, labels);
     const knownNodeOutputs: Record<string, unknown> = {};
     let previousTimestamp: string | null = null;
     return {
@@ -529,10 +665,11 @@ export function buildAgentRunLanes(
         (agentState?.current_node_id ? labels.get(agentState.current_node_id) : null) ??
         agentState?.current_node_id ??
         "n/a",
-      completedNodes: Object.keys(agentState?.visit_counts ?? {}).length,
+      completedNodes: completedAgentNodeIds.size,
       totalNodes: currentGraph?.nodes.length ?? 0,
       transitionCount: agentState?.transition_history.length ?? 0,
-      errorCount: Object.keys(agentState?.node_errors ?? {}).length,
+      errorCount: errorSummaries.length,
+      errorSummaries,
       retryCount: agentEvents.filter((event) => event.event_type === "retry.triggered").length,
       elapsedLabel: formatElapsed(agentState?.started_at, agentState?.ended_at),
       milestones: agentEvents.map((event, index) => {
@@ -578,16 +715,18 @@ export function buildFocusedRunSummary(
 ): FocusedRunSummary {
   const labels = nodeLabelMap(graph);
   const normalizedEvents = normalizeFocusedEvents(events);
+  const completedNodeIdSet = completedNodeIds(normalizedEvents);
+  const errorCount = summarizeNodeErrors(runState?.node_errors ?? {}, labels).length;
   return {
     runId: runState?.run_id ?? null,
     status: runState?.status ?? "idle",
     currentNodeId: runState?.current_node_id ?? null,
     currentNodeLabel:
       (runState?.current_node_id ? labels.get(runState.current_node_id) : null) ?? runState?.current_node_id ?? "n/a",
-    completedNodes: Object.keys(runState?.visit_counts ?? {}).length,
+    completedNodes: completedNodeIdSet.size,
     totalNodes: graph?.nodes.length ?? 0,
     transitionCount: runState?.transition_history.length ?? 0,
-    errorCount: Object.keys(runState?.node_errors ?? {}).length,
+    errorCount,
     retryCount: normalizedEvents.filter((event) => event.event_type === "retry.triggered").length,
     elapsedLabel: formatElapsed(runState?.started_at, runState?.ended_at),
     finalOutput: runState?.final_output ?? null,

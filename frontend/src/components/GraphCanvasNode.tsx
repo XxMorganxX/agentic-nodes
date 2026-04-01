@@ -4,7 +4,7 @@ import { Handle, Position } from "reactflow";
 import type { NodeProps } from "reactflow";
 
 import {
-  API_MESSAGE_HANDLE_ID,
+  API_FINAL_MESSAGE_HANDLE_ID,
   API_TOOL_CALL_HANDLE_ID,
   API_TOOL_CONTEXT_HANDLE_ID,
   getApiToolContextTargetAnchorRatio,
@@ -52,7 +52,6 @@ const KIND_LABELS: Record<string, string> = {
   tool: "FX",
   mcp_context_provider: "MC",
   mcp_tool_executor: "MX",
-  mcp_recheck: "MR",
   data: "DB",
   output: "OUT",
 };
@@ -223,7 +222,7 @@ function GraphCanvasNodeComponent({
     top: `${getToolSourceHandleAnchorRatio(API_TOOL_CALL_HANDLE_ID) * 100}%`,
   } satisfies CSSProperties;
   const apiMessageHandleStyle = {
-    top: `${getToolSourceHandleAnchorRatio(API_MESSAGE_HANDLE_ID) * 100}%`,
+    top: `${getToolSourceHandleAnchorRatio(API_FINAL_MESSAGE_HANDLE_ID) * 100}%`,
   } satisfies CSSProperties;
   const mcpTerminalHandleStyle = {
     top: `${getToolSourceHandleAnchorRatio(MCP_TERMINAL_OUTPUT_HANDLE_ID) * 100}%`,
@@ -247,15 +246,9 @@ function GraphCanvasNodeComponent({
     : null;
   const isContextConnected = isContextProviderNode ? hasContextConnection(graph, node) : false;
   const contextBooted = isContextProviderNode ? isContextBooted(catalog, node) : false;
-  const displayStatus = isContextProviderNode
-    ? contextBooted && isContextConnected
-      ? "success"
-      : isContextConnected
-        ? "failed"
-        : "idle"
-    : status;
+  const displayStatus = status;
   const isActive = displayStatus === "active";
-  const statusLabel = isContextProviderNode
+  const contextBindingLabel = isContextProviderNode
     ? contextBooted && isContextConnected
       ? "Bound and MCP booted"
       : isContextConnected
@@ -263,6 +256,9 @@ function GraphCanvasNodeComponent({
         : contextBooted
           ? "MCP booted but not bound"
           : "MCP not booted and not bound"
+    : null;
+  const statusLabel = contextBindingLabel
+    ? `${formatRunStatusLabel(displayStatus)} • ${contextBindingLabel}`
     : formatRunStatusLabel(displayStatus);
   const nodeCardClassName = `graph-node-card graph-node-card--${displayStatus} ${isRoutableTool ? "graph-node-card--tool-outputs" : ""} ${
     isContextProviderNode ? "graph-node-card--tool-context-provider" : ""
@@ -501,7 +497,9 @@ function GraphCanvasNodeComponent({
       {showSourceHandle && isRoutableTool ? (
         <>
           <div className="graph-node-output-port graph-node-output-port--success" style={successHandleStyle} aria-hidden="true">
-            <span className="graph-node-output-port-label">On Success</span>
+            <span className="graph-node-output-port-label">
+              {node.kind === "mcp_tool_executor" ? "On Finish" : "On Success"}
+            </span>
           </div>
           <Handle
             id={TOOL_SUCCESS_HANDLE_ID}
@@ -553,7 +551,7 @@ function GraphCanvasNodeComponent({
       {showSourceHandle && isModelNode ? (
         <>
           <div className="graph-node-output-port graph-node-output-port--tool-call" style={apiToolCallHandleStyle} aria-hidden="true">
-            <span className="graph-node-output-port-label">Tool Call</span>
+            <span className="graph-node-output-port-label">Tool Calls</span>
           </div>
           <Handle
             id={API_TOOL_CALL_HANDLE_ID}
@@ -563,10 +561,10 @@ function GraphCanvasNodeComponent({
             style={apiToolCallHandleStyle}
           />
           <div className="graph-node-output-port graph-node-output-port--message" style={apiMessageHandleStyle} aria-hidden="true">
-            <span className="graph-node-output-port-label">Message</span>
+            <span className="graph-node-output-port-label">Final Message</span>
           </div>
           <Handle
-            id={API_MESSAGE_HANDLE_ID}
+            id={API_FINAL_MESSAGE_HANDLE_ID}
             type="source"
             position={Position.Right}
             className="graph-node-handle graph-node-handle-source graph-node-handle-source--message"

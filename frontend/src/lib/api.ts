@@ -1,4 +1,13 @@
-import type { EditorCatalog, GraphDocument, McpServerStatus, ProviderDiagnosticsResult, ProviderPreflightResult, RunState, ToolDefinition } from "./types";
+import type {
+  EditorCatalog,
+  GraphDocument,
+  McpServerDraft,
+  McpServerStatus,
+  ProviderDiagnosticsResult,
+  ProviderPreflightResult,
+  RunState,
+  ToolDefinition,
+} from "./types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
 
@@ -138,6 +147,69 @@ export async function refreshMcpServer(serverId: string): Promise<McpServerStatu
     throw new Error(await response.text());
   }
   return (await response.json()) as McpServerStatus;
+}
+
+export async function createMcpServer(server: McpServerDraft): Promise<McpServerStatus> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/mcp/servers`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(server),
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return (await response.json()) as McpServerStatus;
+}
+
+export async function updateMcpServer(serverId: string, server: McpServerDraft): Promise<McpServerStatus> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/mcp/servers/${serverId}`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(server),
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return (await response.json()) as McpServerStatus;
+}
+
+export async function deleteMcpServer(serverId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/mcp/servers/${serverId}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+}
+
+export async function testMcpServer(server: McpServerDraft): Promise<{
+  ok: boolean;
+  server: McpServerStatus;
+  tool_names: string[];
+  tools: Array<Record<string, unknown>>;
+  message: string;
+}> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/mcp/servers/test`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(server),
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return (await response.json()) as {
+    ok: boolean;
+    server: McpServerStatus;
+    tool_names: string[];
+    tools: Array<Record<string, unknown>>;
+    message: string;
+  };
 }
 
 export async function setMcpToolEnabled(toolName: string, enabled: boolean): Promise<ToolDefinition> {

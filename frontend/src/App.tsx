@@ -8,7 +8,9 @@ import { McpServerPanel } from "./components/McpServerPanel";
 import { UserPreferencesModal } from "./components/UserPreferencesModal";
 import {
   bootMcpServer,
+  createMcpServer,
   createGraph,
+  deleteMcpServer,
   deleteGraph,
   eventStreamUrl,
   fetchEditorCatalog,
@@ -18,12 +20,14 @@ import {
   setMcpToolEnabled,
   startRun,
   stopMcpServer,
+  testMcpServer,
+  updateMcpServer,
   updateGraph,
 } from "./lib/api";
 import { createBlankGraph, layoutGraphDocument, layoutGraphLR, normalizeGraphDocument } from "./lib/editor";
 import { filterEventsForAgent, getCanvasGraph, getDefaultAgentId, getSelectedRunId, getSelectedRunState, isTestEnvironment, updateSelectedAgentGraph } from "./lib/graphDocuments";
 import { buildAgentRunLanes, buildEnvironmentRunSummary, buildFocusedEventGroups, buildFocusedRunSummary } from "./lib/runVisualization";
-import type { EditorCatalog, GraphDefinition, GraphDocument, McpServerStatus, RunState, RuntimeEvent, ToolDefinition } from "./lib/types";
+import type { EditorCatalog, GraphDefinition, GraphDocument, McpServerDraft, McpServerStatus, RunState, RuntimeEvent, ToolDefinition } from "./lib/types";
 import { getUserPreferences, resetUserPreferences, saveUserPreferences } from "./lib/userPreferences";
 import type { UserPreferences } from "./lib/userPreferences";
 import { useGraphHistory } from "./lib/useGraphHistory";
@@ -49,6 +53,7 @@ function createEmptyRunState(runId: string, graphId: string, input: string): Run
     started_at: null,
     ended_at: null,
     input_payload: input,
+    node_inputs: {},
     node_outputs: {},
     edge_outputs: {},
     node_errors: {},
@@ -59,6 +64,68 @@ function createEmptyRunState(runId: string, graphId: string, input: string): Run
     terminal_error: null,
     agent_runs: {},
   };
+}
+
+function createPendingRunState(graph: GraphDocument, runId: string, input: string): RunState {
+  const next = createEmptyRunState(runId, graph.graph_id, input);
+  if (!isTestEnvironment(graph)) {
+    return next;
+  }
+  return {
+    ...next,
+    agent_runs: Object.fromEntries(
+      graph.agents.map((agent) => [
+        agent.agent_id,
+        {
+          ...createEmptyRunState(`${runId}:${agent.agent_id}`, agent.agent_id, input),
+          agent_id: agent.agent_id,
+          agent_name: agent.name,
+          parent_run_id: runId,
+        } satisfies RunState,
+      ]),
+    ),
+  };
+}
+
+function omitRunStateEntry<T>(record: Record<string, T> | undefined, key: string): Record<string, T> {
+  if (!record || !Object.prototype.hasOwnProperty.call(record, key)) {
+    return record ?? {};
+  }
+  const next = { ...record };
+  delete next[key];
+  return next;
+}
+
+function resolveEdgeOutputFromEventHistory(previous: RunState, edgePayload: Record<string, unknown>): unknown {
+  const sourceNodeId = typeof edgePayload.source_id === "string" ? edgePayload.source_id : null;
+  const sourceHandleId = typeof edgePayload.source_handle_id === "string" ? edgePayload.source_handle_id : null;
+  if (!sourceNodeId) {
+    return undefined;
+  }
+  for (let index = previous.event_history.length - 1; index >= 0; index -= 1) {
+    const candidate = previous.event_history[index];
+    if (candidate.event_type !== "node.completed") {
+      continue;
+    }
+    const candidateNodeId = typeof candidate.payload.node_id === "string" ? candidate.payload.node_id : null;
+    if (candidateNodeId !== sourceNodeId) {
+      continue;
+    }
+    if (sourceHandleId) {
+      const routeOutputs =
+        typeof candidate.payload.route_outputs === "object" && candidate.payload.route_outputs !== null
+          ? (candidate.payload.route_outputs as Record<string, unknown>)
+          : null;
+      if (routeOutputs && Object.prototype.hasOwnProperty.call(routeOutputs, sourceHandleId)) {
+        return routeOutputs[sourceHandleId];
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(candidate.payload, "output")) {
+      return candidate.payload.output;
+    }
+    return undefined;
+  }
+  return undefined;
 }
 
 function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState {
@@ -73,37 +140,58 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
   }
 
   if (event.event_type === "node.started") {
-    const payload = event.payload as { node_id: string; visit_count: number };
+    const payload = event.payload as { node_id: string; visit_count: number; received_input?: unknown };
     next.current_node_id = payload.node_id;
+    next.current_edge_id = null;
     next.visit_counts = {
       ...next.visit_counts,
       [payload.node_id]: payload.visit_count,
     };
+    next.node_inputs = {
+      ...(next.node_inputs ?? {}),
+      [payload.node_id]: payload.received_input,
+    };
+    next.node_errors = omitRunStateEntry(next.node_errors, payload.node_id);
   }
 
   if (event.event_type === "node.completed") {
     const payload = event.payload as { node_id: string; output?: unknown; error?: unknown };
+    if (next.current_node_id === payload.node_id) {
+      next.current_node_id = null;
+    }
     if (payload.output !== undefined) {
       next.node_outputs = {
         ...next.node_outputs,
         [payload.node_id]: payload.output,
       };
     }
-    if (payload.error !== undefined) {
+    if (payload.error != null) {
       next.node_errors = {
         ...next.node_errors,
         [payload.node_id]: payload.error,
       };
+    } else {
+      next.node_errors = omitRunStateEntry(next.node_errors, payload.node_id);
     }
   }
 
   if (event.event_type === "edge.selected") {
+    const payload = event.payload as Record<string, unknown>;
+    next.current_edge_id = typeof payload.id === "string" ? payload.id : null;
+    const selectedEdgeId = typeof payload.id === "string" ? payload.id : null;
+    const selectedEdgeOutput = resolveEdgeOutputFromEventHistory(previous, payload);
+    if (selectedEdgeId && selectedEdgeOutput !== undefined) {
+      next.edge_outputs = {
+        ...(next.edge_outputs ?? {}),
+        [selectedEdgeId]: selectedEdgeOutput,
+      };
+    }
     next.transition_history = [
       ...next.transition_history,
       {
-        edge_id: event.payload.id,
-        source_id: event.payload.source_id,
-        target_id: event.payload.target_id,
+        edge_id: payload.id,
+        source_id: payload.source_id,
+        target_id: payload.target_id,
         timestamp: event.timestamp,
       },
     ];
@@ -111,12 +199,16 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
 
   if (event.event_type === "run.completed") {
     next.status = "completed";
+    next.current_node_id = null;
+    next.current_edge_id = null;
     next.ended_at = event.timestamp;
     next.final_output = event.payload.final_output;
   }
 
   if (event.event_type === "run.failed") {
     next.status = "failed";
+    next.current_node_id = null;
+    next.current_edge_id = null;
     next.ended_at = event.timestamp;
     next.terminal_error = (event.payload.error ?? null) as Record<string, unknown> | null;
     if ("final_output" in event.payload) {
@@ -318,16 +410,18 @@ export default function App() {
     }
   }
 
-  async function runMcpAction<T>(actionKey: string, callback: () => Promise<T>, applyResult?: (result: T) => void) {
+  async function runMcpAction<T>(actionKey: string, callback: () => Promise<T>, applyResult?: (result: T) => void): Promise<T | null> {
     setMcpPendingKey(actionKey);
     setError(null);
     try {
       const result = await callback();
       applyResult?.(result);
       await refreshCatalog();
+      return result;
     } catch (actionError) {
       const message = actionError instanceof Error ? actionError.message : "Unable to update MCP state.";
       setError(message);
+      return null;
     } finally {
       setMcpPendingKey(null);
     }
@@ -430,6 +524,7 @@ export default function App() {
     try {
       const runId = await startRun(savedGraph.graph_id, input);
       setActiveRunId(runId);
+      setRunState(createPendingRunState(savedGraph, runId, input));
 
       const source = new EventSource(eventStreamUrl(runId));
       sourceRef.current = source;
@@ -578,36 +673,43 @@ export default function App() {
               <GraphEnvEditor graph={draftGraph} onGraphChange={setDraftGraph} />
             </div>
 
-            {(catalog?.mcp_servers?.length ?? 0) > 0 ? (
-              <div className="mosaic-tile panel mosaic-mcp">
-                <McpServerPanel
-                  catalog={catalog}
-                  onBootMcpServer={(serverId) =>
-                    void runMcpAction(`boot:${serverId}`, () => bootMcpServer(serverId), (serverStatus) => {
-                      setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
-                    })
-                  }
-                  onStopMcpServer={(serverId) =>
-                    void runMcpAction(`stop:${serverId}`, () => stopMcpServer(serverId), (serverStatus) => {
-                      setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
-                    })
-                  }
-                  onRefreshMcpServer={(serverId) =>
-                    void runMcpAction(`refresh:${serverId}`, () => refreshMcpServer(serverId), (serverStatus) => {
-                      setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
-                    })
-                  }
-                  onToggleMcpTool={(toolName, enabled) =>
-                    void runMcpAction(`tool:${toolName}`, () => setMcpToolEnabled(toolName, enabled), (toolDefinition) => {
-                      setCatalog((current) => mergeCatalogTool(current, toolDefinition));
-                    })
-                  }
-                  mcpPendingKey={mcpPendingKey}
-                  title="Project MCP"
-                  description="Manage project-level MCP servers. Tool and model nodes can consume these tools, but they do not own the server lifecycle."
-                />
-              </div>
-            ) : null}
+            <div className="mosaic-tile panel mosaic-mcp">
+              <McpServerPanel
+                catalog={catalog}
+                onBootMcpServer={(serverId) =>
+                  void runMcpAction(`boot:${serverId}`, () => bootMcpServer(serverId), (serverStatus) => {
+                    setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
+                  })
+                }
+                onStopMcpServer={(serverId) =>
+                  void runMcpAction(`stop:${serverId}`, () => stopMcpServer(serverId), (serverStatus) => {
+                    setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
+                  })
+                }
+                onRefreshMcpServer={(serverId) =>
+                  void runMcpAction(`refresh:${serverId}`, () => refreshMcpServer(serverId), (serverStatus) => {
+                    setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
+                  })
+                }
+                onToggleMcpTool={(toolName, enabled) =>
+                  void runMcpAction(`tool:${toolName}`, () => setMcpToolEnabled(toolName, enabled), (toolDefinition) => {
+                    setCatalog((current) => mergeCatalogTool(current, toolDefinition));
+                  })
+                }
+                onCreateMcpServer={(server: McpServerDraft) => runMcpAction(`create:${server.server_id}`, () => createMcpServer(server))}
+                onUpdateMcpServer={(serverId: string, server: McpServerDraft) =>
+                  runMcpAction(`update:${serverId}`, () => updateMcpServer(serverId, server))
+                }
+                onDeleteMcpServer={(serverId: string) => runMcpAction(`delete:${serverId}`, () => deleteMcpServer(serverId))}
+                onTestMcpServer={async (server: McpServerDraft) => {
+                  const result = await runMcpAction(`test:${server.server_id || "draft"}`, () => testMcpServer(server));
+                  return result?.message ?? null;
+                }}
+                mcpPendingKey={mcpPendingKey}
+                title="Project MCP"
+                description="Manage project-level MCP servers. Tool and model nodes can consume these tools, but they do not own the server lifecycle."
+              />
+            </div>
           </div>
         </div>
 

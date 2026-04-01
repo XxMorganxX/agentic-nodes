@@ -14,9 +14,11 @@ from graph_agent.providers.base import (
     ModelProvider,
     ModelRequest,
     ModelResponse,
+    api_decision_response_schema,
     ModelToolCall,
     ModelToolDefinition,
     ProviderPreflightResult,
+    normalize_api_decision_output,
 )
 
 _HEALTHCHECK_MIN_TURNS = 2
@@ -275,45 +277,10 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
         request: ModelRequest,
         tools: list[ModelToolDefinition],
     ) -> Mapping[str, Any] | None:
-        if tools:
-            preferred_tool_name = self._preferred_tool_name(request, tools)
-            if preferred_tool_name:
-                preferred_tool = next(tool for tool in tools if tool.name == preferred_tool_name)
-                return {
-                    "type": "object",
-                    "properties": {
-                        "tool_name": {"type": "string", "const": preferred_tool.name},
-                        "arguments": dict(preferred_tool.input_schema),
-                    },
-                    "required": ["tool_name", "arguments"],
-                    "additionalProperties": False,
-                }
-            if len(tools) == 1:
-                return {
-                    "type": "object",
-                    "properties": {
-                        "tool_name": {"type": "string", "const": tools[0].name},
-                        "arguments": dict(tools[0].input_schema),
-                    },
-                    "required": ["tool_name", "arguments"],
-                    "additionalProperties": False,
-                }
-            return {
-                "oneOf": [
-                    {
-                        "type": "object",
-                        "properties": {
-                            "tool_name": {"type": "string", "const": tool.name},
-                            "arguments": dict(tool.input_schema),
-                        },
-                        "required": ["tool_name", "arguments"],
-                        "additionalProperties": False,
-                    }
-                    for tool in tools
-                ]
-            }
         if _is_mapping(request.response_schema):
             return request.response_schema
+        if tools:
+            return api_decision_response_schema(available_tools=tools, allow_tool_calls=True)
         return None
 
     def _build_command(
@@ -586,13 +553,25 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
                     )
                 )
 
-        if normalized_tool_calls:
-            structured_output = normalized_tool_calls[0].arguments
+        decision_output = normalize_api_decision_output(
+            structured_output,
+            content=content_text,
+            tool_calls=normalized_tool_calls,
+        )
+        normalized_decision_tool_calls = [
+            ModelToolCall(
+                tool_name=str(tool_call["tool_name"]),
+                arguments=tool_call.get("arguments"),
+                provider_tool_id=tool_call.get("provider_tool_id"),
+                metadata=dict(tool_call.get("metadata", {})),
+            )
+            for tool_call in decision_output["tool_calls"]
+        ]
 
         return ModelResponse(
             content=content_text,
-            structured_output=structured_output,
-            tool_calls=normalized_tool_calls,
+            structured_output=decision_output,
+            tool_calls=normalized_decision_tool_calls,
             metadata={
                 "latency_ms": latency_ms,
                 "vendor_model": payload.get("model") or _string_config(provider_config, "model", self.default_model),

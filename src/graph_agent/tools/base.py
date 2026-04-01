@@ -64,6 +64,9 @@ class ToolRegistry:
     def upsert(self, tool: ToolDefinition) -> None:
         self._tools[tool.name] = tool
 
+    def remove(self, name: str) -> None:
+        self._tools.pop(name, None)
+
     def get(self, name: str) -> ToolDefinition:
         if name not in self._tools:
             raise KeyError(f"Unknown tool '{name}'.")
@@ -77,6 +80,10 @@ class ToolRegistry:
 
     def list_server_tool_names(self, server_id: str) -> list[str]:
         return sorted(tool.name for tool in self._tools.values() if tool.server_id == server_id)
+
+    def remove_server_tools(self, server_id: str) -> None:
+        for tool_name in self.list_server_tool_names(server_id):
+            self.remove(tool_name)
 
     def exposable_definitions(self, names: list[str]) -> list[ToolDefinition]:
         definitions: list[ToolDefinition] = []

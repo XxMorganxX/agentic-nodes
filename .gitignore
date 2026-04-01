@@ -23,7 +23,9 @@ venv/
 
 # Environment files
 .env
+.env.*
 .env.local
+!.env.example
 
 # Local graph store
 .graph-agent/

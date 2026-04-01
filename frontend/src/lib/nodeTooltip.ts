@@ -63,9 +63,9 @@ function describeResponseMode(value: string | null | undefined): string {
     return "tool_call (inferred from tool-call routing)";
   }
   if (value === "auto") {
-    return "auto (inferred mixed routing; can emit both envelopes)";
+    return "auto (inferred mixed routing; can emit both tool decisions and final messages)";
   }
-  return "message (inferred from message-only routing)";
+  return "message (inferred from final-message-only routing)";
 }
 
 function truncate(value: string, limit = 96): string {
@@ -191,6 +191,7 @@ function buildRuntimeSection(node: GraphNode, runState: RunState | null | undefi
   const hasOutput = Object.prototype.hasOwnProperty.call(runState.node_outputs ?? {}, node.id);
   const hasError = Object.prototype.hasOwnProperty.call(runState.node_errors ?? {}, node.id);
   const visitCount = runState.visit_counts?.[node.id];
+  const liveInput = runState.node_inputs?.[node.id];
 
   if (isCurrent) {
     rows.push({ label: "Status", value: "Currently running" });
@@ -202,6 +203,14 @@ function buildRuntimeSection(node: GraphNode, runState: RunState | null | undefi
 
   if (typeof visitCount === "number") {
     rows.push({ label: "Visits", value: String(visitCount) });
+  }
+
+  if (isCurrent && runState.current_edge_id) {
+    rows.push({ label: "Current Edge", value: runState.current_edge_id });
+  }
+
+  if (isCurrent && liveInput !== undefined) {
+    rows.push({ label: "Current Input", value: truncateText(cleanInlineText(stringifyCompactValue(liveInput)), 160) });
   }
 
   return rows.length > 0 ? { title: "Runtime", rows } : null;
@@ -305,6 +314,7 @@ export function buildNodeTooltip(
   }
 
   if (node.kind === "mcp_tool_executor") {
+    const followUpEnabled = node.config.enable_follow_up_decision === true;
     return {
       title: node.label,
       eyebrow: `${node.category} / ${node.kind}`,
@@ -321,33 +331,15 @@ export function buildNodeTooltip(
                   ? "Explicit binding configured"
                   : "Implicit latest incoming edge",
             },
-            { label: "Routes", value: "On success / On failure / Terminal output" },
-          ],
-        },
-        ...baseSections,
-      ],
-      parameters: [],
-    };
-  }
-
-  if (node.kind === "mcp_recheck") {
-    return {
-      title: node.label,
-      eyebrow: `${node.category} / ${node.kind}`,
-      description: node.description,
-      sections: [
-        {
-          title: "MCP Recheck",
-          rows: [
-            { label: "Role", value: "Packages the latest MCP execution for a follow-up API decision" },
-            {
-              label: "Input Binding",
-              value:
-                node.config.input_binding && typeof node.config.input_binding === "object"
-                  ? "Explicit binding configured"
-                  : "Implicit latest incoming edge",
-            },
-            { label: "Carries", value: "Tool call, result, status, errors, and terminal output when available" },
+            { label: "Routes", value: "On finish / On failure / Terminal output" },
+            { label: "Follow-Up Decision", value: followUpEnabled ? "Enabled" : "Disabled" },
+            { label: "Validation", value: node.config.validate_last_tool_success === false ? "Allows failed tool results" : "Stops on failed tool results" },
+            ...(followUpEnabled
+              ? [
+                  { label: "Model Provider", value: asString(node.config.provider_name) ?? "claude_code" },
+                  { label: "Response Mode", value: describeResponseMode(asString(node.config.response_mode) ?? "auto") },
+                ]
+              : []),
           ],
         },
         ...baseSections,
@@ -372,8 +364,8 @@ export function buildNodeTooltip(
             { label: "Model", value: asString(node.config.model) ?? "Default" },
             { label: "Prompt", value: asString(node.config.prompt_name) ?? node.prompt_name ?? "Not set" },
             { label: "Response", value: describeResponseMode(responseMode) },
-            { label: "Tool Call Output", value: "Routes structured tool-call envelopes to tool nodes whenever tools are emitted" },
-            { label: "Message Output", value: "Routes assistant/message envelopes to api, data, or end nodes when message content is emitted" },
+            { label: "Tool Calls Output", value: "Routes structured tool-call envelopes to tool nodes whenever the decision object requests tools" },
+            { label: "Final Message Output", value: "Routes the decision object's final message payload to api, data, or end nodes when no tools are needed" },
             { label: "Allowed Tools", value: allowedTools.length > 0 ? formatList(allowedTools) : "None" },
             { label: "Preferred Tool", value: preferredTool ?? "None" },
           ],
