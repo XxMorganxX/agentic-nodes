@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
@@ -441,6 +441,49 @@ class AutoToolCallProvider(ModelProvider):
         return ProviderPreflightResult(status="available", ok=True, message="ok")
 
 
+class AutoTwoToolCallsProvider(ModelProvider):
+    name = "auto_two_tool_calls"
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        return ModelResponse(
+            content="",
+            structured_output=_decision(
+                tool_calls=[
+                    {
+                        "tool_name": "weather_current",
+                        "arguments": {"location": "Austin"},
+                        "provider_tool_id": "auto-two-tools-1",
+                        "metadata": {"variant": "tool_call"},
+                    },
+                    {
+                        "tool_name": "time_current_minute",
+                        "arguments": {},
+                        "provider_tool_id": "auto-two-tools-2",
+                        "metadata": {"variant": "tool_call"},
+                    },
+                ]
+            ),
+            tool_calls=[
+                ModelToolCall(
+                    tool_name="weather_current",
+                    arguments={"location": "Austin"},
+                    provider_tool_id="auto-two-tools-1",
+                    metadata={"variant": "tool_call"},
+                ),
+                ModelToolCall(
+                    tool_name="time_current_minute",
+                    arguments={},
+                    provider_tool_id="auto-two-tools-2",
+                    metadata={"variant": "tool_call"},
+                ),
+            ],
+            metadata={"variant": "tool_call"},
+        )
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+
 class AutoMixedProvider(ModelProvider):
     name = "auto_mixed"
 
@@ -575,7 +618,9 @@ class ModelProviderTests(unittest.TestCase):
         initial_provider_name: str,
         followup_provider_name: str,
         tool_name: str,
+        allowed_tool_names: Sequence[str] | None = None,
     ) -> dict[str, Any]:
+        tool_names = list(allowed_tool_names) if allowed_tool_names else [tool_name]
         return {
             "graph_id": f"mcp-followup-executor-{tool_name}",
             "name": "MCP Follow-Up Executor Graph",
@@ -600,7 +645,7 @@ class ModelProviderTests(unittest.TestCase):
                     "label": "Tool Context",
                     "provider_id": "tool.mcp_context_provider",
                     "provider_label": "MCP Context Provider",
-                    "config": {"tool_names": [tool_name], "include_mcp_tool_context": False},
+                    "config": {"tool_names": tool_names, "include_mcp_tool_context": False},
                     "position": {"x": 120, "y": 0},
                 },
                 {
@@ -635,7 +680,7 @@ class ModelProviderTests(unittest.TestCase):
                         "system_prompt": "Review the last MCP execution and decide whether another tool is needed.",
                         "user_message_template": "{input_payload}",
                         "response_mode": "auto",
-                        "allowed_tool_names": [tool_name],
+                        "allowed_tool_names": tool_names,
                     },
                     "position": {"x": 500, "y": 0},
                 },
@@ -3443,6 +3488,65 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertEqual(
                         [entry["tool_arguments"] for entry in follow_up_payload["tool_history"]],
                         [{"location": "Austin"}, {"location": "Seattle"}],
+                    )
+            finally:
+                manager.stop_background_services()
+
+    def test_mcp_executor_executes_all_requested_initial_tool_calls_before_follow_up(self) -> None:
+        services = build_example_services()
+        followup_provider = UserMessageJsonEchoProvider()
+        services.model_providers["auto_two_tool_calls"] = AutoTwoToolCallsProvider()
+        services.model_providers["followup_echo"] = followup_provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = self._build_mcp_followup_executor_graph(
+            initial_provider_name="auto_two_tool_calls",
+            followup_provider_name="followup_echo",
+            tool_name="weather_current",
+            allowed_tool_names=["weather_current", "time_current_minute"],
+        )
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.boot_mcp_server("time_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    manager.set_mcp_tool_enabled("time_current_minute", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather and time please"}, run_id="run-mcp-multi-tool-followup")
+
+                    self.assertEqual(state.status, "completed")
+                    assert isinstance(state.final_output, dict)
+                    self.assertFalse(state.final_output["should_call_tool"])
+                    self.assertEqual(state.final_output["tool_calls"], [])
+                    self.assertEqual(
+                        [entry["tool_name"] for entry in state.final_output["tool_payloads"]],
+                        ["weather_current", "time_current_minute"],
+                    )
+                    self.assertEqual(state.final_output["tool_payloads"][0]["tool_arguments"], {"location": "Austin"})
+                    self.assertIn("local_iso_minute", state.final_output["tool_payloads"][1]["tool_output"])
+
+                    executor_output = state.node_outputs["executor"]
+                    assert isinstance(executor_output, dict)
+                    follow_up_payload = executor_output["artifacts"]["follow_up_payload"]
+                    assert isinstance(follow_up_payload, dict)
+                    self.assertEqual(
+                        [entry["tool_name"] for entry in follow_up_payload["tool_history"]],
+                        ["weather_current", "time_current_minute"],
+                    )
+                    self.assertEqual(follow_up_payload["pending_tool_calls"], [])
+
+                    assert followup_provider.last_request is not None
+                    echoed_payload = json.loads(followup_provider.last_request.messages[-1].content)
+                    self.assertEqual(
+                        [entry["tool_name"] for entry in echoed_payload["tool_history"]],
+                        ["weather_current", "time_current_minute"],
                     )
             finally:
                 manager.stop_background_services()

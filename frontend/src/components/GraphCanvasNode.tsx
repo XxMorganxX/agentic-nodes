@@ -45,6 +45,7 @@ export type GraphCanvasNodeData = {
   onToggleTooltip: (nodeId: string) => void;
   onOpenToolDetails: (nodeId: string) => void;
   onOpenProviderDetails: (nodeId: string) => void;
+  onToggleExecutorRetries: (nodeId: string) => void;
   onOpenPromptBlockDetails: (nodeId: string) => void;
   onOpenDisplayResponse: (nodeId: string) => void;
   onOpenContextBuilderPayload: (nodeId: string) => void;
@@ -159,6 +160,7 @@ function GraphCanvasNodeComponent({
     onToggleTooltip,
     onOpenToolDetails,
     onOpenProviderDetails,
+    onToggleExecutorRetries,
     onOpenPromptBlockDetails,
     onOpenDisplayResponse,
     onOpenContextBuilderPayload,
@@ -279,6 +281,7 @@ function GraphCanvasNodeComponent({
   const contextBooted = isContextProviderNode ? isContextBooted(catalog, node) : false;
   const displayStatus = status;
   const isActive = displayStatus === "active";
+  const executorRetriesEnabled = node.kind === "mcp_tool_executor" ? node.config.allow_retries !== false : false;
   const contextBindingLabel = isContextProviderNode
     ? contextBooted && isContextConnected
       ? "Bound and MCP booted"
@@ -407,6 +410,27 @@ function GraphCanvasNodeComponent({
           <span className="graph-node-chip">{node.category}</span>
           <span className="graph-node-meta-text">{node.kind}</span>
         </div>
+        {node.kind === "mcp_tool_executor" ? (
+          <div className="graph-node-inline-toggle-row">
+            <span className="graph-node-inline-toggle-label">Retries</span>
+            <button
+              type="button"
+              className={`graph-node-inline-toggle ${executorRetriesEnabled ? "is-enabled" : "is-disabled"}`}
+              aria-pressed={executorRetriesEnabled}
+              aria-label={`${executorRetriesEnabled ? "Disable" : "Enable"} retries for ${displayLabel}`}
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                onToggleExecutorRetries(node.id);
+              }}
+            >
+              <span className="graph-node-inline-toggle-track">
+                <span className="graph-node-inline-toggle-thumb" />
+              </span>
+              <span className="graph-node-inline-toggle-text">{executorRetriesEnabled ? "On" : "Off"}</span>
+            </button>
+          </div>
+        ) : null}
         {contextBuilderSummary ? <div className="graph-node-summary">{contextBuilderSummary}</div> : null}
         {isContextBuilderNode ? (
           <div

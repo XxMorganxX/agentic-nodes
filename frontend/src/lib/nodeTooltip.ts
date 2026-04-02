@@ -336,6 +336,7 @@ export function buildNodeTooltip(
 
   if (node.kind === "mcp_tool_executor") {
     const followUpEnabled = node.config.enable_follow_up_decision === true;
+    const retriesEnabled = node.config.allow_retries !== false;
     return {
       title: nodeTitle,
       eyebrow: `${node.category} / ${node.kind}`,
@@ -354,6 +355,14 @@ export function buildNodeTooltip(
             },
             { label: "Routes", value: "On finish / On failure / Terminal output" },
             { label: "Follow-Up Decision", value: followUpEnabled ? "Enabled" : "Disabled" },
+            {
+              label: "Retries",
+              value: followUpEnabled
+                ? retriesEnabled
+                  ? "Enabled"
+                  : "Disabled; no follow-up model call"
+                : "Not applicable",
+            },
             { label: "Validation", value: node.config.validate_last_tool_success === false ? "Allows failed tool results" : "Stops on failed tool results" },
             ...(followUpEnabled
               ? [

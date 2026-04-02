@@ -2047,6 +2047,7 @@ class McpContextProviderNode(BaseNode):
 class McpToolExecutorNode(BaseNode):
     kind = "mcp_tool_executor"
     _RUNTIME_CONFIG_KEYS = {
+        "allow_retries",
         "allowed_tool_names",
         "enable_follow_up_decision",
         "input_binding",
@@ -2167,11 +2168,64 @@ class McpToolExecutorNode(BaseNode):
                 successful_signatures.add(self._tool_call_signature(tool_name, entry.get("tool_arguments", {})))
         return successful_signatures
 
+    def _normalize_tool_calls(self, raw_tool_calls: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw_tool_calls, Sequence) or isinstance(raw_tool_calls, (str, bytes)):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for candidate in raw_tool_calls:
+            if not isinstance(candidate, Mapping):
+                continue
+            tool_name = str(candidate.get("tool_name", "")).strip()
+            if not tool_name:
+                continue
+            normalized_call = dict(candidate)
+            normalized_call["tool_name"] = tool_name
+            normalized_call["arguments"] = (
+                dict(candidate.get("arguments", {})) if isinstance(candidate.get("arguments"), Mapping) else {}
+            )
+            normalized.append(normalized_call)
+        return normalized
+
+    def _split_requested_tool_calls(
+        self,
+        requested_tool_calls: Sequence[Mapping[str, Any]],
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        remaining_tool_calls: list[dict[str, Any]] = []
+        matched_tool_call: dict[str, Any] | None = None
+        target_signature = self._tool_call_signature(tool_name, arguments)
+        for candidate in requested_tool_calls:
+            normalized_candidate = dict(candidate)
+            normalized_candidate["arguments"] = (
+                dict(candidate.get("arguments", {})) if isinstance(candidate.get("arguments"), Mapping) else {}
+            )
+            candidate_signature = self._tool_call_signature(
+                str(normalized_candidate.get("tool_name", "")).strip(),
+                normalized_candidate.get("arguments", {}),
+            )
+            if matched_tool_call is None and candidate_signature == target_signature:
+                matched_tool_call = normalized_candidate
+                continue
+            remaining_tool_calls.append(normalized_candidate)
+        if matched_tool_call is None and tool_name:
+            matched_tool_call = {
+                "tool_name": tool_name,
+                "arguments": dict(arguments),
+                "provider_tool_id": None,
+                "metadata": {},
+            }
+        return matched_tool_call, remaining_tool_calls
+
     def _configured_follow_up_response_mode(self) -> str:
         response_mode = str(self.config.get("response_mode", "auto") or "auto").strip()
         if response_mode not in {"message", "tool_call", "auto"}:
             return "auto"
         return response_mode
+
+    def _retries_enabled(self) -> bool:
+        return bool(self.config.get("allow_retries", True))
 
     def _dispatch_tool_call(
         self,
@@ -2217,8 +2271,17 @@ class McpToolExecutorNode(BaseNode):
             tool_artifacts: dict[str, Any] = {}
             if source_envelope is not None:
                 tool_artifacts["source_tool_call_envelope"] = source_envelope.to_dict()
-                if source_envelope.tool_calls:
-                    tool_artifacts["requested_tool_call"] = dict(source_envelope.tool_calls[0])
+                normalized_requested_tool_calls = self._normalize_tool_calls(source_envelope.tool_calls)
+                if normalized_requested_tool_calls:
+                    requested_tool_call, pending_tool_calls = self._split_requested_tool_calls(
+                        normalized_requested_tool_calls,
+                        tool_name=tool_name,
+                        arguments=payload_dict,
+                    )
+                    if requested_tool_call is not None:
+                        tool_artifacts["requested_tool_call"] = requested_tool_call
+                    tool_artifacts["requested_tool_calls"] = [dict(tool_call) for tool_call in normalized_requested_tool_calls]
+                    tool_artifacts["pending_tool_calls"] = [dict(tool_call) for tool_call in pending_tool_calls]
                 assistant_message = source_envelope.artifacts.get("assistant_message")
                 if assistant_message:
                     tool_artifacts["assistant_message"] = assistant_message
@@ -2328,6 +2391,28 @@ class McpToolExecutorNode(BaseNode):
             and str(source_input_metadata.get("contract", "")).strip() == self._FOLLOW_UP_STATE_CONTRACT
             else None
         )
+        requested_tool_calls = (
+            self._normalize_tool_calls(previous_follow_up_payload.get("requested_tool_calls"))
+            if previous_follow_up_payload is not None and "requested_tool_calls" in previous_follow_up_payload
+            else []
+        )
+        if "requested_tool_calls" in source_envelope.artifacts:
+            requested_tool_calls = self._normalize_tool_calls(source_envelope.artifacts.get("requested_tool_calls"))
+        elif not requested_tool_calls and isinstance(source_tool_call_envelope, Mapping):
+            requested_tool_calls = self._normalize_tool_calls(source_tool_call_envelope.get("tool_calls"))
+        pending_tool_calls = (
+            self._normalize_tool_calls(previous_follow_up_payload.get("pending_tool_calls"))
+            if previous_follow_up_payload is not None and "pending_tool_calls" in previous_follow_up_payload
+            else []
+        )
+        if "pending_tool_calls" in source_envelope.artifacts:
+            pending_tool_calls = self._normalize_tool_calls(source_envelope.artifacts.get("pending_tool_calls"))
+        elif not pending_tool_calls and requested_tool_calls:
+            _, pending_tool_calls = self._split_requested_tool_calls(
+                requested_tool_calls,
+                tool_name=str(source_envelope.metadata.get("tool_name", "")).strip(),
+                arguments=dict(requested_tool_call.get("arguments", {})) if isinstance(requested_tool_call, Mapping) else {},
+            )
         terminal_output = source_envelope.artifacts.get("terminal_output")
         terminal_output_envelope = source_envelope.artifacts.get("terminal_output_envelope")
         tool_name = str(source_envelope.metadata.get("tool_name", "")).strip()
@@ -2355,6 +2440,8 @@ class McpToolExecutorNode(BaseNode):
                 if previous_follow_up_payload is not None and "original_input_payload" in previous_follow_up_payload
                 else source_input_payload if source_input_payload is not None else context.state.input_payload
             ),
+            "requested_tool_calls": [dict(tool_call) for tool_call in requested_tool_calls],
+            "pending_tool_calls": [dict(tool_call) for tool_call in pending_tool_calls],
             "tool_name": tool_name,
             "tool_history": [*prior_tool_history, current_tool_entry],
             **current_tool_entry,
@@ -2363,6 +2450,7 @@ class McpToolExecutorNode(BaseNode):
                 "run_id": context.state.run_id,
                 "graph_id": context.state.graph_id,
                 "tool_history_length": len(prior_tool_history) + 1,
+                "pending_tool_call_count": len(pending_tool_calls),
             },
         }
         return normalized_payload, source_tool_call_envelope, terminal_output_envelope
@@ -2640,11 +2728,74 @@ class McpToolExecutorNode(BaseNode):
         iteration_budget = self._follow_up_iteration_limit()
 
         while True:
+            pending_tool_calls = self._normalize_tool_calls(normalized_payload.get("pending_tool_calls", []))
+            if pending_tool_calls:
+                if iteration_budget <= 0:
+                    return self._invalid_follow_up_result(
+                        "MCP executor follow-up exceeded the configured iteration limit.",
+                        route_outputs=route_outputs,
+                    )
+                next_tool_call = pending_tool_calls[0]
+                queued_tool_metadata = {
+                    "node_kind": self.kind,
+                    "provider": (
+                        str(source_tool_call_envelope.get("metadata", {}).get("provider", "")).strip()
+                        if isinstance(source_tool_call_envelope, Mapping) and isinstance(source_tool_call_envelope.get("metadata"), Mapping)
+                        else ""
+                    ),
+                    "prompt_name": (
+                        str(source_tool_call_envelope.get("metadata", {}).get("prompt_name", "")).strip()
+                        if isinstance(source_tool_call_envelope, Mapping) and isinstance(source_tool_call_envelope.get("metadata"), Mapping)
+                        else ""
+                    ),
+                    "response_mode": "tool_call",
+                    "should_call_tools": True,
+                    "tool_call_count": len(pending_tool_calls),
+                    "tool_name": normalized_payload.get("tool_name"),
+                    "tool_status": normalized_payload.get("tool_status"),
+                }
+                tool_call_envelope = self._follow_up_tool_call_envelope(
+                    tool_call=next_tool_call,
+                    normalized_payload=normalized_payload,
+                    source_tool_result_envelope=source_envelope,
+                    source_tool_call_envelope=source_tool_call_envelope,
+                    terminal_output_envelope=terminal_output_envelope,
+                    metadata=queued_tool_metadata,
+                    assistant_message=None,
+                )
+                dispatch_result = self._dispatch_tool_call(
+                    context,
+                    tool_name=str(next_tool_call.get("tool_name", "")).strip(),
+                    payload=dict(next_tool_call.get("arguments", {}))
+                    if isinstance(next_tool_call.get("arguments", {}), Mapping)
+                    else {},
+                    source_envelope=tool_call_envelope,
+                )
+                route_outputs.update(dispatch_result.route_outputs)
+                source_envelope = self._source_envelope_from_value(dispatch_result.output)
+                if source_envelope is None:
+                    return self._invalid_follow_up_result(
+                        "MCP executor follow-up lost the downstream tool result envelope.",
+                        route_outputs=route_outputs,
+                    )
+                normalized_payload, source_tool_call_envelope, terminal_output_envelope = self._build_follow_up_payload(
+                    context,
+                    source_envelope,
+                )
+                if bool(self.config.get("validate_last_tool_success", True)) and normalized_payload["tool_status"] != "success":
+                    return self._follow_up_failure_result(
+                        normalized_payload,
+                        source_envelope,
+                        route_outputs=route_outputs,
+                    )
+                iteration_budget -= 1
+                continue
             successful_tool_call_signatures = self._successful_tool_call_signatures(normalized_payload)
             request = self._build_follow_up_request(
                 context,
                 normalized_payload,
                 forbidden_tool_call_signatures=successful_tool_call_signatures,
+                include_available_tools=self._retries_enabled(),
             )
             metadata = request.metadata
             response_mode = request.response_mode
@@ -2745,7 +2896,7 @@ class McpToolExecutorNode(BaseNode):
             payload=payload,
             source_envelope=source_envelope,
         )
-        if not bool(self.config.get("enable_follow_up_decision", False)):
+        if not bool(self.config.get("enable_follow_up_decision", False)) or not self._retries_enabled():
             return dispatch_result
         return self._execute_follow_up(context, dispatch_result)
 
@@ -2755,6 +2906,7 @@ class McpToolExecutorNode(BaseNode):
             "tool_name": tool_name,
             "arguments": payload,
             "follow_up_enabled": bool(self.config.get("enable_follow_up_decision", False)),
+            "retries_enabled": self._retries_enabled(),
             "provider_name": self.config.get("provider_name", "claude_code"),
             "response_mode": self._configured_follow_up_response_mode(),
         }

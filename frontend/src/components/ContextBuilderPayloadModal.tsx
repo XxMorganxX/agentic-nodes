@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { MouseEvent } from "react";
 
 import type { ContextBuilderRuntimeView } from "../lib/contextBuilderRuntime";
@@ -18,6 +18,36 @@ function resolveContextBuilderPayload(node: GraphNode, runState: RunState | null
   return nodeOutput ?? null;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function formatContextBuilderSourceValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value === undefined) {
+    return "No context captured yet.";
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function resolveContextBuilderSourceValue(runState: RunState | null, sourceNodeId: string): unknown {
+  const sourceError = runState?.node_errors?.[sourceNodeId];
+  if (sourceError !== undefined) {
+    return sourceError;
+  }
+  const sourceOutput = runState?.node_outputs?.[sourceNodeId];
+  if (isRecord(sourceOutput) && Object.prototype.hasOwnProperty.call(sourceOutput, "payload")) {
+    return sourceOutput.payload;
+  }
+  return sourceOutput;
+}
+
 type ContextBuilderPayloadModalProps = {
   graph: GraphDefinition;
   node: GraphNode;
@@ -28,6 +58,8 @@ type ContextBuilderPayloadModalProps = {
 
 export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView, onClose }: ContextBuilderPayloadModalProps) {
   const nodeLabel = getNodeInstanceLabel(graph, node);
+  const [expandedSourceNodeId, setExpandedSourceNodeId] = useState<string | null>(null);
+
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
@@ -41,6 +73,18 @@ export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView,
 
   const payload = useMemo(() => resolveContextBuilderPayload(node, runState), [node, runState]);
   const formattedPayload = useMemo(() => JSON.stringify(payload, null, 2), [payload]);
+
+  useEffect(() => {
+    if (!runtimeView || runtimeView.sources.length === 0) {
+      setExpandedSourceNodeId(null);
+      return;
+    }
+    if (expandedSourceNodeId && runtimeView.sources.some((slot) => slot.sourceNodeId === expandedSourceNodeId)) {
+      return;
+    }
+    const firstSettledSource = runtimeView.sources.find((slot) => slot.status !== "pending");
+    setExpandedSourceNodeId(firstSettledSource?.sourceNodeId ?? runtimeView.sources[0]?.sourceNodeId ?? null);
+  }, [expandedSourceNodeId, runtimeView]);
 
   function handleOverlayClick(event: MouseEvent<HTMLDivElement>) {
     if (event.target === event.currentTarget) {
@@ -98,22 +142,44 @@ export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView,
                 </span>
               </div>
               <ul className="context-builder-input-list">
-                {runtimeView.sources.map((slot) => (
-                  <li
-                    key={slot.sourceNodeId}
-                    className={`context-builder-input-row context-builder-input-row--${slot.status}`}
-                  >
-                    <div className="context-builder-input-row-main">
-                      <span className="context-builder-input-label">{slot.sourceLabel}</span>
-                      <span className="context-builder-input-placeholder">{`{${slot.placeholder}}`}</span>
-                    </div>
-                    <div className="context-builder-input-status">
-                      {slot.status === "pending" ? "Waiting…" : null}
-                      {slot.status === "fulfilled" ? "Ready" : null}
-                      {slot.status === "error" ? <span className="context-builder-input-error">{slot.errorSummary ?? "Error"}</span> : null}
-                    </div>
-                  </li>
-                ))}
+                {runtimeView.sources.map((slot) => {
+                  const isExpanded = expandedSourceNodeId === slot.sourceNodeId;
+                  const contextValue = resolveContextBuilderSourceValue(runState, slot.sourceNodeId);
+                  const detailId = `context-builder-input-detail-${slot.sourceNodeId}`;
+                  return (
+                    <li
+                      key={slot.sourceNodeId}
+                      className={`context-builder-input-row context-builder-input-row--${slot.status}${isExpanded ? " is-expanded" : ""}`}
+                    >
+                      <button
+                        type="button"
+                        className="context-builder-input-row-button"
+                        aria-expanded={isExpanded}
+                        aria-controls={detailId}
+                        onClick={() => setExpandedSourceNodeId(isExpanded ? null : slot.sourceNodeId)}
+                      >
+                        <div className="context-builder-input-row-main">
+                          <span className="context-builder-input-label">{slot.sourceLabel}</span>
+                          <span className="context-builder-input-placeholder">{`{${slot.placeholder}}`}</span>
+                        </div>
+                        <div className="context-builder-input-status">
+                          {slot.status === "pending" ? "Waiting…" : null}
+                          {slot.status === "fulfilled" ? "Ready" : null}
+                          {slot.status === "error" ? <span className="context-builder-input-error">{slot.errorSummary ?? "Error"}</span> : null}
+                          <span className="context-builder-input-toggle">{isExpanded ? "Hide context" : "Show context"}</span>
+                        </div>
+                      </button>
+                      {isExpanded ? (
+                        <div id={detailId} className="context-builder-input-detail">
+                          <div className="context-builder-input-detail-label">
+                            {slot.status === "error" ? "Captured error" : "Captured context"}
+                          </div>
+                          <pre>{formatContextBuilderSourceValue(contextValue)}</pre>
+                        </div>
+                      ) : null}
+                    </li>
+                  );
+                })}
               </ul>
             </section>
           ) : null}

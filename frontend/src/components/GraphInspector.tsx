@@ -222,6 +222,8 @@ export function GraphInspector({
   const formatNodeLabel = (node: GraphNode) => getNodeInstanceLabel(graph, node);
   const executorFollowUpEnabled =
     selectedNode?.kind === "mcp_tool_executor" && Boolean(selectedNode.config.enable_follow_up_decision);
+  const executorRetriesEnabled =
+    selectedNode?.kind === "mcp_tool_executor" && Boolean(selectedNode.config.allow_retries ?? true);
   const isPromptDrivenNode = selectedNode?.kind === "model" || executorFollowUpEnabled;
   const selectedModelResponseMode =
     selectedNode?.kind === "model"
@@ -1070,12 +1072,36 @@ export function GraphInspector({
                   </span>
                 </label>
               ) : null}
+              {executorFollowUpEnabled ? (
+                <label className="checkbox-option">
+                  <input
+                    type="checkbox"
+                    checked={executorRetriesEnabled}
+                    onChange={(event) =>
+                      onGraphChange(
+                        updateNode(graph, selectedNode.id, (node) => ({
+                          ...node,
+                          config: {
+                            ...node.config,
+                            allow_retries: event.target.checked,
+                          },
+                        })),
+                      )
+                    }
+                  />
+                  <span>
+                    Enable Retries
+                    <small>When off, this node makes no follow-up model/API calls. It only executes the incoming MCP tool call and forwards the execution result.</small>
+                  </span>
+                </label>
+              ) : null}
               <div className="inspector-meta">
                 <span>Dispatch mode: single MCP tool call from upstream API output</span>
                 <span>Input binding: {executorBindingSummary}</span>
                 <span>
                   Follow-up decision: {executorFollowUpEnabled ? "enabled via internal model loop" : "disabled"}
                 </span>
+                <span>Retries: {executorFollowUpEnabled ? (executorRetriesEnabled ? "enabled" : "disabled") : "n/a"}</span>
                 <span>Routes: on finish / on failure / terminal output</span>
               </div>
             </>

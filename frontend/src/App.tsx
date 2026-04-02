@@ -349,6 +349,7 @@ export default function App() {
   const [catalog, setCatalog] = useState<EditorCatalog | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
+  const [visualizerResetVersion, setVisualizerResetVersion] = useState(0);
   const [input, setInput] = useState(DEFAULT_INPUT);
   const [savedInputPrompt, setSavedInputPrompt] = useState(DEFAULT_INPUT);
   const [events, setEvents] = useState<RuntimeEvent[]>([]);
@@ -713,6 +714,9 @@ export default function App() {
     setEvents([]);
     setRunState(null);
     setIsRunning(false);
+    setSelectedNodeId(null);
+    setSelectedEdgeId(null);
+    setVisualizerResetVersion((current) => current + 1);
   }
 
   function handleCreateGraph() {
@@ -1048,6 +1052,7 @@ export default function App() {
 
       <section className="content-grid">
         <GraphCanvas
+          key={`graph-canvas-${selectedGraphId || "draft"}-${selectedAgentId ?? "all"}-${visualizerResetVersion}`}
           graph={canvasGraph}
           runState={selectedRunState}
           events={filteredEvents}
@@ -1084,6 +1089,7 @@ export default function App() {
 
       {isTestEnvironment(draftGraph) ? (
         <AgentRunSwimlanes
+          key={`agent-swimlanes-${selectedGraphId || "draft"}-${visualizerResetVersion}`}
           lanes={agentRunLanes}
           selectedAgentId={selectedAgentId}
           onSelectAgent={(agentId) => setSelectedAgentId(agentId)}

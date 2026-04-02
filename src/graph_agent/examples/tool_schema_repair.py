@@ -300,6 +300,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             capabilities=["mcp tool dispatch", "success routing", "failure routing", "follow-up tool decision"],
             default_config={
                 "enable_follow_up_decision": False,
+                "allow_retries": True,
                 "provider_name": "claude_code",
                 "prompt_name": "mcp_executor_follow_up",
                 "mode": "mcp_executor_follow_up",

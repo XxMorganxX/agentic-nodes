@@ -693,6 +693,13 @@ function DrawerActionButton({ tab, activeTab, drawerOpen, label, onClick, childr
   );
 }
 
+function updateNode(graph: GraphDefinition, nodeId: string, updater: (node: GraphNode) => GraphNode): GraphDefinition {
+  return {
+    ...graph,
+    nodes: graph.nodes.map((node) => (node.id === nodeId ? updater(node) : node)),
+  };
+}
+
 const MILESTONE_CHAT_MAX_VISIBLE = 6;
 /** Max age before a line is dropped; opacity eases over this window (not linear). */
 const MILESTONE_CHAT_MAX_AGE_MS = 14_000;
@@ -1128,6 +1135,24 @@ export function GraphCanvas({
       setToolDetailsNodeId(nodeId);
     },
     [onSelectionChange],
+  );
+
+  const handleToggleExecutorRetries = useCallback(
+    (nodeId: string) => {
+      if (!graph) {
+        return;
+      }
+      onGraphChange(
+        updateNode(graph, nodeId, (node) => ({
+          ...node,
+          config: {
+            ...node.config,
+            allow_retries: !(node.config.allow_retries ?? true),
+          },
+        })),
+      );
+    },
+    [graph, onGraphChange],
   );
 
   const handleFlowInit = useCallback((instance: ReactFlowInstance) => {
@@ -3344,6 +3369,7 @@ export function GraphCanvas({
                 onToggleTooltip: handleToggleTooltip,
                 onOpenToolDetails: handleOpenToolDetails,
                 onOpenProviderDetails: handleOpenProviderDetails,
+                onToggleExecutorRetries: handleToggleExecutorRetries,
                 onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
                 onOpenDisplayResponse: handleOpenDisplayResponse,
                 onOpenContextBuilderPayload: handleOpenContextBuilderPayload,
@@ -3431,6 +3457,7 @@ export function GraphCanvas({
         previousData.onToggleTooltip === handleToggleTooltip &&
         previousData.onOpenToolDetails === handleOpenToolDetails &&
         previousData.onOpenProviderDetails === handleOpenProviderDetails &&
+        previousData.onToggleExecutorRetries === handleToggleExecutorRetries &&
         previousData.onOpenPromptBlockDetails === handleOpenPromptBlockDetails &&
         previousData.onOpenDisplayResponse === handleOpenDisplayResponse &&
         previousData.onOpenContextBuilderPayload === handleOpenContextBuilderPayload &&
@@ -3454,6 +3481,7 @@ export function GraphCanvas({
               onToggleTooltip: handleToggleTooltip,
               onOpenToolDetails: handleOpenToolDetails,
               onOpenProviderDetails: handleOpenProviderDetails,
+              onToggleExecutorRetries: handleToggleExecutorRetries,
               onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
               onOpenDisplayResponse: handleOpenDisplayResponse,
               onOpenContextBuilderPayload: handleOpenContextBuilderPayload,
@@ -3512,6 +3540,7 @@ export function GraphCanvas({
     handleOpenDisplayResponse,
     handleOpenPromptBlockDetails,
     handleOpenProviderDetails,
+    handleToggleExecutorRetries,
     handleOpenToolDetails,
     handleToggleTooltip,
     isConnecting,
