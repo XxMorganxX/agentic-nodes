@@ -61,3 +61,7 @@ export function clearPersistedRunSnapshot(graphId: string): void {
   delete snapshots[graphId];
   writeSnapshotMap(snapshots);
 }
+
+export function clearAllPersistedRunSnapshots(): void {
+  writeSnapshotMap({});
+}

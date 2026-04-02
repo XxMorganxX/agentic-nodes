@@ -4,6 +4,7 @@ import type { ChangeEvent, MouseEvent } from "react";
 import { fetchProviderDiagnostics, preflightProvider } from "../lib/api";
 import { findProviderDefinition, modelProviderDefinitions, providerDefaultConfig, providerModelName } from "../lib/editor";
 import { getGraphEnvVars, resolveGraphEnvReferences } from "../lib/graphEnv";
+import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
 import type { EditorCatalog, GraphDefinition, GraphNode, ProviderDiagnosticsResult, ProviderPreflightResult } from "../lib/types";
 
 const LIVE_PROVIDER_VERIFICATION_STORAGE_KEY = "agentic-nodes-live-provider-verifications";
@@ -82,6 +83,7 @@ export function ProviderDetailsModal({
   onGraphChange,
   onClose,
 }: ProviderDetailsModalProps) {
+  const nodeLabel = getNodeInstanceLabel(graph, node);
   const provider = resolveProviderDefinition(node, catalog);
   const availableProviders = modelProviderDefinitions(catalog);
   const envVarEntries = Object.entries(getGraphEnvVars(graph));
@@ -292,7 +294,7 @@ export function ProviderDetailsModal({
           <div>
             <div className="tool-details-modal-eyebrow">API Provider Details</div>
             <h3 id="provider-details-modal-title">
-              {node.label}
+              {nodeLabel}
               {provider ? ` · ${provider.display_name}` : ""}
             </h3>
             <p>

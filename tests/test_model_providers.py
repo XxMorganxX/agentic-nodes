@@ -635,7 +635,7 @@ class ModelProviderTests(unittest.TestCase):
                         "system_prompt": "Review the last MCP execution and decide whether another tool is needed.",
                         "user_message_template": "{input_payload}",
                         "response_mode": "auto",
-                        "tool_target_node_ids": ["tool_context"],
+                        "allowed_tool_names": [tool_name],
                     },
                     "position": {"x": 500, "y": 0},
                 },
@@ -1065,11 +1065,11 @@ class ModelProviderTests(unittest.TestCase):
         weather_tool = next(tool for tool in catalog["tools"] if tool["name"] == "weather_current")
         time_tool = next(tool for tool in catalog["tools"] if tool["name"] == "time_current_minute")
         self.assertEqual(weather_tool["source_type"], "mcp")
-        self.assertFalse(weather_tool["enabled"])
+        self.assertTrue(weather_tool["enabled"])
         self.assertFalse(weather_tool["available"])
         self.assertEqual(weather_tool["schema_origin"], "static")
         self.assertEqual(time_tool["source_type"], "mcp")
-        self.assertFalse(time_tool["enabled"])
+        self.assertTrue(time_tool["enabled"])
         self.assertFalse(time_tool["available"])
         self.assertEqual(time_tool["schema_origin"], "static")
 
@@ -1118,7 +1118,7 @@ class ModelProviderTests(unittest.TestCase):
             assert result.error is not None
             self.assertIn("offline", result.error["message"].lower())
 
-    def test_booted_enabled_mcp_tools_can_validate_and_execute(self) -> None:
+    def test_booted_mcp_tools_default_to_enabled_and_execute(self) -> None:
         services = build_example_services()
         manager = GraphRunManager(services=services)
         with WeatherStubServer() as weather_base:
@@ -1126,10 +1126,10 @@ class ModelProviderTests(unittest.TestCase):
                 with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
                     server = manager.boot_mcp_server("weather_mcp")
                     self.assertTrue(server["running"])
-                    manager.set_mcp_tool_enabled("weather_current", True)
 
                     catalog = manager.get_catalog()
                     weather_tool = next(tool for tool in catalog["tools"] if tool["name"] == "weather_current")
+                    self.assertTrue(weather_tool["enabled"])
                     self.assertTrue(weather_tool["available"])
                     self.assertEqual(weather_tool["schema_origin"], "discovered")
 
@@ -1163,7 +1163,6 @@ class ModelProviderTests(unittest.TestCase):
         try:
             server = manager.boot_mcp_server("time_mcp")
             self.assertTrue(server["running"])
-            manager.set_mcp_tool_enabled("time_current_minute", True)
 
             result = services.tool_registry.invoke(
                 "time_current_minute",
@@ -1207,6 +1206,7 @@ class ModelProviderTests(unittest.TestCase):
             manager.boot_mcp_server("weather_mcp")
             catalog = manager.get_catalog()
             weather_tool = next(tool for tool in catalog["tools"] if tool["name"] == "weather_current")
+            self.assertFalse(weather_tool["enabled"])
             self.assertEqual(weather_tool["schema_origin"], "discovered")
             self.assertIn("differs", weather_tool["schema_warning"])
         finally:
@@ -1512,6 +1512,7 @@ class ModelProviderTests(unittest.TestCase):
             try:
                 with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
                     manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", False)
                     state = runtime.run(graph, {"request": "weather please"}, run_id="run-mcp-disabled")
                     self.assertEqual(state.status, "completed")
                     payload = state.final_output
@@ -1820,6 +1821,75 @@ class ModelProviderTests(unittest.TestCase):
             finally:
                 manager.stop_background_services()
 
+    def test_mcp_executor_receives_tool_call_through_display_passthrough_when_envelope_preview_is_disabled(self) -> None:
+        services, runtime, graph_payload = self._build_auto_branch_graph("auto_tool_call", AutoToolCallProvider())
+        for node in graph_payload["nodes"]:
+            if node["id"] == "executor":
+                node["config"]["input_binding"] = {"type": "latest_envelope", "source": "start"}
+        graph_payload["edges"] = [edge for edge in graph_payload["edges"] if edge["id"] != "edge-model-executor"]
+        graph_payload["nodes"].append(
+            {
+                "id": "tool_display",
+                "kind": "data",
+                "category": "data",
+                "label": "Tool Display",
+                "provider_id": "core.data_display",
+                "provider_label": "Envelope Display Node",
+                "config": {
+                    "mode": "passthrough",
+                    "show_input_envelope": False,
+                    "lock_passthrough": True,
+                },
+                "position": {"x": 520, "y": 180},
+            }
+        )
+        graph_payload["edges"].extend(
+            [
+                {
+                    "id": "edge-model-display",
+                    "source_id": "model",
+                    "target_id": "tool_display",
+                    "source_handle_id": "api-tool-call",
+                    "label": "tool call display",
+                    "kind": "conditional",
+                    "priority": 110,
+                    "condition": {
+                        "id": "edge-model-display-condition",
+                        "label": "Tool call output",
+                        "type": "result_payload_path_equals",
+                        "value": "tool_call_envelope",
+                        "path": "metadata.contract",
+                    },
+                },
+                {
+                    "id": "edge-display-executor",
+                    "source_id": "tool_display",
+                    "target_id": "executor",
+                    "label": "to executor",
+                    "kind": "standard",
+                    "priority": 100,
+                },
+            ]
+        )
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-display-passthrough-to-mcp-executor")
+                    self.assertEqual(state.status, "completed")
+                    self.assertNotIn("executor", state.node_errors)
+                    executor_output = state.node_outputs["executor"]
+                    assert isinstance(executor_output, dict)
+                    self.assertEqual(executor_output["metadata"]["tool_status"], "success")
+                    self.assertEqual(executor_output["metadata"]["tool_name"], "weather_current")
+            finally:
+                manager.stop_background_services()
+
     def test_api_model_preserves_multiple_tool_call_schemas_in_tool_envelope(self) -> None:
         class MultiToolProvider(ModelProvider):
             name = "multi_tool"
@@ -1892,7 +1962,13 @@ class ModelProviderTests(unittest.TestCase):
 
                     state = runtime.run(graph, {"request": "weather please"}, run_id="run-invalid-structured")
                     self.assertEqual(state.status, "failed")
-                    self.assertEqual(state.terminal_error, {"type": "no_matching_edge", "node_id": "model"})
+                    assert isinstance(state.terminal_error, dict)
+                    self.assertEqual(state.terminal_error["type"], "no_matching_edge")
+                    self.assertEqual(state.terminal_error["node_id"], "model")
+                    self.assertEqual(state.terminal_error["node_label"], graph.get_node("model").label)
+                    self.assertIn("no outgoing edge matched", state.terminal_error["message"].lower())
+                    self.assertEqual(state.terminal_error["result_contract"], "message_envelope")
+                    self.assertTrue(state.terminal_error["available_routes"])
                     self.assertIn("model", state.node_errors)
                     self.assertEqual(state.node_errors["model"]["type"], "structured_api_output_error")
                     self.assertIn("must leave 'tool_calls' empty", state.node_errors["model"]["message"])
@@ -1931,7 +2007,13 @@ class ModelProviderTests(unittest.TestCase):
 
                     state = runtime.run(graph, {"request": "weather please"}, run_id="run-tool-call-bypass")
                     self.assertEqual(state.status, "failed")
-                    self.assertEqual(state.terminal_error, {"type": "no_matching_edge", "node_id": "model"})
+                    assert isinstance(state.terminal_error, dict)
+                    self.assertEqual(state.terminal_error["type"], "no_matching_edge")
+                    self.assertEqual(state.terminal_error["node_id"], "model")
+                    self.assertEqual(state.terminal_error["node_label"], graph.get_node("model").label)
+                    self.assertIn("no outgoing edge matched", state.terminal_error["message"].lower())
+                    self.assertEqual(state.terminal_error["result_contract"], "message_envelope")
+                    self.assertTrue(state.terminal_error["available_routes"])
                     self.assertIn("model", state.node_errors)
                     self.assertEqual(state.node_errors["model"]["type"], "structured_api_output_error")
                     self.assertIn("requires 'need_tool' to be true", state.node_errors["model"]["message"])
@@ -2159,6 +2241,29 @@ class ModelProviderTests(unittest.TestCase):
                 {"id": "model-executor", "source_id": "model", "target_id": "executor", "label": "", "kind": "standard", "priority": 100},
             ],
         }
+
+        with self.assertRaises(GraphValidationError):
+            GraphDefinition.from_dict(graph_payload).validate_against_services(services)
+
+    def test_mcp_executor_validation_rejects_mcp_context_provider_bindings(self) -> None:
+        services = build_example_services()
+        graph_payload = self._build_mcp_followup_executor_graph(
+            initial_provider_name="mock",
+            followup_provider_name="mock",
+            tool_name="weather_current",
+        )
+        graph_payload["edges"].append(
+            {
+                "id": "ctx-to-executor",
+                "source_id": "tool_context",
+                "target_id": "executor",
+                "source_handle_id": "tool-context",
+                "target_handle_id": None,
+                "label": "tool context",
+                "kind": "binding",
+                "priority": 0,
+            }
+        )
 
         with self.assertRaises(GraphValidationError):
             GraphDefinition.from_dict(graph_payload).validate_against_services(services)
@@ -2557,7 +2662,175 @@ class ModelProviderTests(unittest.TestCase):
             ],
         )
 
-    def test_context_builder_waits_for_all_connected_inputs_before_becoming_ready(self) -> None:
+    def test_context_builder_includes_newly_connected_sources_when_some_bindings_are_configured(self) -> None:
+        services = build_example_services()
+        services.model_providers["auto_message"] = AutoMessageProvider()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph = GraphDefinition.from_dict(
+            {
+                "graph_id": "context-builder-partial-bindings",
+                "name": "Context Builder Partial Bindings",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "model_a",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model A",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "auto_message",
+                        "prompt_name": "auto_message_a",
+                        "config": {
+                            "provider_name": "auto_message",
+                            "prompt_name": "auto_message_a",
+                            "mode": "auto_message_a",
+                            "system_prompt": "Return a direct reply.",
+                            "user_message_template": "{input_payload}",
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 180, "y": 0},
+                    },
+                    {
+                        "id": "model_b",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model B",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "auto_message",
+                        "prompt_name": "auto_message_b",
+                        "config": {
+                            "provider_name": "auto_message",
+                            "prompt_name": "auto_message_b",
+                            "mode": "auto_message_b",
+                            "system_prompt": "Return a direct reply.",
+                            "user_message_template": "{input_payload}",
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 180, "y": 140},
+                    },
+                    {
+                        "id": "display_a",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Display A",
+                        "provider_id": "core.data_display",
+                        "provider_label": "Envelope Display Node",
+                        "config": {
+                            "mode": "passthrough",
+                            "show_input_envelope": True,
+                            "lock_passthrough": True,
+                        },
+                        "position": {"x": 360, "y": 0},
+                    },
+                    {
+                        "id": "display_b",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Display B",
+                        "provider_id": "core.data_display",
+                        "provider_label": "Envelope Display Node",
+                        "config": {
+                            "mode": "passthrough",
+                            "show_input_envelope": True,
+                            "lock_passthrough": True,
+                        },
+                        "position": {"x": 360, "y": 140},
+                    },
+                    {
+                        "id": "compose",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Compose",
+                        "provider_id": "core.context_builder",
+                        "provider_label": "Context Builder",
+                        "config": {
+                            "mode": "context_builder",
+                            "template": "",
+                            "joiner": "\n\n",
+                            "input_bindings": [
+                                {
+                                    "source_node_id": "display_a",
+                                    "placeholder": "display_a",
+                                    "binding": {"type": "latest_payload", "source": "display_a"},
+                                }
+                            ],
+                        },
+                        "position": {"x": 560, "y": 70},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "compose"}},
+                        "position": {"x": 760, "y": 70},
+                    },
+                ],
+                "edges": [
+                    {"id": "start-model-a", "source_id": "start", "target_id": "model_a", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "model-a-display", "source_id": "model_a", "target_id": "display_a", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "display-a-model-b", "source_id": "display_a", "target_id": "model_b", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "model-b-display", "source_id": "model_b", "target_id": "display_b", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "display-a-compose", "source_id": "display_a", "target_id": "compose", "label": "bind prior display", "kind": "binding", "priority": 0},
+                    {"id": "display-b-compose", "source_id": "display_b", "target_id": "compose", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "compose-finish", "source_id": "compose", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, "current request", run_id="run-context-builder-partial-bindings")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(
+            state.final_output,
+            [
+                {"role": "assistant", "content": "A direct reply is enough."},
+                {"role": "assistant", "content": "A direct reply is enough."},
+            ],
+        )
+        # display_a→compose is a binding edge: it schedules an early compose pass (partial
+        # merge, hold_outgoing). display_b→compose (standard) schedules the final pass.
+        compose_events = [
+            e
+            for e in state.event_history
+            if e.event_type == "node.completed" and e.payload.get("node_id") == "compose"
+        ]
+        self.assertEqual(len(compose_events), 2)
+        self.assertGreaterEqual(state.visit_counts.get("compose", 0), 2)
+        first_out = compose_events[0].payload.get("output")
+        self.assertIsInstance(first_out, dict)
+        assert isinstance(first_out, dict)
+        self.assertEqual(first_out.get("metadata", {}).get("binding_count"), 2)
+        self.assertFalse(first_out.get("metadata", {}).get("context_builder_complete", True))
+        self.assertTrue(compose_events[0].payload.get("metadata", {}).get("hold_outgoing_edges"))
+        last_out = compose_events[-1].payload.get("output")
+        self.assertIsInstance(last_out, dict)
+        assert isinstance(last_out, dict)
+        self.assertTrue(last_out.get("metadata", {}).get("context_builder_complete", False))
+        self.assertFalse(bool(compose_events[-1].payload.get("metadata", {}).get("hold_outgoing_edges")))
+
+    def test_context_builder_is_ready_when_any_connected_source_has_output(self) -> None:
         services = build_example_services()
         graph = GraphDefinition.from_dict(
             {
@@ -2656,7 +2929,7 @@ class ModelProviderTests(unittest.TestCase):
             "metadata": {"contract": "message_envelope", "node_kind": "data"},
         }
         partial_context = NodeContext(graph=graph, state=partial_state, services=services, node_id="compose")
-        self.assertFalse(compose_node.is_ready(partial_context))
+        self.assertTrue(compose_node.is_ready(partial_context))
 
         partial_state.node_outputs["display_b"] = {
             "schema_version": "1.0",
@@ -3093,22 +3366,25 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertEqual(state.status, "completed")
                     payload = state.final_output
                     assert isinstance(payload, dict)
-                    self.assertEqual(payload["original_input_payload"], {"request": "weather please"})
-                    self.assertEqual(payload["tool_name"], "weather_current")
-                    self.assertEqual(payload["tool_arguments"], {"location": "Austin"})
-                    self.assertEqual(payload["tool_output"]["resolved_location"], "Testville")
-                    self.assertEqual(payload["tool_status"], "success")
-                    self.assertEqual(len(payload["tool_history"]), 1)
-                    self.assertEqual(payload["tool_history"][0]["tool_name"], "weather_current")
-                    self.assertIsNone(payload["terminal_output"])
-                    self.assertEqual(payload["tool_call"]["tool_name"], "weather_current")
+                    self.assertFalse(payload["should_call_tool"])
+                    self.assertEqual(payload["tool_calls"], [])
+                    self.assertEqual(len(payload["tool_payloads"]), 1)
+                    self.assertEqual(payload["tool_payloads"][0]["tool_name"], "weather_current")
+                    self.assertEqual(payload["tool_payloads"][0]["tool_arguments"], {"location": "Austin"})
+                    self.assertEqual(payload["tool_payloads"][0]["tool_output"]["resolved_location"], "Testville")
+                    self.assertEqual(payload["tool_payloads"][0]["tool_status"], "success")
+                    self.assertNotIn("terminal_output", payload["tool_payloads"][0])
                     executor_output = state.node_outputs["executor"]
                     assert isinstance(executor_output, dict)
-                    self.assertEqual(executor_output["metadata"]["contract"], "message_envelope")
-                    self.assertEqual(executor_output["payload"]["tool_name"], "weather_current")
+                    self.assertEqual(executor_output["metadata"]["contract"], "tool_result_envelope")
+                    self.assertEqual(executor_output["payload"]["tool_payloads"][0]["tool_name"], "weather_current")
                     self.assertEqual(
                         executor_output["artifacts"]["source_tool_call_envelope"]["metadata"]["contract"],
                         "tool_call_envelope",
+                    )
+                    self.assertEqual(
+                        executor_output["artifacts"]["follow_up_payload"]["original_input_payload"],
+                        {"request": "weather please"},
                     )
                     self.assertEqual(
                         executor_output["artifacts"]["follow_up_payload"]["tool_history"][0]["tool_arguments"],
@@ -3144,21 +3420,24 @@ class ModelProviderTests(unittest.TestCase):
                     state = runtime.run(graph, {"request": "weather please"}, run_id="run-mcp-followup-context")
 
                     self.assertEqual(state.status, "completed")
-                    self.assertEqual(state.final_output, "No additional tools needed after weather_current.")
+                    assert isinstance(state.final_output, dict)
+                    self.assertFalse(state.final_output["should_call_tool"])
+                    self.assertEqual(state.final_output["tool_calls"], [])
+                    self.assertEqual(
+                        [entry["tool_arguments"] for entry in state.final_output["tool_payloads"]],
+                        [{"location": "Austin"}, {"location": "Seattle"}],
+                    )
                     self.assertEqual(state.visit_counts["executor"], 1)
-                    self.assertEqual(len(followup_provider.seen_payloads), 3)
+                    self.assertEqual(len(followup_provider.seen_payloads), 2)
                     self.assertEqual(followup_provider.seen_payloads[0]["original_input_payload"], {"request": "weather please"})
                     self.assertEqual(followup_provider.seen_payloads[1]["original_input_payload"], {"request": "weather please"})
-                    self.assertEqual(followup_provider.seen_payloads[2]["original_input_payload"], {"request": "weather please"})
                     self.assertEqual(followup_provider.seen_payloads[0]["tool_arguments"], {"location": "Austin"})
                     self.assertEqual(followup_provider.seen_payloads[1]["tool_arguments"], {"location": "Seattle"})
-                    self.assertEqual(followup_provider.seen_payloads[2]["tool_arguments"], {"location": "Seattle"})
                     self.assertEqual(len(followup_provider.seen_payloads[0]["tool_history"]), 1)
                     self.assertEqual(len(followup_provider.seen_payloads[1]["tool_history"]), 2)
-                    self.assertEqual(len(followup_provider.seen_payloads[2]["tool_history"]), 2)
                     executor_output = state.node_outputs["executor"]
                     assert isinstance(executor_output, dict)
-                    self.assertEqual(executor_output["metadata"]["contract"], "message_envelope")
+                    self.assertEqual(executor_output["metadata"]["contract"], "tool_result_envelope")
                     follow_up_payload = executor_output["artifacts"]["follow_up_payload"]
                     assert isinstance(follow_up_payload, dict)
                     self.assertEqual(
@@ -3230,8 +3509,9 @@ class ModelProviderTests(unittest.TestCase):
         self.assertEqual(state.status, "completed")
         payload = state.final_output
         assert isinstance(payload, dict)
-        self.assertEqual(payload["tool_name"], "mock_terminal_tool")
-        self.assertEqual(payload["terminal_output"]["stderr"], "first line\nsecond line")
+        self.assertFalse(payload["should_call_tool"])
+        self.assertEqual(payload["tool_payloads"][0]["tool_name"], "mock_terminal_tool")
+        self.assertEqual(payload["tool_payloads"][0]["terminal_output"]["stderr"], "first line\nsecond line")
         executor_output = state.node_outputs["executor"]
         assert isinstance(executor_output, dict)
         self.assertEqual(executor_output["artifacts"]["terminal_output_envelope"]["metadata"]["contract"], "terminal_output_envelope")

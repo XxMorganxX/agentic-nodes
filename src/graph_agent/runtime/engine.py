@@ -20,6 +20,31 @@ from graph_agent.runtime.core import (
 )
 
 
+def _base_node_label(node: Any) -> str:
+    explicit_label = str(getattr(node, "label", "") or "").strip()
+    if explicit_label:
+        return explicit_label
+    provider_label = str(getattr(node, "provider_label", "") or "").strip()
+    if provider_label:
+        return provider_label
+    return str(getattr(node, "id", "node"))
+
+
+def _node_instance_labels(graph: GraphDefinition) -> dict[str, str]:
+    groups: dict[str, list[Any]] = {}
+    for node in graph.nodes.values():
+        base_label = _base_node_label(node)
+        groups.setdefault(base_label, []).append(node)
+    labels: dict[str, str] = {}
+    for base_label, nodes in groups.items():
+        if len(nodes) == 1:
+            labels[str(nodes[0].id)] = base_label
+            continue
+        for index, node in enumerate(nodes, start=1):
+            labels[str(node.id)] = f"{base_label} {index}"
+    return labels
+
+
 class GraphRuntime:
     def __init__(
         self,
@@ -28,11 +53,13 @@ class GraphRuntime:
         max_steps: int,
         max_visits_per_node: int,
         event_listeners: list[Callable[[RuntimeEvent], None]] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> None:
         self.services = services
         self.max_steps = max_steps
         self.max_visits_per_node = max_visits_per_node
         self.event_listeners = event_listeners or []
+        self.cancel_requested = cancel_requested or (lambda: False)
 
     def add_event_listener(self, listener: Callable[[RuntimeEvent], None]) -> None:
         self.event_listeners.append(listener)
@@ -48,6 +75,64 @@ class GraphRuntime:
         for listener in self.event_listeners:
             listener(event)
         return event
+
+    def _describe_edge(self, edge: Edge, graph: GraphDefinition) -> dict[str, Any]:
+        source_node = graph.nodes.get(edge.source_id)
+        target_node = graph.nodes.get(edge.target_id)
+        instance_labels = _node_instance_labels(graph)
+        condition = edge.condition
+        return {
+            "edge_id": edge.id,
+            "kind": edge.kind,
+            "label": edge.label or None,
+            "source_handle_id": edge.source_handle_id,
+            "target_handle_id": edge.target_handle_id,
+            "target_node_id": edge.target_id,
+            "target_node_label": instance_labels.get(edge.target_id, target_node.label if target_node is not None else edge.target_id),
+            "target_node_kind": target_node.kind if target_node is not None else None,
+            "source_node_label": instance_labels.get(edge.source_id, source_node.label if source_node is not None else edge.source_id),
+            "condition_label": condition.label if condition is not None else None,
+            "condition_type": condition.condition_type if condition is not None else None,
+            "condition_path": condition.path if condition is not None else None,
+            "condition_value": condition.value if condition is not None else None,
+        }
+
+    def _no_matching_edge_error(
+        self,
+        graph: GraphDefinition,
+        node_id: str,
+        result: NodeExecutionResult,
+    ) -> tuple[str, dict[str, Any]]:
+        node = graph.nodes.get(node_id)
+        instance_labels = _node_instance_labels(graph)
+        node_label = instance_labels.get(node_id, node.label if node is not None else node_id)
+        outgoing_edges = graph.get_outgoing_edges(node_id)
+        available_routes = [self._describe_edge(edge, graph) for edge in outgoing_edges]
+        result_contract = self._result_contract(result)
+        route_count = len(outgoing_edges)
+        if route_count == 0:
+            message = f"Node '{node_label}' completed, but it has no outgoing execution edges."
+        else:
+            route_target_labels = ", ".join(route["target_node_label"] for route in available_routes) or "none"
+            contract_clause = f" Output contract was '{result_contract}'." if result_contract else ""
+            message = (
+                f"Node '{node_label}' completed, but no outgoing edge matched its result."
+                f"{contract_clause} Available routes: {route_target_labels}."
+            )
+        error = {
+            "type": "no_matching_edge",
+            "node_id": node_id,
+            "node_label": node_label,
+            "node_kind": node.kind if node is not None else None,
+            "node_provider_id": node.provider_id if node is not None else None,
+            "node_provider_label": node.provider_label if node is not None else None,
+            "result_status": result.status,
+            "result_contract": result_contract,
+            "available_routes": available_routes,
+            "message": message,
+        }
+        summary = f"No outgoing edge matched after node '{node_label}'."
+        return summary, error
 
     def run(self, graph: GraphDefinition, input_payload: Any, *, run_id: str | None = None) -> RunState:
         state = RunState(
@@ -67,6 +152,8 @@ class GraphRuntime:
 
         step = 0
         while pending_nodes and step < self.max_steps:
+            if self.cancel_requested():
+                return self.cancel_run(state, summary="Run cancelled before starting the next node.")
             frame = pending_nodes.popleft()
             current_node_id = str(frame["node_id"])
             state.current_node_id = current_node_id
@@ -111,6 +198,8 @@ class GraphRuntime:
                 },
             )
 
+            if self.cancel_requested():
+                return self.cancel_run(state, summary=f"Run cancelled before executing node '{node.label}'.")
             try:
                 result = node.execute(context)
             except Exception as exc:  # noqa: BLE001
@@ -120,6 +209,8 @@ class GraphRuntime:
                     error={"type": "node_exception", "node_id": node.id, "message": str(exc)},
                 )
 
+            if self.cancel_requested():
+                return self.cancel_run(state, summary=f"Run cancelled while node '{node.label}' was executing.")
             if result.error is not None:
                 state.node_errors[node.id] = result.error
             if result.output is not None:
@@ -160,11 +251,28 @@ class GraphRuntime:
                 continue
 
             next_edges = self.select_edges(graph, state, node.id, result)
-            if not next_edges:
+            binding_edges = [
+                edge
+                for edge in graph.get_outgoing_edges(node.id)
+                if edge.kind == "binding"
+                and (target := graph.nodes.get(edge.target_id)) is not None
+                and getattr(target, "provider_id", None) == "core.context_builder"
+            ]
+            hold_outgoing = bool(result.metadata.get("hold_outgoing_edges"))
+            if hold_outgoing:
+                next_edges = []
+                binding_edges = []
+            if not next_edges and not binding_edges:
+                if hold_outgoing:
+                    state.current_node_id = None
+                    state.current_edge_id = None
+                    step += 1
+                    continue
+                failure_summary, failure_error = self._no_matching_edge_error(graph, node.id, result)
                 return self.fail_run(
                     state,
-                    summary=f"No outgoing edge matched after node '{node.id}'.",
-                    error={"type": "no_matching_edge", "node_id": node.id},
+                    summary=failure_summary,
+                    error=failure_error,
                 )
 
             for next_edge, edge_result in next_edges:
@@ -183,9 +291,34 @@ class GraphRuntime:
                     f"Transitioning from '{next_edge.source_id}' to '{next_edge.target_id}'.",
                     next_edge.to_dict(),
                 )
-                pending_nodes.append({"node_id": next_edge.target_id, "incoming_edge_id": next_edge.id})
+                frame = {"node_id": next_edge.target_id, "incoming_edge_id": next_edge.id}
+                target = graph.nodes.get(next_edge.target_id)
+                if target is not None and getattr(target, "provider_id", None) == "core.context_builder":
+                    pending_nodes.appendleft(frame)
+                else:
+                    pending_nodes.append(frame)
+
+            for edge in binding_edges:
+                state.transition_history.append(
+                    TransitionRecord(
+                        edge_id=edge.id,
+                        source_id=edge.source_id,
+                        target_id=edge.target_id,
+                    )
+                )
+                self.emit(
+                    state,
+                    "edge.selected",
+                    f"Transitioning from '{edge.source_id}' to '{edge.target_id}'.",
+                    edge.to_dict(),
+                )
+                pending_nodes.appendleft(
+                    {"node_id": edge.target_id, "incoming_edge_id": edge.id},
+                )
             step += 1
 
+        if self.cancel_requested():
+            return self.cancel_run(state, summary="Run cancelled before completion.")
         return self.fail_run(
             state,
             summary="Run exceeded the maximum number of steps.",
@@ -351,4 +484,13 @@ class GraphRuntime:
         state.terminal_error = error
         failure_event = self.emit(state, "run.failed", summary, {"error": error})
         state.ended_at = failure_event.timestamp
+        return state
+
+    def cancel_run(self, state: RunState, summary: str) -> RunState:
+        state.status = "cancelled"
+        state.current_node_id = None
+        state.current_edge_id = None
+        state.terminal_error = {"type": "run_cancelled", "message": summary}
+        cancelled_event = self.emit(state, "run.cancelled", summary, {"error": state.terminal_error})
+        state.ended_at = cancelled_event.timestamp
         return state

@@ -9,6 +9,7 @@ import {
   TOOL_USER_DESCRIPTION_CONFIG_KEY,
 } from "../lib/toolNodeDetails";
 import { getGraphEnvVars } from "../lib/graphEnv";
+import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
 import type { EditorCatalog, GraphDefinition, GraphNode } from "../lib/types";
 
 type ToolDetailsModalProps = {
@@ -38,6 +39,7 @@ export function ToolDetailsModal({
   onClose,
 }: ToolDetailsModalProps) {
   const details = resolveToolNodeDetails(node, catalog, graph);
+  const nodeLabel = getNodeInstanceLabel(graph, node);
   const envVarEntries = Object.entries(getGraphEnvVars(graph));
 
   useEffect(() => {
@@ -87,7 +89,7 @@ export function ToolDetailsModal({
           <div>
             <div className="tool-details-modal-eyebrow">Tool Runtime Details</div>
             <h3 id="tool-details-modal-title">
-              {node.label}
+              {nodeLabel}
               {details.toolName ? ` · ${details.toolName}` : ""}
             </h3>
             <p>

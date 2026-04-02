@@ -815,7 +815,7 @@ class McpServerManager:
                     executor=self._executor_for(server_id, name),
                     source_type="mcp",
                     server_id=server_id,
-                    enabled=existing.enabled if existing is not None else False,
+                    enabled=existing.enabled if existing is not None else True,
                     available=True,
                     availability_error="",
                     schema_origin="discovered",

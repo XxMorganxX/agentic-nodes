@@ -16,7 +16,9 @@ import {
   fetchEditorCatalog,
   fetchGraph,
   fetchGraphs,
+  fetchRun,
   refreshMcpServer,
+  resetRuntime,
   setMcpToolEnabled,
   startRun,
   stopMcpServer,
@@ -26,8 +28,8 @@ import {
 } from "./lib/api";
 import { createBlankGraph, layoutGraphDocument, layoutGraphLR, normalizeGraphDocument } from "./lib/editor";
 import { filterEventsForAgent, getCanvasGraph, getDefaultAgentId, getSelectedRunId, getSelectedRunState, isTestEnvironment, updateSelectedAgentGraph } from "./lib/graphDocuments";
-import { clearPersistedRunSnapshot, loadPersistedRunSnapshot, savePersistedRunSnapshot } from "./lib/runSnapshots";
-import { buildAgentRunLanes, buildEnvironmentRunSummary, buildFocusedEventGroups, buildFocusedRunSummary } from "./lib/runVisualization";
+import { clearAllPersistedRunSnapshots, clearPersistedRunSnapshot, loadPersistedRunSnapshot, savePersistedRunSnapshot } from "./lib/runSnapshots";
+import { buildAgentRunLanes, buildEnvironmentRunSummary, buildFocusedRunProjection } from "./lib/runVisualization";
 import type { EditorCatalog, GraphDefinition, GraphDocument, McpServerDraft, McpServerStatus, RunState, RuntimeEvent, ToolDefinition } from "./lib/types";
 import { getUserPreferences, resetUserPreferences, saveUserPreferences } from "./lib/userPreferences";
 import type { UserPreferences } from "./lib/userPreferences";
@@ -36,9 +38,33 @@ import { useGraphHistory } from "./lib/useGraphHistory";
 const DEFAULT_INPUT = "Find graph-agent references for a schema repair workflow.";
 const DEFAULT_TEST_ENVIRONMENT_ID = "test-environment";
 
+function isTerminalRunStatus(status: string | null | undefined): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled" || status === "interrupted";
+}
+
 function getSavedInputPrompt(graph: GraphDocument | null | undefined): string {
   const savedPrompt = typeof graph?.default_input === "string" ? graph.default_input.trim() : "";
   return savedPrompt || DEFAULT_INPUT;
+}
+
+function buildEnvironmentAgentSelection(
+  graph: GraphDocument | null | undefined,
+  previous: Record<string, boolean> = {},
+): Record<string, boolean> {
+  if (!isTestEnvironment(graph)) {
+    return {};
+  }
+  return Object.fromEntries(graph.agents.map((agent) => [agent.agent_id, previous[agent.agent_id] ?? true]));
+}
+
+function getSelectedEnvironmentAgentIds(
+  graph: GraphDocument | null | undefined,
+  selection: Record<string, boolean>,
+): string[] {
+  if (!isTestEnvironment(graph)) {
+    return [];
+  }
+  return graph.agents.filter((agent) => selection[agent.agent_id] !== false).map((agent) => agent.agent_id);
 }
 
 function createEmptyRunState(runId: string, graphId: string, input: string): RunState {
@@ -51,8 +77,11 @@ function createEmptyRunState(runId: string, graphId: string, input: string): Run
     current_node_id: null,
     current_edge_id: null,
     status: "queued",
+    status_reason: null,
     started_at: null,
     ended_at: null,
+    runtime_instance_id: null,
+    last_heartbeat_at: null,
     input_payload: input,
     node_inputs: {},
     node_outputs: {},
@@ -67,15 +96,18 @@ function createEmptyRunState(runId: string, graphId: string, input: string): Run
   };
 }
 
-function createPendingRunState(graph: GraphDocument, runId: string, input: string): RunState {
+function createPendingRunState(graph: GraphDocument, runId: string, input: string, agentIds?: string[]): RunState {
   const next = createEmptyRunState(runId, graph.graph_id, input);
   if (!isTestEnvironment(graph)) {
     return next;
   }
+  const selectedAgentIds = new Set(agentIds ?? graph.agents.map((agent) => agent.agent_id));
   return {
     ...next,
     agent_runs: Object.fromEntries(
-      graph.agents.map((agent) => [
+      graph.agents
+        .filter((agent) => selectedAgentIds.has(agent.agent_id))
+        .map((agent) => [
         agent.agent_id,
         {
           ...createEmptyRunState(`${runId}:${agent.agent_id}`, agent.agent_id, input),
@@ -83,7 +115,7 @@ function createPendingRunState(graph: GraphDocument, runId: string, input: strin
           agent_name: agent.name,
           parent_run_id: runId,
         } satisfies RunState,
-      ]),
+        ]),
     ),
   };
 }
@@ -137,6 +169,7 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
 
   if (event.event_type === "run.started") {
     next.status = "running";
+    next.status_reason = null;
     next.started_at = event.timestamp;
   }
 
@@ -200,6 +233,7 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
 
   if (event.event_type === "run.completed") {
     next.status = "completed";
+    next.status_reason = null;
     next.current_node_id = null;
     next.current_edge_id = null;
     next.ended_at = event.timestamp;
@@ -208,6 +242,31 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
 
   if (event.event_type === "run.failed") {
     next.status = "failed";
+    next.status_reason = null;
+    next.current_node_id = null;
+    next.current_edge_id = null;
+    next.ended_at = event.timestamp;
+    next.terminal_error = (event.payload.error ?? null) as Record<string, unknown> | null;
+    if ("final_output" in event.payload) {
+      next.final_output = event.payload.final_output;
+    }
+  }
+
+  if (event.event_type === "run.cancelled") {
+    next.status = "cancelled";
+    next.status_reason = null;
+    next.current_node_id = null;
+    next.current_edge_id = null;
+    next.ended_at = event.timestamp;
+    next.terminal_error = (event.payload.error ?? null) as Record<string, unknown> | null;
+    if ("final_output" in event.payload) {
+      next.final_output = event.payload.final_output;
+    }
+  }
+
+  if (event.event_type === "run.interrupted") {
+    next.status = "interrupted";
+    next.status_reason = typeof event.payload.reason === "string" ? event.payload.reason : null;
     next.current_node_id = null;
     next.current_edge_id = null;
     next.ended_at = event.timestamp;
@@ -283,6 +342,7 @@ export default function App() {
   const [graphs, setGraphs] = useState<GraphDocument[]>([]);
   const [selectedGraphId, setSelectedGraphId] = useState<string>("");
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [environmentAgentSelection, setEnvironmentAgentSelection] = useState<Record<string, boolean>>({});
   const history = useGraphHistory();
   const { graph: draftGraph, set: setDraftGraph, setQuiet: setDraftGraphQuiet, reset: resetHistory } = history;
   const [savedGraphSnapshot, setSavedGraphSnapshot] = useState("");
@@ -296,11 +356,14 @@ export default function App() {
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isResettingRuntime, setIsResettingRuntime] = useState(false);
   const [mcpPendingKey, setMcpPendingKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [userPreferences, setUserPreferences] = useState<UserPreferences>(() => getUserPreferences());
   const [userPreferencesOpen, setUserPreferencesOpen] = useState(false);
   const sourceRef = useRef<EventSource | null>(null);
+  const runPollTimeoutRef = useRef<number | null>(null);
+  const runStateRef = useRef<RunState | null>(null);
   const executionBoxRef = useRef<HTMLDivElement | null>(null);
 
   const canvasGraph = useMemo(() => getCanvasGraph(draftGraph, selectedAgentId), [draftGraph, selectedAgentId]);
@@ -309,21 +372,27 @@ export default function App() {
   const filteredEvents = useMemo(() => filterEventsForAgent(events, selectedAgentId), [events, selectedAgentId]);
   const persistedGraphIds = useMemo(() => new Set(graphs.map((graph) => graph.graph_id)), [graphs]);
   const isEnvironment = isTestEnvironment(draftGraph);
+  const selectedEnvironmentAgentIds = useMemo(
+    () => getSelectedEnvironmentAgentIds(draftGraph, environmentAgentSelection),
+    [draftGraph, environmentAgentSelection],
+  );
   const environmentRunSummary = useMemo(
     () => buildEnvironmentRunSummary(draftGraph, runState, selectedAgentId),
     [draftGraph, runState, selectedAgentId],
   );
   const agentRunLanes = useMemo(() => buildAgentRunLanes(draftGraph, runState, events), [draftGraph, runState, events]);
-  const focusedRunSummary = useMemo(
-    () => buildFocusedRunSummary(canvasGraph, selectedRunState, filteredEvents),
+  const focusedRunProjection = useMemo(
+    () => buildFocusedRunProjection(canvasGraph, selectedRunState, filteredEvents),
     [canvasGraph, selectedRunState, filteredEvents],
   );
-  const focusedEventGroups = useMemo(
-    () => buildFocusedEventGroups(canvasGraph, filteredEvents),
-    [canvasGraph, filteredEvents],
-  );
+  const focusedRunSummary = focusedRunProjection.runSummary;
+  const focusedEventGroups = focusedRunProjection.eventGroups;
   const draftGraphSnapshot = useMemo(() => serializeGraphSnapshot(draftGraph), [draftGraph]);
   const hasUnsavedChanges = (Boolean(draftGraph) && draftGraphSnapshot !== savedGraphSnapshot) || input !== savedInputPrompt;
+
+  useEffect(() => {
+    runStateRef.current = runState;
+  }, [runState]);
 
   const refreshCatalog = useCallback(async () => {
     const loadedCatalog = await fetchEditorCatalog();
@@ -331,13 +400,148 @@ export default function App() {
     return loadedCatalog;
   }, []);
 
-  const restorePersistedRunSnapshot = useCallback((graphId: string) => {
-    const snapshot = loadPersistedRunSnapshot(graphId);
-    setActiveRunId(snapshot?.activeRunId ?? snapshot?.runState?.run_id ?? null);
-    setEvents(snapshot?.events ?? []);
-    setRunState(snapshot?.runState ?? null);
-    setIsRunning(false);
+  const clearRunPolling = useCallback(() => {
+    if (runPollTimeoutRef.current === null) {
+      return;
+    }
+    window.clearTimeout(runPollTimeoutRef.current);
+    runPollTimeoutRef.current = null;
   }, []);
+
+  const applyFetchedRunState = useCallback((nextRunState: RunState) => {
+    setActiveRunId(nextRunState.run_id);
+    setRunState(nextRunState);
+    setEvents(nextRunState.event_history ?? []);
+    setIsRunning(!isTerminalRunStatus(nextRunState.status));
+  }, []);
+
+  const markRecoveredRunInterrupted = useCallback((
+    graphId: string,
+    nextRunState: RunState | null,
+    fallbackRunId: string | null,
+    savedAt?: string,
+  ) => {
+    clearRunPolling();
+    sourceRef.current?.close();
+    sourceRef.current = null;
+    if (!nextRunState) {
+      clearPersistedRunSnapshot(graphId);
+      setActiveRunId(null);
+      setEvents([]);
+      setRunState(null);
+      setIsRunning(false);
+      return;
+    }
+    const interruptedState: RunState = {
+      ...nextRunState,
+      run_id: nextRunState.run_id ?? fallbackRunId ?? nextRunState.run_id,
+      status: "interrupted",
+      status_reason: nextRunState.status_reason ?? "recovery_unavailable",
+      ended_at: nextRunState.ended_at ?? savedAt ?? new Date().toISOString(),
+      terminal_error:
+        nextRunState.terminal_error ??
+        ({
+          type: "run_state_unavailable",
+          message: "The UI could not reconnect to the backend for this persisted run.",
+        } as Record<string, unknown>),
+    };
+    setActiveRunId(interruptedState.run_id);
+    setRunState(interruptedState);
+    setEvents(interruptedState.event_history ?? []);
+    setIsRunning(false);
+    savePersistedRunSnapshot({
+      graphId,
+      activeRunId: interruptedState.run_id,
+      events: interruptedState.event_history ?? [],
+      runState: interruptedState,
+      savedAt: interruptedState.ended_at ?? new Date().toISOString(),
+    });
+  }, [clearRunPolling]);
+
+  const scheduleRunPoll = useCallback((runId: string, graphId: string) => {
+    clearRunPolling();
+    runPollTimeoutRef.current = window.setTimeout(() => {
+      void fetchRun(runId)
+        .then((nextRunState) => {
+          applyFetchedRunState(nextRunState);
+          if (isTerminalRunStatus(nextRunState.status)) {
+            clearPersistedRunSnapshot(graphId);
+            clearRunPolling();
+            return;
+          }
+          scheduleRunPoll(runId, graphId);
+        })
+        .catch(() => {
+          markRecoveredRunInterrupted(graphId, runStateRef.current, runId);
+        });
+    }, 1500);
+  }, [applyFetchedRunState, clearRunPolling, markRecoveredRunInterrupted]);
+
+  const connectToRunStream = useCallback((runId: string, graphId: string, inputValue: string) => {
+    clearRunPolling();
+    sourceRef.current?.close();
+    const source = new EventSource(eventStreamUrl(runId));
+    sourceRef.current = source;
+
+    source.onmessage = (message) => {
+      const event = JSON.parse(message.data) as RuntimeEvent;
+      setEvents((previous) => [...previous, event]);
+      setRunState((previous) => applyEvent(previous, event, graphId, inputValue));
+
+      if (!event.agent_id && isTerminalRunStatus(event.event_type.replace(/^run\./, ""))) {
+        source.close();
+        sourceRef.current = null;
+        setIsRunning(false);
+        clearPersistedRunSnapshot(graphId);
+        void fetchRun(runId)
+          .then((nextRunState) => {
+            applyFetchedRunState(nextRunState);
+          })
+          .catch(() => {
+            // The local reducer already has the terminal event; keep that snapshot.
+          });
+      }
+    };
+
+    source.onerror = () => {
+      source.close();
+      sourceRef.current = null;
+      setIsRunning(false);
+      scheduleRunPoll(runId, graphId);
+    };
+  }, [applyFetchedRunState, clearRunPolling, scheduleRunPoll]);
+
+  const restorePersistedRunSnapshot = useCallback(async (graphId: string) => {
+    const snapshot = loadPersistedRunSnapshot(graphId);
+    const snapshotRunId = snapshot?.activeRunId ?? snapshot?.runState?.run_id ?? null;
+    const snapshotRunState = snapshot?.runState ?? null;
+    const shouldHydrateLocalSnapshot = Boolean(snapshotRunId && snapshotRunState && !isTerminalRunStatus(snapshotRunState.status));
+    setActiveRunId(shouldHydrateLocalSnapshot ? snapshotRunId : null);
+    setEvents(shouldHydrateLocalSnapshot ? (snapshot?.events ?? []) : []);
+    setRunState(shouldHydrateLocalSnapshot ? snapshotRunState : null);
+    setIsRunning(false);
+    clearRunPolling();
+    sourceRef.current?.close();
+    sourceRef.current = null;
+    if (!snapshotRunId) {
+      return;
+    }
+    try {
+      const recoveredRunState = await fetchRun(snapshotRunId);
+      if (isTerminalRunStatus(recoveredRunState.status)) {
+        clearPersistedRunSnapshot(graphId);
+        setActiveRunId(null);
+        setEvents([]);
+        setRunState(null);
+        setIsRunning(false);
+        return;
+      }
+      applyFetchedRunState(recoveredRunState);
+      connectToRunStream(recoveredRunState.run_id, graphId, input);
+    } catch {
+      markRecoveredRunInterrupted(graphId, shouldHydrateLocalSnapshot ? snapshotRunState : null, snapshotRunId, snapshot?.savedAt);
+    }
+  }, [applyFetchedRunState, clearRunPolling, connectToRunStream, input, markRecoveredRunInterrupted]);
 
   useEffect(() => {
     Promise.all([fetchGraphs(), refreshCatalog()])
@@ -366,6 +570,9 @@ export default function App() {
   useEffect(() => {
     return () => {
       sourceRef.current?.close();
+      if (runPollTimeoutRef.current !== null) {
+        window.clearTimeout(runPollTimeoutRef.current);
+      }
     };
   }, []);
 
@@ -384,10 +591,14 @@ export default function App() {
         setSelectedAgentId(getDefaultAgentId(nextGraph));
         setSelectedNodeId(null);
         setSelectedEdgeId(null);
-        restorePersistedRunSnapshot(nextGraph.graph_id);
+        void restorePersistedRunSnapshot(nextGraph.graph_id);
       })
       .catch((loadError: Error) => setError(loadError.message));
   }, [resetHistory, restorePersistedRunSnapshot, selectedGraphId]);
+
+  useEffect(() => {
+    setEnvironmentAgentSelection((current) => buildEnvironmentAgentSelection(draftGraph, current));
+  }, [draftGraph]);
 
   useEffect(() => {
     setSelectedNodeId(null);
@@ -494,9 +705,19 @@ export default function App() {
     }
   }
 
+  function clearLiveRunState() {
+    clearRunPolling();
+    sourceRef.current?.close();
+    sourceRef.current = null;
+    setActiveRunId(null);
+    setEvents([]);
+    setRunState(null);
+    setIsRunning(false);
+  }
+
   function handleCreateGraph() {
     const blankGraph = createBlankGraph();
-    sourceRef.current?.close();
+    clearLiveRunState();
     setSelectedGraphId("");
     setSelectedAgentId(null);
     resetHistory(blankGraph);
@@ -505,10 +726,6 @@ export default function App() {
     setSavedInputPrompt(DEFAULT_INPUT);
     setSelectedNodeId(null);
     setSelectedEdgeId(null);
-    setActiveRunId(null);
-    setEvents([]);
-    setRunState(null);
-    setIsRunning(false);
     setError(null);
   }
 
@@ -532,10 +749,7 @@ export default function App() {
         setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
         setInput(DEFAULT_INPUT);
         setSavedInputPrompt(DEFAULT_INPUT);
-        setActiveRunId(null);
-        setEvents([]);
-        setRunState(null);
-        setIsRunning(false);
+        clearLiveRunState();
       }
       setSelectedNodeId(null);
       setSelectedEdgeId(null);
@@ -550,46 +764,58 @@ export default function App() {
     if (!draftGraph) {
       return;
     }
+    const agentIdsToRun = isTestEnvironment(draftGraph) ? getSelectedEnvironmentAgentIds(draftGraph, environmentAgentSelection) : undefined;
+    if (isTestEnvironment(draftGraph) && (!agentIdsToRun || agentIdsToRun.length === 0)) {
+      setError("Turn on at least one agent before running the environment.");
+      return;
+    }
 
     const savedGraph = await saveCurrentGraph();
     if (!savedGraph) {
       return;
     }
 
+    clearRunPolling();
     sourceRef.current?.close();
+    sourceRef.current = null;
     setError(null);
+    clearPersistedRunSnapshot(savedGraph.graph_id);
     setActiveRunId(null);
     setEvents([]);
     setRunState(null);
     setIsRunning(true);
+    if (isTestEnvironment(savedGraph) && agentIdsToRun && agentIdsToRun.length > 0 && !agentIdsToRun.includes(selectedAgentId ?? "")) {
+      setSelectedAgentId(agentIdsToRun[0] ?? null);
+    }
 
     try {
-      const runId = await startRun(savedGraph.graph_id, input);
+      const runId = await startRun(savedGraph.graph_id, input, { agent_ids: agentIdsToRun });
       setActiveRunId(runId);
-      setRunState(createPendingRunState(savedGraph, runId, input));
-
-      const source = new EventSource(eventStreamUrl(runId));
-      sourceRef.current = source;
-
-      source.onmessage = (message) => {
-        const event = JSON.parse(message.data) as RuntimeEvent;
-        setEvents((previous) => [...previous, event]);
-        setRunState((previous) => applyEvent(previous, event, savedGraph.graph_id, input));
-
-        if (!event.agent_id && (event.event_type === "run.completed" || event.event_type === "run.failed")) {
-          source.close();
-          setIsRunning(false);
-        }
-      };
-
-      source.onerror = () => {
-        source.close();
-        setIsRunning(false);
-      };
+      setRunState(createPendingRunState(savedGraph, runId, input, agentIdsToRun));
+      connectToRunStream(runId, savedGraph.graph_id, input);
     } catch (runError) {
       const message = runError instanceof Error ? runError.message : "Unable to start run.";
       setError(message);
       setIsRunning(false);
+    }
+  }
+
+  async function handleResetRuntime() {
+    if (!window.confirm("Reset runtime? This will stop active runs, disconnect runtime services, and clear live run state.")) {
+      return;
+    }
+    setIsResettingRuntime(true);
+    setError(null);
+    try {
+      await resetRuntime();
+      clearAllPersistedRunSnapshots();
+      clearLiveRunState();
+      await refreshCatalog();
+    } catch (resetError) {
+      const message = resetError instanceof Error ? resetError.message : "Unable to reset runtime.";
+      setError(message);
+    } finally {
+      setIsResettingRuntime(false);
     }
   }
 
@@ -664,6 +890,9 @@ export default function App() {
                   <button type="button" className="secondary-button" onClick={history.redo} disabled={!history.canRedo} title="Redo (⌘⇧Z)">
                     Redo
                   </button>
+                  <button type="button" className="danger-button" onClick={() => void handleResetRuntime()} disabled={isResettingRuntime}>
+                    {isResettingRuntime ? "Resetting..." : "Reset Runtime"}
+                  </button>
                   <button type="button" className="danger-button" onClick={() => void handleDeleteGraph()} disabled={!draftGraph}>
                     Delete
                   </button>
@@ -700,9 +929,68 @@ export default function App() {
                 <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={10} />
               </label>
               <div className="mosaic-execution-run">
-                <button type="button" onClick={() => void handleRun()} disabled={!draftGraph || isRunning || isSaving}>
+                <button type="button" onClick={() => void handleRun()} disabled={!draftGraph || isRunning || isSaving || isResettingRuntime}>
                   {isRunning ? "Running..." : isEnvironment ? "Run Environment" : "Run Graph"}
                 </button>
+                {isEnvironment && draftGraph ? (
+                  <div className="environment-run-toggle-panel">
+                    <div className="environment-run-toggle-header">
+                      <strong>Agents To Run</strong>
+                      <span>
+                        {selectedEnvironmentAgentIds.length} of {draftGraph.agents.length} enabled
+                      </span>
+                    </div>
+                    <div className="environment-run-toggle-actions">
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() =>
+                          setEnvironmentAgentSelection(
+                            Object.fromEntries(draftGraph.agents.map((agent) => [agent.agent_id, true])),
+                          )
+                        }
+                        disabled={isRunning || isSaving || isResettingRuntime}
+                      >
+                        All On
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() =>
+                          setEnvironmentAgentSelection(
+                            Object.fromEntries(draftGraph.agents.map((agent) => [agent.agent_id, false])),
+                          )
+                        }
+                        disabled={isRunning || isSaving || isResettingRuntime}
+                      >
+                        All Off
+                      </button>
+                    </div>
+                    <div className="environment-run-toggle-list">
+                      {draftGraph.agents.map((agent) => {
+                        const enabled = environmentAgentSelection[agent.agent_id] !== false;
+                        return (
+                          <button
+                            key={agent.agent_id}
+                            type="button"
+                            className={`environment-run-toggle ${enabled ? "is-enabled" : "is-disabled"}`}
+                            aria-pressed={enabled}
+                            onClick={() =>
+                              setEnvironmentAgentSelection((current) => ({
+                                ...current,
+                                [agent.agent_id]: current[agent.agent_id] === false,
+                              }))
+                            }
+                            disabled={isRunning || isSaving || isResettingRuntime}
+                          >
+                            <span>{agent.name}</span>
+                            <strong>{enabled ? "On" : "Off"}</strong>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null}
                 {selectedRunId ? <code>Run ID: {selectedRunId}</code> : <p>Ready to launch the selected graph.</p>}
                 {error ? <p className="error-text">{error}</p> : null}
               </div>
@@ -767,7 +1055,7 @@ export default function App() {
           isRunning={isRunning}
           runButtonLabel={isEnvironment ? "Run Environment" : "Run Graph"}
           focusedAgentName={isEnvironment ? (environmentRunSummary?.focusedAgentName ?? null) : null}
-          focusedAgentStatus={isEnvironment ? (selectedRunState?.status ?? "idle") : null}
+          focusedAgentStatus={isEnvironment ? focusedRunSummary.status : null}
           environmentAgents={isEnvironment ? agentRunLanes : []}
           selectedAgentId={selectedAgentId}
           onSelectAgent={(agentId) => {
@@ -775,6 +1063,7 @@ export default function App() {
             setSelectedNodeId(null);
             setSelectedEdgeId(null);
           }}
+          runProjection={focusedRunProjection}
           runSummary={focusedRunSummary}
           eventGroups={focusedEventGroups}
           catalog={catalog}

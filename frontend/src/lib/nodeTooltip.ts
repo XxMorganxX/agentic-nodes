@@ -1,5 +1,6 @@
 import type { EditorCatalog, GraphDefinition, GraphNode, RunState } from "./types";
 import { inferModelResponseMode } from "./editor";
+import { getNodeInstanceLabel } from "./nodeInstanceLabels";
 import { resolveToolNodeDetails } from "./toolNodeDetails";
 
 type TooltipRow = {
@@ -75,6 +76,25 @@ function truncate(value: string, limit = 96): string {
   return `${value.slice(0, limit - 1)}...`;
 }
 
+function cleanInlineText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function truncateText(value: string, limit = 220): string {
+  return value.length > limit ? `${value.slice(0, limit - 1)}...` : value;
+}
+
+function stringifyCompactValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 function inferSchemaType(property: SchemaProperty): string {
   if (Array.isArray(property.type) && property.type.length > 0) {
     return property.type.join(" | ");
@@ -109,7 +129,7 @@ function formatNodeLabel(graph: GraphDefinition | null | undefined, nodeId: stri
   if (sourceNode.kind === "input") {
     return "user input";
   }
-  return sourceNode.label;
+  return getNodeInstanceLabel(graph ?? null, sourceNode);
 }
 
 function formatSourceList(sourceIds: string[], graph: GraphDefinition | null | undefined): string {
@@ -222,6 +242,7 @@ export function buildNodeTooltip(
   catalog: EditorCatalog | null,
   runState?: RunState | null,
 ): NodeTooltipData {
+  const nodeTitle = getNodeInstanceLabel(graph, node);
   const contract = catalog?.contracts[node.category];
   const baseSections: TooltipSection[] = [
     {
@@ -257,7 +278,7 @@ export function buildNodeTooltip(
     const parameterSource = describeBindingSource(node, graph);
 
     return {
-      title: node.label,
+      title: nodeTitle,
       eyebrow: `${node.category} / ${node.kind}`,
       description: details.userDescriptionText || node.description,
       sections: [
@@ -293,7 +314,7 @@ export function buildNodeTooltip(
   if (node.kind === "mcp_context_provider") {
     const toolNames = Array.isArray(node.config.tool_names) ? node.config.tool_names.map((toolName) => String(toolName)) : [];
     return {
-      title: node.label,
+      title: nodeTitle,
       eyebrow: `${node.category} / ${node.kind}`,
       description: node.description,
       sections: [
@@ -316,7 +337,7 @@ export function buildNodeTooltip(
   if (node.kind === "mcp_tool_executor") {
     const followUpEnabled = node.config.enable_follow_up_decision === true;
     return {
-      title: node.label,
+      title: nodeTitle,
       eyebrow: `${node.category} / ${node.kind}`,
       description: node.description,
       sections: [
@@ -353,7 +374,7 @@ export function buildNodeTooltip(
     const preferredTool = asString(node.config.preferred_tool_name);
     const responseMode = inferModelResponseMode(graph, node);
     return {
-      title: node.label,
+      title: nodeTitle,
       eyebrow: `${node.category} / ${node.kind}`,
       description: node.description,
       sections: [
@@ -392,7 +413,7 @@ export function buildNodeTooltip(
       graph?.edges.filter((edge) => edge.target_id === node.id).map((edge) => edge.source_id) ?? [],
     ).length;
     return {
-      title: node.label,
+      title: nodeTitle,
       eyebrow: `${node.category} / ${node.kind}`,
       description: node.description,
       sections: [
@@ -450,7 +471,7 @@ export function buildNodeTooltip(
 
   if (node.kind === "provider") {
     return {
-      title: node.label,
+      title: nodeTitle,
       eyebrow: `${node.category} / ${node.kind}`,
       description: node.description,
       sections: [
@@ -470,7 +491,7 @@ export function buildNodeTooltip(
 
   if (node.kind === "input") {
     return {
-      title: node.label,
+      title: nodeTitle,
       eyebrow: `${node.category} / ${node.kind}`,
       description: node.description,
       sections: [
@@ -485,7 +506,7 @@ export function buildNodeTooltip(
   }
 
   return {
-    title: node.label,
+    title: nodeTitle,
     eyebrow: `${node.category} / ${node.kind}`,
     description: node.description,
     sections: [

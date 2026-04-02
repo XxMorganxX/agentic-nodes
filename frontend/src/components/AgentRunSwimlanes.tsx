@@ -47,6 +47,8 @@ const EVENT_TYPE_DISPLAY_ORDER = [
   "retry.triggered",
   "run.completed",
   "run.failed",
+  "run.cancelled",
+  "run.interrupted",
 ] as const;
 
 function compareEventTypes(left: string, right: string): number {

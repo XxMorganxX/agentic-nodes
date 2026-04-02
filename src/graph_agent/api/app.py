@@ -14,6 +14,7 @@ from graph_agent.api.manager import GraphRunManager
 
 class RunRequest(BaseModel):
     input: Any
+    agent_ids: Optional[list[str]] = None
 
 
 class ProviderPreflightRequest(BaseModel):
@@ -228,13 +229,25 @@ def toggle_mcp_tool(tool_name: str, request: ToolToggleRequest) -> dict[str, Any
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/graphs/{graph_id}/runs")
+def list_graph_runs(graph_id: str, limit: int = 50) -> dict[str, Any]:
+    return {"runs": manager.list_runs(graph_id, limit=limit)}
+
+
 @app.post("/api/graphs/{graph_id}/runs")
 def start_run(graph_id: str, request: RunRequest) -> dict[str, str]:
     try:
-        run_id = manager.start_run(graph_id, request.input)
+        run_id = manager.start_run(graph_id, request.input, agent_ids=request.agent_ids)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Unknown graph '{graph_id}'.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"run_id": run_id}
+
+
+@app.post("/api/runtime/reset")
+def reset_runtime() -> dict[str, Any]:
+    return manager.reset_runtime()
 
 
 @app.get("/api/runs/{run_id}")

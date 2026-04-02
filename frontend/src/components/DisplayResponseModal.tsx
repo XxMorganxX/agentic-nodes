@@ -1,9 +1,11 @@
 import { useEffect, useMemo } from "react";
 import type { MouseEvent } from "react";
 
-import type { GraphNode, RunState } from "../lib/types";
+import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
+import type { GraphDefinition, GraphNode, RunState } from "../lib/types";
 
 type DisplayResponseModalProps = {
+  graph: GraphDefinition;
   node: GraphNode;
   runState: RunState | null;
   onClose: () => void;
@@ -26,7 +28,8 @@ function resolveDisplayEnvelope(node: GraphNode, runState: RunState | null): unk
   return nodeOutput ?? null;
 }
 
-export function DisplayResponseModal({ node, runState, onClose }: DisplayResponseModalProps) {
+export function DisplayResponseModal({ graph, node, runState, onClose }: DisplayResponseModalProps) {
+  const nodeLabel = getNodeInstanceLabel(graph, node);
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
@@ -58,7 +61,7 @@ export function DisplayResponseModal({ node, runState, onClose }: DisplayRespons
         <div className="tool-details-modal-header">
           <div>
             <div className="tool-details-modal-eyebrow">Data Display Response</div>
-            <h3 id="display-response-modal-title">{node.label}</h3>
+            <h3 id="display-response-modal-title">{nodeLabel}</h3>
             <p>Inspect the full resolved envelope captured by this display node during the current or latest run.</p>
           </div>
           <button type="button" className="secondary-button" onClick={onClose}>

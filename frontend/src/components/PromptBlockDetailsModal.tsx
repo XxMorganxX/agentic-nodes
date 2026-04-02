@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import type { ChangeEvent, MouseEvent } from "react";
 
+import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
 import { insertTokenAtEnd, listPromptBlockAvailableVariables, PROMPT_BLOCK_STARTERS, renderPromptBlockPreview } from "../lib/promptBlockEditor";
 import type { GraphDefinition, GraphNode, RunState } from "../lib/types";
 
@@ -30,6 +31,7 @@ export function PromptBlockDetailsModal({
   onGraphChange,
   onClose,
 }: PromptBlockDetailsModalProps) {
+  const nodeLabel = getNodeInstanceLabel(graph, node);
   const availableVariables = listPromptBlockAvailableVariables(graph);
   const renderedPreview = renderPromptBlockPreview(node, graph, runState);
 
@@ -115,7 +117,7 @@ export function PromptBlockDetailsModal({
         <div className="tool-details-modal-header">
           <div>
             <div className="tool-details-modal-eyebrow">Prompt Block Details</div>
-            <h3 id="prompt-block-details-modal-title">{node.label}</h3>
+            <h3 id="prompt-block-details-modal-title">{nodeLabel}</h3>
             <p>Edit this message block in a dedicated modal and preview the rendered prompt with current graph variables.</p>
           </div>
           <button type="button" className="secondary-button" onClick={onClose}>

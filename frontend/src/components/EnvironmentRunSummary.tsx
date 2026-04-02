@@ -37,12 +37,24 @@ export function EnvironmentRunSummary({ summary }: EnvironmentRunSummaryProps) {
           <dd>{summary.failedAgents}</dd>
         </div>
         <div>
+          <dt>Cancelled</dt>
+          <dd>{summary.cancelledAgents}</dd>
+        </div>
+        <div>
+          <dt>Interrupted</dt>
+          <dd>{summary.interruptedAgents}</dd>
+        </div>
+        <div>
           <dt>Queued</dt>
           <dd>{summary.queuedAgents}</dd>
         </div>
         <div>
           <dt>Elapsed</dt>
           <dd>{summary.elapsedLabel}</dd>
+        </div>
+        <div>
+          <dt>Last Heartbeat</dt>
+          <dd>{summary.lastHeartbeatLabel}</dd>
         </div>
       </dl>
       <div className="environment-run-summary-active">

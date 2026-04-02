@@ -6,6 +6,7 @@ import type {
   RuntimeEvent,
   TestEnvironmentDefinition,
 } from "./types";
+import { buildNodeInstanceLabelMap } from "./nodeInstanceLabels";
 
 export type EnvironmentRunSummary = {
   runId: string | null;
@@ -14,11 +15,14 @@ export type EnvironmentRunSummary = {
   completedAgents: number;
   runningAgents: number;
   failedAgents: number;
+  cancelledAgents: number;
+  interruptedAgents: number;
   queuedAgents: number;
   activeAgentNames: string[];
   focusedAgentId: string | null;
   focusedAgentName: string | null;
   elapsedLabel: string;
+  lastHeartbeatLabel: string;
 };
 
 export type AgentRunMilestone = {
@@ -95,8 +99,28 @@ export type FocusedRunSummary = {
   errorCount: number;
   retryCount: number;
   elapsedLabel: string;
+  lastHeartbeatLabel: string;
   finalOutput: unknown;
   nodeErrors: Record<string, unknown>;
+};
+
+export type FocusedRunNodeState = {
+  nodeId: string;
+  isActive: boolean;
+  wasVisited: boolean;
+  hasError: boolean;
+  latestOutput: unknown;
+  latestError: unknown;
+  visitCount: number;
+};
+
+export type FocusedRunProjection = {
+  normalizedEvents: RuntimeEvent[];
+  completedNodeIds: Set<string>;
+  nodeStates: Record<string, FocusedRunNodeState>;
+  errorSummaries: AgentRunErrorSummary[];
+  runSummary: FocusedRunSummary;
+  eventGroups: FocusedEventGroup[];
 };
 
 export function formatRunStatusLabel(status: string | null | undefined): string {
@@ -235,7 +259,7 @@ function summarizeNodeErrors(nodeErrors: Record<string, unknown>, labels: Map<st
 }
 
 function nodeLabelMap(graph: GraphDefinition | null): Map<string, string> {
-  return new Map((graph?.nodes ?? []).map((node) => [node.id, node.label]));
+  return buildNodeInstanceLabelMap(graph);
 }
 
 function completedNodeIds(events: RuntimeEvent[]): Set<string> {
@@ -245,6 +269,10 @@ function completedNodeIds(events: RuntimeEvent[]): Set<string> {
       .map((event) => (typeof event.payload.node_id === "string" ? event.payload.node_id : ""))
       .filter((nodeId) => nodeId.length > 0),
   );
+}
+
+function hasOwnRecordValue(record: Record<string, unknown> | null | undefined, key: string): boolean {
+  return Boolean(record && Object.prototype.hasOwnProperty.call(record, key));
 }
 
 function graphByAgent(environment: TestEnvironmentDefinition): Map<string, GraphDefinition> {
@@ -287,6 +315,13 @@ function formatElapsed(startedAt: string | null | undefined, endedAt: string | n
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = seconds % 60;
   return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+}
+
+function formatHeartbeat(timestamp: string | null | undefined): string {
+  if (!timestamp) {
+    return "n/a";
+  }
+  return formatTimestamp(timestamp, true);
 }
 
 function formatDurationMs(durationMs: number): string {
@@ -352,11 +387,25 @@ function nodeIdFromEvent(event: RuntimeEvent): string | null {
   return typeof payloadNodeId === "string" && payloadNodeId.length > 0 ? payloadNodeId : null;
 }
 
+function incomingSourceNodeLabels(nodeId: string | null, graph: GraphDefinition | null, labels: Map<string, string>): string[] {
+  if (!nodeId || !graph) {
+    return [];
+  }
+  const sourceNodeIds = graph.edges
+    .filter((edge) => edge.target_id === nodeId)
+    .map((edge) => edge.source_id)
+    .filter((sourceId, index, values) => values.indexOf(sourceId) === index);
+  return sourceNodeIds.map((sourceId) => {
+    const sourceLabel = labels.get(sourceId) ?? sourceId;
+    return sourceLabel === sourceId ? sourceId : `${sourceLabel} (${sourceId})`;
+  });
+}
+
 function eventTone(eventType: string): AgentRunMilestone["tone"] {
   if (eventType === "run.completed" || eventType === "node.completed") {
     return "success";
   }
-  if (eventType === "run.failed") {
+  if (eventType === "run.failed" || eventType === "run.cancelled" || eventType === "run.interrupted") {
     return "danger";
   }
   if (eventType === "run.started" || eventType === "node.started" || eventType === "retry.triggered") {
@@ -378,6 +427,12 @@ function milestoneLabel(event: RuntimeEvent, graph: GraphDefinition | null): str
   }
   if (eventType === "run.failed") {
     return "Run failed";
+  }
+  if (eventType === "run.cancelled") {
+    return "Run cancelled";
+  }
+  if (eventType === "run.interrupted") {
+    return "Run interrupted";
   }
   if (eventType === "node.started") {
     return nodeLabel ? `${nodeLabel} started` : "Node started";
@@ -512,6 +567,14 @@ function buildMilestoneDetails(
   if (typeof payload.visit_count === "number") {
     details.push({ label: "Visit", value: `#${payload.visit_count}` });
   }
+  if (event.event_type === "node.started") {
+    const sourceLabels = incomingSourceNodeLabels(nodeId, graph, labels);
+    if (sourceLabels.length === 1) {
+      details.push({ label: "Input source", value: sourceLabels[0] });
+    } else if (sourceLabels.length > 1) {
+      details.push({ label: "Input sources", value: sourceLabels.join(", ") });
+    }
+  }
   if (typeof payload.source_id === "string" && typeof payload.target_id === "string") {
     const sourceLabel = labels.get(payload.source_id) ?? payload.source_id;
     const targetLabel = labels.get(payload.target_id) ?? payload.target_id;
@@ -579,6 +642,17 @@ function buildMilestoneDataSections(
     }
     return sections;
   }
+  if (event.event_type === "run.cancelled") {
+    appendSection(sections, "Cancellation", payload.error, { allowNull: true });
+    if ("final_output" in payload) {
+      appendSection(sections, "Final output", payload.final_output, { allowNull: true });
+    }
+    return sections;
+  }
+  if (event.event_type === "run.interrupted") {
+    appendSection(sections, "Interruption", payload.error, { allowNull: true });
+    return sections;
+  }
   if (event.event_type === "condition.evaluated") {
     appendSection(sections, "Condition payload", payload);
     return sections;
@@ -614,17 +688,25 @@ export function buildEnvironmentRunSummary(
     return null;
   }
   const agentStates = Object.values(runState?.agent_runs ?? {});
+  const totalAgents = runState?.agent_runs ? agentStates.length : graph.agents.length;
   const runningAgents = agentStates.filter((state) => state.status === "running").length;
   const completedAgents = agentStates.filter((state) => state.status === "completed").length;
   const failedAgents = agentStates.filter((state) => state.status === "failed").length;
-  const queuedAgents = Math.max(0, graph.agents.length - runningAgents - completedAgents - failedAgents);
+  const cancelledAgents = agentStates.filter((state) => state.status === "cancelled").length;
+  const interruptedAgents = agentStates.filter((state) => state.status === "interrupted").length;
+  const queuedAgents = Math.max(
+    0,
+    totalAgents - runningAgents - completedAgents - failedAgents - cancelledAgents - interruptedAgents,
+  );
   return {
     runId: runState?.run_id ?? null,
     status: runState?.status ?? "idle",
-    totalAgents: graph.agents.length,
+    totalAgents,
     completedAgents,
     runningAgents,
     failedAgents,
+    cancelledAgents,
+    interruptedAgents,
     queuedAgents,
     activeAgentNames: graph.agents
       .filter((agent) => runState?.agent_runs?.[agent.agent_id]?.status === "running")
@@ -632,6 +714,7 @@ export function buildEnvironmentRunSummary(
     focusedAgentId: selectedAgentId,
     focusedAgentName: focusedGraphName(graph, selectedAgentId),
     elapsedLabel: formatElapsed(runState?.started_at, runState?.ended_at),
+    lastHeartbeatLabel: formatHeartbeat(runState?.last_heartbeat_at),
   };
 }
 
@@ -651,27 +734,24 @@ export function buildAgentRunLanes(
     const agentEvents = events
       .filter((event) => event.agent_id === agent.agent_id)
       .map((event) => ({ ...event, event_type: normalizeEventType(event.event_type) }));
-    const completedAgentNodeIds = completedNodeIds(agentEvents);
-    const errorSummaries = summarizeNodeErrors(agentState?.node_errors ?? {}, labels);
+    const projection = buildFocusedRunProjection(currentGraph, agentState, agentEvents);
+    const errorSummaries = projection.errorSummaries;
     const knownNodeOutputs: Record<string, unknown> = {};
     let previousTimestamp: string | null = null;
     return {
       agentId: agent.agent_id,
       agentName: agent.name,
-      status: agentState?.status ?? "idle",
-      runId: agentState?.run_id ?? null,
-      currentNodeId: agentState?.current_node_id ?? null,
-      currentNodeLabel:
-        (agentState?.current_node_id ? labels.get(agentState.current_node_id) : null) ??
-        agentState?.current_node_id ??
-        "n/a",
-      completedNodes: completedAgentNodeIds.size,
-      totalNodes: currentGraph?.nodes.length ?? 0,
-      transitionCount: agentState?.transition_history.length ?? 0,
+      status: projection.runSummary.status,
+      runId: projection.runSummary.runId,
+      currentNodeId: projection.runSummary.currentNodeId,
+      currentNodeLabel: projection.runSummary.currentNodeLabel,
+      completedNodes: projection.runSummary.completedNodes,
+      totalNodes: projection.runSummary.totalNodes,
+      transitionCount: projection.runSummary.transitionCount,
       errorCount: errorSummaries.length,
       errorSummaries,
-      retryCount: agentEvents.filter((event) => event.event_type === "retry.triggered").length,
-      elapsedLabel: formatElapsed(agentState?.started_at, agentState?.ended_at),
+      retryCount: projection.runSummary.retryCount,
+      elapsedLabel: projection.runSummary.elapsedLabel,
       milestones: agentEvents.map((event, index) => {
         const milestone = {
           id: `${agent.agent_id}-${event.timestamp}-${index}`,
@@ -708,30 +788,230 @@ function normalizeFocusedEvents(events: RuntimeEvent[]): RuntimeEvent[] {
   return events.map((event) => ({ ...event, event_type: normalizeEventType(event.event_type) }));
 }
 
+const syncInvariantWarnings = new Set<string>();
+
+function warnSyncInvariantOnce(key: string, details: Record<string, unknown>): void {
+  if (typeof window === "undefined" || syncInvariantWarnings.has(key)) {
+    return;
+  }
+  syncInvariantWarnings.add(key);
+  console.warn("[runVisualization] runtime projection sync invariant", details);
+}
+
+function setDifference(left: Set<string>, right: Set<string>): string[] {
+  return [...left].filter((value) => !right.has(value));
+}
+
+function deriveRunStatus(runState: RunState | null, normalizedEvents: RuntimeEvent[]): string {
+  const currentStatus = runState?.status?.trim();
+  if (currentStatus) {
+    return currentStatus;
+  }
+  const lastEventType = normalizedEvents[normalizedEvents.length - 1]?.event_type ?? null;
+  if (lastEventType === "run.completed") {
+    return "completed";
+  }
+  if (lastEventType === "run.failed") {
+    return "failed";
+  }
+  if (lastEventType === "run.interrupted") {
+    return "interrupted";
+  }
+  if (normalizedEvents.some((event) => event.event_type === "run.started")) {
+    return "running";
+  }
+  return "idle";
+}
+
+function deriveCurrentNodeId(runState: RunState | null, normalizedEvents: RuntimeEvent[]): string | null {
+  if (runState) {
+    return runState.current_node_id ?? null;
+  }
+  let currentNodeId: string | null = null;
+  for (const event of normalizedEvents) {
+    if (event.event_type === "node.started") {
+      currentNodeId = nodeIdFromEvent(event);
+      continue;
+    }
+    if (event.event_type === "node.completed" && nodeIdFromEvent(event) === currentNodeId) {
+      currentNodeId = null;
+      continue;
+    }
+    if (event.event_type === "run.completed" || event.event_type === "run.failed" || event.event_type === "run.interrupted") {
+      currentNodeId = null;
+    }
+  }
+  return currentNodeId;
+}
+
+function wasNodeVisited(nodeId: string, runState: RunState | null, completedNodeIdSet: Set<string>): boolean {
+  if (!runState) {
+    return completedNodeIdSet.has(nodeId);
+  }
+  return (
+    (runState.visit_counts?.[nodeId] ?? 0) > 0 ||
+    hasOwnRecordValue(runState.node_outputs, nodeId) ||
+    hasOwnRecordValue(runState.node_errors, nodeId)
+  );
+}
+
+/** Latest `node.completed` output per node id (successive completions overwrite; supports progressive nodes). */
+export function latestOutputsFromCompletedNodeEvents(normalizedEvents: RuntimeEvent[]): Record<string, unknown> {
+  const outputs: Record<string, unknown> = {};
+  for (const event of normalizedEvents) {
+    if (event.event_type !== "node.completed") {
+      continue;
+    }
+    const nodeId = nodeIdFromEvent(event);
+    if (!nodeId || !Object.prototype.hasOwnProperty.call(event.payload, "output")) {
+      continue;
+    }
+    outputs[nodeId] = event.payload.output;
+  }
+  return outputs;
+}
+
+function latestNodeOutputsByEvent(normalizedEvents: RuntimeEvent[]): Record<string, unknown> {
+  return latestOutputsFromCompletedNodeEvents(normalizedEvents);
+}
+
+function buildFocusedNodeStates(
+  graph: GraphDefinition | null,
+  runState: RunState | null,
+  normalizedEvents: RuntimeEvent[],
+  completedNodeIdSet: Set<string>,
+  currentNodeId: string | null,
+): Record<string, FocusedRunNodeState> {
+  const latestEventOutputs = latestNodeOutputsByEvent(normalizedEvents);
+  return Object.fromEntries(
+    (graph?.nodes ?? []).map((node) => {
+      const latestError = runState?.node_errors?.[node.id];
+      const latestOutput = Object.prototype.hasOwnProperty.call(latestEventOutputs, node.id)
+        ? latestEventOutputs[node.id]
+        : runState?.node_outputs?.[node.id];
+      return [
+        node.id,
+        {
+          nodeId: node.id,
+          isActive: currentNodeId === node.id,
+          wasVisited: wasNodeVisited(node.id, runState, completedNodeIdSet),
+          hasError: latestError != null,
+          latestOutput,
+          latestError,
+          visitCount: runState?.visit_counts?.[node.id] ?? 0,
+        },
+      ] satisfies [string, FocusedRunNodeState];
+    }),
+  );
+}
+
+function validateFocusedRunProjection(
+  runState: RunState | null,
+  normalizedEvents: RuntimeEvent[],
+  completedNodeIdSet: Set<string>,
+  currentNodeId: string | null,
+): void {
+  if (!runState) {
+    return;
+  }
+  const historyCompletedNodeIds = completedNodeIds(normalizeFocusedEvents(runState.event_history ?? []));
+  const missingFromProjection = setDifference(historyCompletedNodeIds, completedNodeIdSet);
+  const missingFromHistory = setDifference(completedNodeIdSet, historyCompletedNodeIds);
+  if (missingFromProjection.length > 0 || missingFromHistory.length > 0) {
+    warnSyncInvariantOnce(
+      `completed:${runState.run_id}:${missingFromProjection.join(",")}:${missingFromHistory.join(",")}`,
+      {
+        runId: runState.run_id,
+        projectionCompletedNodeIds: [...completedNodeIdSet],
+        historyCompletedNodeIds: [...historyCompletedNodeIds],
+        missingFromProjection,
+        missingFromHistory,
+      },
+    );
+  }
+  if ((runState.current_node_id ?? null) !== currentNodeId) {
+    warnSyncInvariantOnce(`current-node:${runState.run_id}:${runState.current_node_id ?? "none"}:${currentNodeId ?? "none"}`, {
+      runId: runState.run_id,
+      projectedCurrentNodeId: currentNodeId,
+      runStateCurrentNodeId: runState.current_node_id ?? null,
+      lastEventType: normalizedEvents[normalizedEvents.length - 1]?.event_type ?? null,
+    });
+  }
+}
+
+function buildFocusedEventGroupsFromNormalizedEvents(
+  graph: GraphDefinition | null,
+  normalizedEvents: RuntimeEvent[],
+): FocusedEventGroup[] {
+  const groups: FocusedEventGroup[] = [];
+  for (let index = 0; index < normalizedEvents.length; index += 1) {
+    const event = normalizedEvents[index];
+    if (event.event_type === "node.started") {
+      const nextEvent = normalizedEvents[index + 1];
+      const sameNodeCompleted =
+        nextEvent &&
+        nextEvent.event_type === "node.completed" &&
+        nodeIdFromEvent(nextEvent) === nodeIdFromEvent(event);
+      groups.push(
+        buildExecutionGroup(
+          `node-${event.timestamp}-${index}`,
+          graph,
+          event,
+          sameNodeCompleted ? nextEvent : null,
+        ),
+      );
+      if (sameNodeCompleted) {
+        index += 1;
+      }
+      continue;
+    }
+    groups.push(buildSingleEventGroup(`event-${event.timestamp}-${index}`, event));
+  }
+  return groups.reverse();
+}
+
+export function buildFocusedRunProjection(
+  graph: GraphDefinition | null,
+  runState: RunState | null,
+  events: RuntimeEvent[],
+): FocusedRunProjection {
+  const labels = nodeLabelMap(graph);
+  const normalizedEvents = normalizeFocusedEvents(events);
+  const completedNodeIdSet = completedNodeIds(normalizedEvents);
+  const currentNodeId = deriveCurrentNodeId(runState, normalizedEvents);
+  const errorSummaries = summarizeNodeErrors(runState?.node_errors ?? {}, labels);
+  const nodeStates = buildFocusedNodeStates(graph, runState, normalizedEvents, completedNodeIdSet, currentNodeId);
+  validateFocusedRunProjection(runState, normalizedEvents, completedNodeIdSet, currentNodeId);
+  return {
+    normalizedEvents,
+    completedNodeIds: completedNodeIdSet,
+    nodeStates,
+    errorSummaries,
+    runSummary: {
+      runId: runState?.run_id ?? null,
+      status: deriveRunStatus(runState, normalizedEvents),
+      currentNodeId,
+      currentNodeLabel: (currentNodeId ? labels.get(currentNodeId) : null) ?? currentNodeId ?? "n/a",
+      completedNodes: Object.values(nodeStates).filter((nodeState) => nodeState.wasVisited).length,
+      totalNodes: graph?.nodes.length ?? 0,
+      transitionCount: runState?.transition_history.length ?? 0,
+      errorCount: errorSummaries.length,
+      retryCount: normalizedEvents.filter((event) => event.event_type === "retry.triggered").length,
+      elapsedLabel: formatElapsed(runState?.started_at, runState?.ended_at),
+      lastHeartbeatLabel: formatHeartbeat(runState?.last_heartbeat_at),
+      finalOutput: runState?.final_output ?? null,
+      nodeErrors: runState?.node_errors ?? {},
+    },
+    eventGroups: buildFocusedEventGroupsFromNormalizedEvents(graph, normalizedEvents),
+  };
+}
+
 export function buildFocusedRunSummary(
   graph: GraphDefinition | null,
   runState: RunState | null,
   events: RuntimeEvent[],
 ): FocusedRunSummary {
-  const labels = nodeLabelMap(graph);
-  const normalizedEvents = normalizeFocusedEvents(events);
-  const completedNodeIdSet = completedNodeIds(normalizedEvents);
-  const errorCount = summarizeNodeErrors(runState?.node_errors ?? {}, labels).length;
-  return {
-    runId: runState?.run_id ?? null,
-    status: runState?.status ?? "idle",
-    currentNodeId: runState?.current_node_id ?? null,
-    currentNodeLabel:
-      (runState?.current_node_id ? labels.get(runState.current_node_id) : null) ?? runState?.current_node_id ?? "n/a",
-    completedNodes: completedNodeIdSet.size,
-    totalNodes: graph?.nodes.length ?? 0,
-    transitionCount: runState?.transition_history.length ?? 0,
-    errorCount,
-    retryCount: normalizedEvents.filter((event) => event.event_type === "retry.triggered").length,
-    elapsedLabel: formatElapsed(runState?.started_at, runState?.ended_at),
-    finalOutput: runState?.final_output ?? null,
-    nodeErrors: runState?.node_errors ?? {},
-  };
+  return buildFocusedRunProjection(graph, runState, events).runSummary;
 }
 
 function buildExecutionGroup(
@@ -783,31 +1063,7 @@ export function buildFocusedEventGroups(
   events: RuntimeEvent[],
 ): FocusedEventGroup[] {
   const normalizedEvents = normalizeFocusedEvents(events);
-  const groups: FocusedEventGroup[] = [];
-  for (let index = 0; index < normalizedEvents.length; index += 1) {
-    const event = normalizedEvents[index];
-    if (event.event_type === "node.started") {
-      const nextEvent = normalizedEvents[index + 1];
-      const sameNodeCompleted =
-        nextEvent &&
-        nextEvent.event_type === "node.completed" &&
-        nodeIdFromEvent(nextEvent) === nodeIdFromEvent(event);
-      groups.push(
-        buildExecutionGroup(
-          `node-${event.timestamp}-${index}`,
-          graph,
-          event,
-          sameNodeCompleted ? nextEvent : null,
-        ),
-      );
-      if (sameNodeCompleted) {
-        index += 1;
-      }
-      continue;
-    }
-    groups.push(buildSingleEventGroup(`event-${event.timestamp}-${index}`, event));
-  }
-  return groups.reverse();
+  return buildFocusedEventGroupsFromNormalizedEvents(graph, normalizedEvents);
 }
 
 export function nodeById(graph: GraphDefinition | null, nodeId: string | null): GraphNode | null {

@@ -21,7 +21,10 @@ import {
 } from "../lib/editor";
 import { warnGraphDiagnostic } from "../lib/dragDiagnostics";
 import { buildNodeTooltip } from "../lib/nodeTooltip";
+import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
 import type { NodeTooltipData } from "../lib/nodeTooltip";
+import { getContextBuilderBindings } from "../lib/contextBuilderBindings";
+import type { ContextBuilderRuntimeView } from "../lib/contextBuilderRuntime";
 import { formatRunStatusLabel } from "../lib/runVisualization";
 import type { EditorCatalog, GraphDefinition, GraphNode, RunState } from "../lib/types";
 
@@ -31,6 +34,9 @@ export type GraphCanvasNodeData = {
   tooltipGraph?: GraphDefinition | null;
   catalog: EditorCatalog | null;
   runState: RunState | null;
+  runtimeOutput?: unknown;
+  contextBuilderRuntime?: ContextBuilderRuntimeView | null;
+  contextBuilderRuntimeKey?: string;
   kindColor: string;
   status: "idle" | "active" | "success" | "failed" | "unreached";
   isConnectionMagnetized?: boolean;
@@ -115,6 +121,9 @@ function isContextBooted(catalog: EditorCatalog | null, node: GraphNode): boolea
 }
 
 function contextBuilderPlaceholderCount(graph: GraphDefinition | null, node: GraphNode): number {
+  if (graph && node.provider_id === "core.context_builder") {
+    return getContextBuilderBindings(node, graph).length;
+  }
   const configuredSourceIds = Array.isArray(node.config.input_bindings)
     ? node.config.input_bindings
         .map((binding) =>
@@ -140,6 +149,8 @@ function GraphCanvasNodeComponent({
     tooltipGraph = null,
     catalog,
     runState,
+    runtimeOutput,
+    contextBuilderRuntime = null,
     kindColor,
     status,
     isConnectionMagnetized = false,
@@ -159,18 +170,18 @@ function GraphCanvasNodeComponent({
   const isModelNode = isApiModelNode(node);
   const isDisplayNode = node.provider_id === "core.data_display";
   const isContextBuilderNode = node.provider_id === "core.context_builder";
-  const nodeOutput = runState?.node_outputs?.[node.id];
+  const displayLabel = getNodeInstanceLabel(graph, node);
   const displayEnvelope =
     isDisplayNode &&
-    nodeOutput &&
-    typeof nodeOutput === "object" &&
-    nodeOutput !== null &&
-    "artifacts" in nodeOutput &&
-    typeof nodeOutput.artifacts === "object" &&
-    nodeOutput.artifacts !== null &&
-    "display_envelope" in nodeOutput.artifacts
-      ? nodeOutput.artifacts.display_envelope
-      : nodeOutput;
+    runtimeOutput &&
+    typeof runtimeOutput === "object" &&
+    runtimeOutput !== null &&
+    "artifacts" in runtimeOutput &&
+    typeof runtimeOutput.artifacts === "object" &&
+    runtimeOutput.artifacts !== null &&
+    "display_envelope" in runtimeOutput.artifacts
+      ? runtimeOutput.artifacts.display_envelope
+      : runtimeOutput;
   const displayText = isDisplayNode
     ? status === "active"
       ? "Running..."
@@ -180,23 +191,39 @@ function GraphCanvasNodeComponent({
     : null;
   const contextBuilderPayload =
     isContextBuilderNode &&
-    nodeOutput &&
-    typeof nodeOutput === "object" &&
-    nodeOutput !== null &&
-    "payload" in nodeOutput
-      ? nodeOutput.payload
-      : nodeOutput;
+    runtimeOutput &&
+    typeof runtimeOutput === "object" &&
+    runtimeOutput !== null &&
+    "payload" in runtimeOutput
+      ? runtimeOutput.payload
+      : runtimeOutput;
+  const contextBuilderForwardLine = contextBuilderRuntime
+    ? contextBuilderRuntime.isWaitingToForward
+      ? "Waiting to forward until every input is resolved and the merge is complete."
+      : contextBuilderRuntime.contextBuilderComplete === true
+        ? "All inputs resolved — payload forwarded downstream when the run continues."
+        : null
+    : null;
   const contextBuilderDisplayText = isContextBuilderNode
-    ? status === "active"
+    ? status === "active" && !contextBuilderRuntime && contextBuilderPayload === undefined
       ? "Running..."
       : contextBuilderPayload !== undefined
-        ? formatInlineDisplayValue(contextBuilderPayload)
-        : "Run the graph to inspect the exact payload produced here."
+        ? [formatInlineDisplayValue(contextBuilderPayload), contextBuilderForwardLine].filter(Boolean).join("\n\n")
+        : contextBuilderRuntime && contextBuilderRuntime.totalCount > 0
+          ? [
+              contextBuilderForwardLine,
+              status === "active"
+                ? "Streaming inputs as upstream nodes finish."
+                : "Run the graph to stream each input into the merged payload.",
+            ]
+              .filter(Boolean)
+              .join("\n\n")
+          : "Run the graph to inspect the exact payload produced here."
     : null;
   let tooltip: NodeTooltipData = FALLBACK_TOOLTIP;
   if (tooltipVisible && !preview && !isWireJunction) {
     try {
-      tooltip = buildNodeTooltip(node, tooltipGraph, catalog, runState);
+      tooltip = buildNodeTooltip({ ...node, label: displayLabel }, tooltipGraph, catalog, runState);
     } catch (error) {
       warnGraphDiagnostic("GraphCanvasNode", "tooltip fallback", error, {
         nodeId: node.id,
@@ -240,9 +267,13 @@ function GraphCanvasNodeComponent({
       : node.provider_label ?? node.provider_id;
   const contextBuilderCount = isContextBuilderNode ? contextBuilderPlaceholderCount(graph, node) : 0;
   const contextBuilderSummary = isContextBuilderNode
-    ? contextBuilderCount > 0
-      ? `${contextBuilderCount} named input${contextBuilderCount === 1 ? "" : "s"}`
-      : "Connect text inputs to build placeholders"
+    ? contextBuilderRuntime && contextBuilderRuntime.totalCount > 0
+      ? `${contextBuilderRuntime.fulfilledCount + contextBuilderRuntime.errorCount}/${contextBuilderRuntime.totalCount} inputs settled${
+          contextBuilderRuntime.errorCount > 0 ? ` (${contextBuilderRuntime.errorCount} error${contextBuilderRuntime.errorCount === 1 ? "" : "s"})` : ""
+        }${contextBuilderRuntime.isWaitingToForward ? " · holding downstream" : ""}`
+      : contextBuilderCount > 0
+        ? `${contextBuilderCount} named input${contextBuilderCount === 1 ? "" : "s"}`
+        : "Connect text inputs to build placeholders"
     : null;
   const isContextConnected = isContextProviderNode ? hasContextConnection(graph, node) : false;
   const contextBooted = isContextProviderNode ? isContextBooted(catalog, node) : false;
@@ -318,7 +349,7 @@ function GraphCanvasNodeComponent({
         } as CSSProperties
       }
       tabIndex={preview ? -1 : 0}
-      aria-label={`${node.label} ${node.kind} node`}
+      aria-label={`${displayLabel} ${node.kind} node`}
       onContextMenu={(event) => {
         if (preview) {
           return;
@@ -356,7 +387,7 @@ function GraphCanvasNodeComponent({
             {iconLabel}
           </div>
           <div className="graph-node-body">
-            <strong className="graph-node-title">{node.label}</strong>
+            <strong className="graph-node-title">{displayLabel}</strong>
             <div className="graph-node-subtitle">{subtitle}</div>
           </div>
           <div className="graph-node-badge" aria-label={`Node status: ${statusLabel}`}>
@@ -394,7 +425,7 @@ function GraphCanvasNodeComponent({
                 onOpenContextBuilderPayload(node.id);
               }
             }}
-            aria-label={`Open full payload for ${node.label}`}
+            aria-label={`Open full payload for ${displayLabel}`}
           >
             <div className="graph-node-inline-display-header">Resolved Payload</div>
             <pre className="graph-node-inline-display-body">{contextBuilderDisplayText}</pre>
@@ -418,7 +449,7 @@ function GraphCanvasNodeComponent({
                 onOpenDisplayResponse(node.id);
               }
             }}
-            aria-label={`Open full response for ${node.label}`}
+            aria-label={`Open full response for ${displayLabel}`}
           >
             <div className="graph-node-inline-display-header">Run Envelope</div>
             <pre className="graph-node-inline-display-body">{displayText}</pre>

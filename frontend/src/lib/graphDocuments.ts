@@ -115,5 +115,5 @@ export function filterEventsForAgent(
   if (!selectedAgentId || events.every((event) => !event.agent_id)) {
     return events;
   }
-  return events.filter((event) => !event.agent_id || event.agent_id === selectedAgentId);
+  return events.filter((event) => event.agent_id === selectedAgentId);
 }

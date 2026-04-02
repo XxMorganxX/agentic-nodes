@@ -6,6 +6,7 @@ import type {
   ProviderDiagnosticsResult,
   ProviderPreflightResult,
   RunState,
+  StartRunOptions,
   ToolDefinition,
 } from "./types";
 
@@ -226,13 +227,16 @@ export async function setMcpToolEnabled(toolName: string, enabled: boolean): Pro
   return (await response.json()) as ToolDefinition;
 }
 
-export async function startRun(graphId: string, input: string): Promise<string> {
+export async function startRun(graphId: string, input: string, options?: StartRunOptions): Promise<string> {
   const response = await fetch(`${API_BASE_URL}/api/graphs/${graphId}/runs`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ input }),
+    body: JSON.stringify({
+      input,
+      agent_ids: options?.agent_ids,
+    }),
   });
 
   if (!response.ok) {
@@ -241,6 +245,28 @@ export async function startRun(graphId: string, input: string): Promise<string> 
 
   const payload = (await response.json()) as { run_id: string };
   return payload.run_id;
+}
+
+export async function resetRuntime(): Promise<{
+  cancelled_run_ids: string[];
+  cancelled_run_count: number;
+  stopped_mcp_server_ids: string[];
+  stopped_mcp_server_count: number;
+  discord_stopped: boolean;
+}> {
+  const response = await fetch(`${API_BASE_URL}/api/runtime/reset`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error("Failed to reset runtime.");
+  }
+  return (await response.json()) as {
+    cancelled_run_ids: string[];
+    cancelled_run_count: number;
+    stopped_mcp_server_ids: string[];
+    stopped_mcp_server_count: number;
+    discord_stopped: boolean;
+  };
 }
 
 export async function fetchRun(runId: string): Promise<RunState> {

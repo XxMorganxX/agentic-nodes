@@ -57,7 +57,14 @@ import { clearHotbarFavorite, getHotbarFavorites, setHotbarFavorite } from "../l
 import type { HotbarFavorites } from "../lib/hotbarFavorites";
 import { deleteSavedNode, getSavedNodes, saveNodeToLibrary } from "../lib/savedNodes";
 import type { SavedNode } from "../lib/savedNodes";
-import { formatRunStatusLabel, type AgentRunLane, type FocusedEventGroup, type FocusedRunSummary } from "../lib/runVisualization";
+import { buildContextBuilderRuntimeView } from "../lib/contextBuilderRuntime";
+import {
+  formatRunStatusLabel,
+  type AgentRunLane,
+  type FocusedEventGroup,
+  type FocusedRunProjection,
+  type FocusedRunSummary,
+} from "../lib/runVisualization";
 import type { EditorCatalog, GraphDefinition, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition, RunState, RuntimeEvent } from "../lib/types";
 
 type GraphCanvasProps = {
@@ -72,6 +79,7 @@ type GraphCanvasProps = {
   environmentAgents?: AgentRunLane[];
   selectedAgentId?: string | null;
   onSelectAgent?: (agentId: string) => void;
+  runProjection?: FocusedRunProjection | null;
   runSummary?: FocusedRunSummary | null;
   eventGroups?: FocusedEventGroup[];
   catalog: EditorCatalog | null;
@@ -307,15 +315,6 @@ type JunctionDragState = {
 type GraphCanvasRuntimeNodeData = GraphCanvasNodeData & {
   isConnectionMagnetized?: boolean;
 };
-
-function completedNodeIdSet(runState: RunState | null): Set<string> {
-  return new Set(
-    (runState?.event_history ?? [])
-      .filter((event) => event.event_type === "node.completed")
-      .map((event) => (typeof event.payload.node_id === "string" ? event.payload.node_id : ""))
-      .filter((nodeId) => nodeId.length > 0),
-  );
-}
 
 type DragDiagnosticSession = {
   active: boolean;
@@ -694,6 +693,12 @@ function DrawerActionButton({ tab, activeTab, drawerOpen, label, onClick, childr
   );
 }
 
+const MILESTONE_CHAT_MAX_VISIBLE = 6;
+/** Max age before a line is dropped; opacity eases over this window (not linear). */
+const MILESTONE_CHAT_MAX_AGE_MS = 14_000;
+/** Ticks + CSS transition interpolate smoothly between updates. */
+const MILESTONE_CHAT_TICK_MS = 300;
+
 export function GraphCanvas({
   graph,
   runState,
@@ -706,6 +711,7 @@ export function GraphCanvas({
   environmentAgents = [],
   selectedAgentId = null,
   onSelectAgent,
+  runProjection = null,
   runSummary,
   eventGroups = [],
   catalog,
@@ -739,6 +745,7 @@ export function GraphCanvas({
   const [isCommandHeld, setIsCommandHeld] = useState(false);
   const [showHotkeys, setShowHotkeys] = useState(false);
   const [quickAddMinimized, setQuickAddMinimized] = useState(false);
+  const [milestoneChatNow, setMilestoneChatNow] = useState(() => Date.now());
   const [junctionDrag, setJunctionDrag] = useState<JunctionDragState | null>(null);
   const [waypointDrag, setWaypointDrag] = useState<WaypointDragState | null>(null);
   const [isNodeDragActive, setIsNodeDragActive] = useState(false);
@@ -808,8 +815,46 @@ export function GraphCanvas({
     () => graph?.nodes.find((node) => node.id === contextBuilderPayloadNodeId && node.provider_id === "core.context_builder") ?? null,
     [contextBuilderPayloadNodeId, graph],
   );
+  const contextBuilderModalRuntime = useMemo(() => {
+    if (!contextBuilderPayloadNode || !graph || !runState) {
+      return null;
+    }
+    const normalizedEvents = runProjection?.normalizedEvents ?? runState.event_history ?? [];
+    return buildContextBuilderRuntimeView(graph, contextBuilderPayloadNode, runState, normalizedEvents);
+  }, [contextBuilderPayloadNode, graph, runProjection?.normalizedEvents, runState]);
   const selectedNodeIdSet = useMemo(() => new Set(selectedNodeIds), [selectedNodeIds]);
   const selectedEdgeIdSet = useMemo(() => new Set(selectedEdgeIds), [selectedEdgeIds]);
+  const milestoneChatEntries = useMemo(() => {
+    const entries = environmentAgents
+      .flatMap((agent) =>
+        agent.milestones.map((milestone) => {
+          const parsedTimestampMs = Date.parse(milestone.timestamp);
+          const timestampMs = Number.isFinite(parsedTimestampMs) ? parsedTimestampMs : milestoneChatNow;
+          const ageMs = Math.max(0, milestoneChatNow - timestampMs);
+          return {
+            id: milestone.id,
+            label: milestone.label,
+            timestampMs,
+            ageMs,
+          };
+        }),
+      )
+      .filter((entry) => entry.ageMs <= MILESTONE_CHAT_MAX_AGE_MS)
+      .sort((left, right) => left.timestampMs - right.timestampMs)
+      .slice(-MILESTONE_CHAT_MAX_VISIBLE);
+    return entries.map((entry, index) => {
+      const positionFraction = entries.length > 1 ? index / (entries.length - 1) : 1;
+      const staggerBonusMs = (1 - positionFraction) * MILESTONE_CHAT_MAX_AGE_MS * 0.35;
+      const effectiveAge = entry.ageMs + staggerBonusMs;
+      const t = Math.min(1, effectiveAge / MILESTONE_CHAT_MAX_AGE_MS);
+      // Ease-out curve: stays readable longer, then tapers smoothly (not a harsh linear cliff).
+      const opacity = Math.max(0, Math.pow(1 - t, 1.35));
+      return {
+        ...entry,
+        opacity,
+      };
+    });
+  }, [environmentAgents, milestoneChatNow]);
 
   useRenderDiagnostics(
     "GraphCanvas",
@@ -825,6 +870,20 @@ export function GraphCanvas({
     },
     12,
   );
+
+  useEffect(() => {
+    const hasMilestones = environmentAgents.some((agent) => agent.milestones.length > 0);
+    if (!hasMilestones) {
+      return;
+    }
+    setMilestoneChatNow(Date.now());
+    const intervalId = window.setInterval(() => {
+      setMilestoneChatNow(Date.now());
+    }, MILESTONE_CHAT_TICK_MS);
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [environmentAgents]);
 
   const requestPrimarySelectionChange = useCallback(
     (nodeId: string | null, edgeId: string | null) => {
@@ -1699,14 +1758,11 @@ export function GraphCanvas({
           sourceHandleId === TOOL_CONTEXT_HANDLE_ID
             ? node.kind === "model"
               ? API_TOOL_CONTEXT_HANDLE_ID
-              : node.kind === "mcp_tool_executor"
-                ? null
               : null
             : null;
         if (
           sourceHandleId === TOOL_CONTEXT_HANDLE_ID &&
-          targetHandleId === null &&
-          node.kind !== "mcp_tool_executor"
+          targetHandleId === null
         ) {
           return;
         }
@@ -1839,8 +1895,8 @@ export function GraphCanvas({
     ) =>
       isMcpContextProviderNode(sourceNode) &&
       sourceHandleId === TOOL_CONTEXT_HANDLE_ID &&
-      ((targetNode?.kind === "model" && targetHandleId === API_TOOL_CONTEXT_HANDLE_ID) ||
-        (targetNode?.kind === "mcp_tool_executor" && targetHandleId === null)),
+      targetNode?.kind === "model" &&
+      targetHandleId === API_TOOL_CONTEXT_HANDLE_ID,
     [],
   );
 
@@ -2046,11 +2102,11 @@ export function GraphCanvas({
         (effectiveSourceHandleId === TOOL_CONTEXT_HANDLE_ID || effectiveTargetHandleId === API_TOOL_CONTEXT_HANDLE_ID) &&
         !isToolContextBindingConnection(sourceNode, targetNode, effectiveSourceHandleId, effectiveTargetHandleId)
       ) {
-        setEditorMessage("Tool context wires can only connect from a tool context port into an API node or MCP executor.");
+        setEditorMessage("Tool context wires can only connect from a tool context port into an API node.");
         return null;
       }
       if (isMcpContextProviderNode(sourceNode) && !isToolContextBindingConnection(sourceNode, targetNode, effectiveSourceHandleId, effectiveTargetHandleId)) {
-        setEditorMessage("MCP context providers can only create tool-context bindings into API nodes or MCP executors.");
+        setEditorMessage("MCP context providers can only create tool-context bindings into API nodes.");
         return null;
       }
       if (isPromptBlockNode(sourceNode) && !isPromptBlockBindingConnection(sourceNode, targetNode)) {
@@ -3309,18 +3365,41 @@ export function GraphCanvas({
     }
     const isRoutingDraftWire = draftConnection !== null && !isConnecting;
     const snapTargetNodeId = isRoutingDraftWire ? draftConnectionSnapTargetNodeId : null;
-  const completedNodeIds = completedNodeIdSet(runState);
     const nextNodeDataCache = new Map<string, GraphCanvasRuntimeNodeData>();
     const nextFlowNodeCache = new Map<string, FlowNode<GraphCanvasRuntimeNodeData>>();
+    const normalizedEvents = runProjection?.normalizedEvents ?? runState?.event_history ?? [];
     const nextNodes = graph.nodes.map((node): FlowNode<GraphCanvasRuntimeNodeData> => {
+      const runtimeNodeState = runProjection?.nodeStates[node.id];
       const isActive = runState?.current_node_id === node.id;
-      const hasError = Boolean(runState?.node_errors?.[node.id]);
-    const wasVisited = completedNodeIds.has(node.id);
-      const didLastRunFinish = runState?.status === "completed" || runState?.status === "failed";
+      const hasError = Object.prototype.hasOwnProperty.call(runState?.node_errors ?? {}, node.id);
+      const wasVisited =
+        (runState?.visit_counts?.[node.id] ?? 0) > 0 ||
+        Object.prototype.hasOwnProperty.call(runState?.node_outputs ?? {}, node.id) ||
+        hasError;
+      const didLastRunFinish =
+        runState?.status === "completed" ||
+        runState?.status === "failed" ||
+        runState?.status === "cancelled" ||
+        runState?.status === "interrupted";
       const expectsExecutionStatus = participatesInExecutionRoute(graph, node);
       const isConnectionMagnetized = isRoutingDraftWire && snapTargetNodeId === node.id;
       const kindColor = KIND_COLORS[node.kind] ?? "#8486a5";
-      const status: GraphCanvasNodeData["status"] = hasError
+      const contextBuilderRuntime =
+        node.provider_id === "core.context_builder"
+          ? buildContextBuilderRuntimeView(graph, node, runState, normalizedEvents)
+          : null;
+      const contextBuilderRuntimeKey = contextBuilderRuntime
+        ? [
+            contextBuilderRuntime.fulfilledCount,
+            contextBuilderRuntime.errorCount,
+            contextBuilderRuntime.totalCount,
+            contextBuilderRuntime.isWaitingToForward ? 1 : 0,
+            contextBuilderRuntime.holdingOutgoing ? 1 : 0,
+            contextBuilderRuntime.contextBuilderComplete === null ? "n" : contextBuilderRuntime.contextBuilderComplete ? "y" : "f",
+            ...contextBuilderRuntime.sources.map((s) => `${s.sourceNodeId}:${s.status}`),
+          ].join("|")
+        : "";
+      let status: GraphCanvasNodeData["status"] = hasError
         ? "failed"
         : isActive
           ? "active"
@@ -3329,6 +3408,9 @@ export function GraphCanvas({
             : didLastRunFinish && expectsExecutionStatus
               ? "unreached"
               : "idle";
+      if (contextBuilderRuntime?.isWaitingToForward && !hasError) {
+        status = "active";
+      }
       const tooltipVisible = tooltipNodeId === node.id;
       const tooltipGraph = tooltipVisible ? graph : null;
       const previousData = nodeDataCacheRef.current.get(node.id);
@@ -3341,6 +3423,8 @@ export function GraphCanvas({
         previousData.runState === runState &&
         previousData.kindColor === kindColor &&
         previousData.status === status &&
+        previousData.runtimeOutput === runtimeNodeState?.latestOutput &&
+        previousData.contextBuilderRuntimeKey === contextBuilderRuntimeKey &&
         previousData.isConnectionMagnetized === isConnectionMagnetized &&
         (previousData.preview === false || previousData.preview === undefined) &&
         previousData.tooltipVisible === tooltipVisible &&
@@ -3361,6 +3445,9 @@ export function GraphCanvas({
               runState,
               kindColor,
               status,
+              runtimeOutput: runtimeNodeState?.latestOutput,
+              contextBuilderRuntime,
+              contextBuilderRuntimeKey,
               isConnectionMagnetized,
               preview: false,
               tooltipVisible,
@@ -3411,7 +3498,30 @@ export function GraphCanvas({
       recordNodeBuildDiagnostic(performance.now() - diagnosticsStart);
     }
     return nextNodes;
-  }, [catalog, dragDiagnosticsEnabled, dragRenderTick, draftConnection?.sourceNodeId, draftConnectionSnapTargetNodeId, getFlowNodeDimensions, graph, handleJunctionPointerDown, handleNodeHandlePointerDown, handleOpenContextBuilderPayload, handleOpenDisplayResponse, handleOpenPromptBlockDetails, handleOpenProviderDetails, handleOpenToolDetails, handleToggleTooltip, isConnecting, isNodeDragActive, recordNodeBuildDiagnostic, runState, selectedNodeIdSet, tooltipNodeId]);
+  }, [
+    catalog,
+    dragDiagnosticsEnabled,
+    dragRenderTick,
+    draftConnection?.sourceNodeId,
+    draftConnectionSnapTargetNodeId,
+    getFlowNodeDimensions,
+    graph,
+    handleJunctionPointerDown,
+    handleNodeHandlePointerDown,
+    handleOpenContextBuilderPayload,
+    handleOpenDisplayResponse,
+    handleOpenPromptBlockDetails,
+    handleOpenProviderDetails,
+    handleOpenToolDetails,
+    handleToggleTooltip,
+    isConnecting,
+    isNodeDragActive,
+    recordNodeBuildDiagnostic,
+    runProjection,
+    runState,
+    selectedNodeIdSet,
+    tooltipNodeId,
+  ]);
 
   const edges = useMemo<FlowEdge<GraphCanvasEdgeData>[]>(() => {
     if (!graph) {
@@ -4121,6 +4231,15 @@ export function GraphCanvas({
               <span>Format</span>
             </button>
           </div>
+          {milestoneChatEntries.length > 0 ? (
+            <div className="graph-milestone-chat" role="log" aria-live="polite" aria-label="Recent environment milestones">
+              {milestoneChatEntries.map((entry) => (
+                <div key={entry.id} className="graph-milestone-chat-entry" style={{ opacity: entry.opacity }}>
+                  {entry.label}
+                </div>
+              ))}
+            </div>
+          ) : null}
           {graph.nodes.length === 0 ? (
             <div className="graph-empty-state">
               <strong>Start building your graph</strong>
@@ -4452,6 +4571,10 @@ export function GraphCanvas({
                         <dt>Elapsed</dt>
                         <dd>{runSummary?.elapsedLabel ?? "Not started"}</dd>
                       </div>
+                      <div>
+                        <dt>Last Heartbeat</dt>
+                        <dd>{runSummary?.lastHeartbeatLabel ?? runState?.last_heartbeat_at ?? "n/a"}</dd>
+                      </div>
                     </dl>
                     <div className="json-block">
                       <strong>Final Output</strong>
@@ -4497,12 +4620,14 @@ export function GraphCanvas({
         />
       ) : null}
       {displayResponseNode ? (
-        <DisplayResponseModal node={displayResponseNode} runState={runState} onClose={() => setDisplayResponseNodeId(null)} />
+        <DisplayResponseModal graph={graph} node={displayResponseNode} runState={runState} onClose={() => setDisplayResponseNodeId(null)} />
       ) : null}
       {contextBuilderPayloadNode ? (
         <ContextBuilderPayloadModal
+          graph={graph}
           node={contextBuilderPayloadNode}
           runState={runState}
+          runtimeView={contextBuilderModalRuntime}
           onClose={() => setContextBuilderPayloadNodeId(null)}
         />
       ) : null}

@@ -404,9 +404,7 @@ def _model_has_exposed_tool_context(graph: GraphDefinition, node: BaseNode) -> b
 
 
 def _node_supports_mcp_tool_context(node: BaseNode | None) -> bool:
-    return isinstance(node, ModelNode) or (
-        isinstance(node, McpToolExecutorNode) and bool(node.config.get("enable_follow_up_decision", False))
-    )
+    return isinstance(node, ModelNode)
 
 
 def _model_has_tool_output_route(graph: GraphDefinition, node: BaseNode) -> bool:
@@ -630,6 +628,27 @@ class NodeContext:
         if display_node_output is not None:
             return display_node_output
         return None
+
+    def latest_completed_output(self, node_id: str) -> Any:
+        """Full source envelope from completed execution, ignoring the current edge's routed slice."""
+        if node_id in self.state.node_outputs:
+            return self.state.node_outputs.get(node_id)
+        prompt_block_envelope = self.prompt_block_envelope_for_node(node_id)
+        if prompt_block_envelope is not None:
+            return prompt_block_envelope.to_dict()
+        display_node_output = self.display_node_output_for_node(node_id)
+        if display_node_output is not None:
+            return display_node_output
+        return None
+
+    def latest_completed_payload(self, node_id: str) -> Any:
+        output = self.latest_completed_output(node_id)
+        if isinstance(output, Mapping) and "schema_version" in output and "payload" in output:
+            try:
+                return MessageEnvelope.from_dict(output).payload
+            except Exception:  # noqa: BLE001
+                return output.get("payload")
+        return output
 
     def latest_error(self, node_id: str) -> Any:
         return self.state.node_errors.get(node_id)
@@ -1074,6 +1093,13 @@ class BaseNode(ABC):
         }
 
 
+def _incoming_edges_are_all_binding(graph: Any, node_id: str) -> bool:
+    edges = graph.get_incoming_edges(node_id)
+    if not edges:
+        return False
+    return all(edge.kind == "binding" for edge in edges)
+
+
 class InputNode(BaseNode):
     kind = "input"
 
@@ -1183,40 +1209,113 @@ class DataNode(BaseNode):
                     }
                 )
 
-        if bindings:
-            return bindings
+        has_explicit_input_bindings = bool(bindings)
+        if has_explicit_input_bindings:
+            configured_source_ids = {str(b.get("source_node_id", "")).strip() for b in bindings}
+            for edge in incoming_edges:
+                if edge.kind != "standard":
+                    continue
+                sid = edge.source_id
+                if sid == self.id or sid in configured_source_ids:
+                    continue
+                source_node = context.graph.nodes.get(sid)
+                if source_node is None or source_node.provider_id != "core.data_display":
+                    continue
+                placeholder = _slugify_context_builder_placeholder(
+                    source_node.label,
+                    fallback=sid,
+                )
+                bindings.append(
+                    {
+                        "source_node_id": sid,
+                        "placeholder": placeholder,
+                        "binding": {"type": "latest_payload", "source": sid},
+                    }
+                )
+                configured_source_ids.add(sid)
 
-        configured_sources = {str(binding["source_node_id"]) for binding in bindings}
-        for index, source_node_id in enumerate(incoming_source_ids):
-            if source_node_id in configured_sources:
-                continue
-            source_node = context.graph.nodes.get(source_node_id)
-            placeholder = _slugify_context_builder_placeholder(
-                source_node.label if source_node is not None else source_node_id,
-                fallback=f"source_{index + 1}",
-            )
-            bindings.append(
-                {
-                    "source_node_id": source_node_id,
-                    "placeholder": placeholder,
-                    "binding": {"type": "latest_payload", "source": source_node_id},
-                }
-            )
+        if not has_explicit_input_bindings:
+            for index, source_node_id in enumerate(incoming_source_ids):
+                source_node = context.graph.nodes.get(source_node_id)
+                placeholder = _slugify_context_builder_placeholder(
+                    source_node.label if source_node is not None else source_node_id,
+                    fallback=f"source_{index + 1}",
+                )
+                bindings.append(
+                    {
+                        "source_node_id": source_node_id,
+                        "placeholder": placeholder,
+                        "binding": {"type": "latest_payload", "source": source_node_id},
+                    }
+                )
         return bindings
+
+    def _context_builder_source_ready(self, context: NodeContext, source_node_id: str) -> bool:
+        source = context.graph.nodes.get(source_node_id)
+        if source is None:
+            return False
+        if source.provider_id == PROMPT_BLOCK_PROVIDER_ID:
+            return True
+        if source.provider_id == "core.data_display":
+            if _incoming_edges_are_all_binding(context.graph, source_node_id):
+                return context.latest_completed_output(source_node_id) is not None
+            return source_node_id in context.state.node_outputs
+        if source.kind == "input":
+            return source_node_id in context.state.node_outputs
+        return source_node_id in context.state.node_outputs
+
+    def _context_builder_all_sources_fulfilled(self, context: NodeContext) -> bool:
+        bindings = self._context_builder_bindings(context)
+        if not bindings:
+            return True
+        for binding in bindings:
+            source_node_id = str(binding.get("source_node_id", "")).strip()
+            if not source_node_id:
+                continue
+            if not self._context_builder_source_ready(context, source_node_id):
+                return False
+        return True
 
     def _execute_context_builder(self, context: NodeContext) -> NodeExecutionResult:
         bindings = self._context_builder_bindings(context)
+        all_fulfilled = self._context_builder_all_sources_fulfilled(context)
         resolved_variables: dict[str, Any] = {}
         ordered_values: list[str] = []
         ordered_prompt_blocks: list[dict[str, Any]] = []
         saw_non_prompt_value = False
         for binding in bindings:
+            source_node_id = str(binding.get("source_node_id", "")).strip()
+            placeholder = str(binding.get("placeholder", "")).strip()
+            if not source_node_id:
+                if placeholder:
+                    resolved_variables[placeholder] = ""
+                continue
+            if not self._context_builder_source_ready(context, source_node_id):
+                if placeholder:
+                    resolved_variables[placeholder] = ""
+                continue
+            if context.latest_completed_output(source_node_id) is None:
+                if placeholder:
+                    resolved_variables[placeholder] = ""
+                continue
+
             source_binding = binding.get("binding")
-            source_node = context.graph.nodes.get(str(binding.get("source_node_id", "")).strip())
-            resolved_value = context.resolve_binding(source_binding if isinstance(source_binding, Mapping) else None)
-            prompt_source_value = resolved_value
-            if source_node is not None and source_node.provider_id == "core.data_display":
-                prompt_source_value = context.latest_output(source_node.id) or resolved_value
+            source_node = context.graph.nodes.get(source_node_id)
+            if isinstance(source_binding, Mapping):
+                binding_type = str(source_binding.get("type", "latest_payload"))
+                if binding_type == "latest_payload":
+                    resolved_value = context.latest_completed_payload(source_node_id)
+                elif binding_type == "latest_output":
+                    resolved_value = context.latest_completed_output(source_node_id)
+                elif binding_type == "latest_envelope":
+                    resolved_value = context.latest_completed_output(source_node_id)
+                elif binding_type == "input_payload":
+                    resolved_value = context.state.input_payload
+                else:
+                    resolved_value = context.resolve_binding(source_binding)
+            else:
+                resolved_value = context.latest_completed_payload(source_node_id)
+            prompt_source_value = context.latest_completed_output(source_node_id) or resolved_value
             prompt_like_values = _extract_prompt_like_payloads(
                 prompt_source_value,
                 source_node_kind=(source_node.kind if source_node is not None else None),
@@ -1241,7 +1340,8 @@ class DataNode(BaseNode):
                 rendered_value = "\n\n".join(_render_prompt_block_text(payload) for payload in prompt_like_value)
             else:
                 rendered_value = value
-            resolved_variables[placeholder] = rendered_value
+            if placeholder:
+                resolved_variables[placeholder] = rendered_value
             if prompt_like_value:
                 ordered_prompt_blocks.extend(prompt_like_value)
             elif value is not None and value != "":
@@ -1273,22 +1373,27 @@ class DataNode(BaseNode):
                 "binding_count": len(bindings),
                 "placeholders": [str(binding.get("placeholder", "")) for binding in bindings],
                 "prompt_blocks": ordered_prompt_blocks,
+                "context_builder_complete": all_fulfilled,
             },
         )
         return NodeExecutionResult(
             status="success",
             output=envelope.to_dict(),
             summary="Context builder rendered a prompt block." if bindings else "Context builder rendered an empty prompt block.",
+            metadata={"hold_outgoing_edges": not all_fulfilled},
         )
 
     def _is_context_builder_ready(self, context: NodeContext) -> bool:
-        for binding in self._context_builder_bindings(context):
+        bindings = self._context_builder_bindings(context)
+        if not bindings:
+            return True
+        for binding in bindings:
             source_node_id = str(binding.get("source_node_id", "")).strip()
             if not source_node_id:
                 continue
-            if context.latest_output(source_node_id) is None:
-                return False
-        return True
+            if self._context_builder_source_ready(context, source_node_id) and context.latest_completed_output(source_node_id) is not None:
+                return True
+        return False
 
     def _execute_prompt_block(self, context: NodeContext) -> NodeExecutionResult:
         payload = context.prompt_block_payload_for_node(self.id) or {
@@ -1380,7 +1485,7 @@ class DataNode(BaseNode):
         errors: list[dict[str, Any]] = []
         tool_calls: list[dict[str, Any]] = []
         schema_version = "1.0"
-        if display_only and source_envelope is not None:
+        if source_envelope is not None:
             schema_version = source_envelope.schema_version
             artifacts = {**source_envelope.artifacts, **artifacts}
             errors = list(source_envelope.errors)
@@ -1389,8 +1494,8 @@ class DataNode(BaseNode):
                 **dict(source_envelope.metadata),
                 "contract": str(source_envelope.metadata.get("contract", "data_envelope")),
                 "node_kind": self.kind,
-                "display_only": True,
-                "display_provider_id": self.provider_id,
+                "display_only": display_only,
+                **({"display_provider_id": self.provider_id} if display_only else {}),
             }
         envelope = MessageEnvelope(
             schema_version=schema_version,
@@ -1989,21 +2094,49 @@ class McpToolExecutorNode(BaseNode):
                 source_envelope = None
         return source_envelope
 
-    def _resolve_tool_call_input(self, context: NodeContext) -> tuple[MessageEnvelope | None, str, dict[str, Any]]:
-        bound_value = context.resolve_binding(self.config.get("input_binding"))
-        source_envelope = self._source_envelope_from_value(bound_value)
-        tool_call = None
-        if isinstance(bound_value, Mapping) and "tool_calls" in bound_value:
-            tool_calls = list(bound_value.get("tool_calls", []))
-            if tool_calls:
-                tool_call = tool_calls[0]
+    def _extract_tool_call_from_value(self, value: Any) -> tuple[MessageEnvelope | None, str, dict[str, Any]]:
+        source_envelope = self._source_envelope_from_value(value)
+        tool_call: Mapping[str, Any] | None = None
+        if isinstance(value, Mapping):
+            raw_tool_calls = value.get("tool_calls", [])
+            if isinstance(raw_tool_calls, Sequence) and not isinstance(raw_tool_calls, (str, bytes)):
+                for candidate in raw_tool_calls:
+                    if isinstance(candidate, Mapping):
+                        tool_call = candidate
+                        break
+        if tool_call is None and source_envelope is not None and source_envelope.tool_calls:
+            tool_call = source_envelope.tool_calls[0]
         tool_name = str((tool_call or {}).get("tool_name", "")).strip()
         payload = (tool_call or {}).get("arguments", {})
-        if isinstance(bound_value, Mapping) and "payload" in bound_value and not tool_name:
-            payload = bound_value.get("payload")
+        if isinstance(value, Mapping) and "payload" in value and not tool_name:
+            payload = value.get("payload")
         if not isinstance(payload, Mapping):
             payload = {}
         return source_envelope, tool_name, dict(payload)
+
+    def _resolve_tool_call_input(self, context: NodeContext) -> tuple[MessageEnvelope | None, str, dict[str, Any]]:
+        input_binding = self.config.get("input_binding")
+        bound_value = context.resolve_binding(input_binding)
+        source_envelope, tool_name, payload = self._extract_tool_call_from_value(bound_value)
+        if tool_name:
+            return source_envelope, tool_name, payload
+
+        fallback_candidates: list[Any] = []
+        current_edge = context.current_input_edge()
+        if current_edge is not None:
+            fallback_candidates.append(context.state.edge_outputs.get(current_edge.id))
+            fallback_candidates.append(context.latest_output(current_edge.source_id))
+        if isinstance(input_binding, Mapping):
+            binding_source = str(input_binding.get("source", "")).strip()
+            if binding_source:
+                fallback_candidates.append(context.latest_output(binding_source))
+
+        for candidate in fallback_candidates:
+            _, candidate_tool_name, candidate_payload = self._extract_tool_call_from_value(candidate)
+            if candidate_tool_name:
+                candidate_envelope = self._source_envelope_from_value(candidate)
+                return candidate_envelope or source_envelope, candidate_tool_name, candidate_payload
+        return source_envelope, tool_name, payload
 
     def _provider_config(self, context: NodeContext) -> dict[str, Any]:
         provider_config: dict[str, Any] = {}
@@ -2160,7 +2293,7 @@ class McpToolExecutorNode(BaseNode):
             from_category=self.category.value,
             payload=None,
             errors=[error],
-            metadata={"contract": "message_envelope", "node_kind": self.kind},
+            metadata={"contract": "tool_result_envelope", "node_kind": self.kind},
         )
         return NodeExecutionResult(
             status="failed",
@@ -2251,21 +2384,10 @@ class McpToolExecutorNode(BaseNode):
                 metadata[key] = context.resolve_binding(binding)
             else:
                 metadata[key] = binding
-        mcp_tool_context = context.mcp_tool_context_for_model(self.id)
-        if mcp_tool_context is not None and "mcp_tool_context" not in metadata:
-            metadata["mcp_tool_context"] = mcp_tool_context
-            metadata["mcp_tool_context_prompt"] = mcp_tool_context.get("rendered_prompt_text", "")
         available_tool_payloads: list[dict[str, Any]] = []
         if include_available_tools:
             allowed_tool_names = list(self.config.get("allowed_tool_names", []))
             available_tool_payloads = context.available_tool_definitions(allowed_tool_names)
-            for tool_definition in context.mcp_tool_definitions_for_model(self.id):
-                tool_name = str(tool_definition.get("name", "")).strip()
-                if not tool_name:
-                    continue
-                if any(str(existing.get("name", "")).strip() == tool_name for existing in available_tool_payloads):
-                    continue
-                available_tool_payloads.append(tool_definition)
         available_tools = [
             ModelToolDefinition(
                 name=str(tool.get("name", "")),
@@ -2424,7 +2546,43 @@ class McpToolExecutorNode(BaseNode):
             },
         )
 
-    def _follow_up_message_result(
+    def _follow_up_output_payload(
+        self,
+        normalized_payload: Mapping[str, Any],
+        *,
+        tool_calls: Sequence[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        raw_tool_history = normalized_payload.get("tool_history", [])
+        tool_payloads: list[dict[str, Any]] = []
+        if isinstance(raw_tool_history, Sequence) and not isinstance(raw_tool_history, (str, bytes)):
+            for entry in raw_tool_history:
+                if not isinstance(entry, Mapping):
+                    continue
+                tool_payload: dict[str, Any] = {
+                    "tool_name": str(entry.get("tool_name", "")).strip(),
+                    "tool_arguments": dict(entry.get("tool_arguments", {}))
+                    if isinstance(entry.get("tool_arguments"), Mapping)
+                    else {},
+                    "tool_output": entry.get("tool_output"),
+                    "tool_status": str(entry.get("tool_status", "")).strip(),
+                }
+                if entry.get("tool_error") is not None:
+                    tool_payload["tool_error"] = entry.get("tool_error")
+                terminal_output = entry.get("terminal_output")
+                if isinstance(terminal_output, Mapping):
+                    tool_payload["terminal_output"] = dict(terminal_output)
+                tool_payloads.append(tool_payload)
+        return {
+            "should_call_tool": bool(tool_calls),
+            "tool_calls": [
+                dict(tool_call)
+                for tool_call in list(tool_calls or [])
+                if isinstance(tool_call, Mapping)
+            ],
+            "tool_payloads": tool_payloads,
+        }
+
+    def _follow_up_result(
         self,
         *,
         normalized_payload: Mapping[str, Any],
@@ -2432,15 +2590,15 @@ class McpToolExecutorNode(BaseNode):
         source_tool_call_envelope: Mapping[str, Any] | None,
         terminal_output_envelope: Mapping[str, Any] | None,
         metadata: Mapping[str, Any],
-        payload: Any,
         summary: str,
         route_outputs: Mapping[str, Any] | None = None,
+        tool_calls: Sequence[Mapping[str, Any]] | None = None,
     ) -> NodeExecutionResult:
-        message_envelope = MessageEnvelope(
+        result_envelope = MessageEnvelope(
             schema_version="1.0",
             from_node_id=self.id,
             from_category=self.category.value,
-            payload=payload,
+            payload=self._follow_up_output_payload(normalized_payload, tool_calls=tool_calls),
             artifacts={
                 "follow_up_payload": normalized_payload,
                 "source_tool_result_envelope": source_tool_result_envelope.to_dict(),
@@ -2448,15 +2606,15 @@ class McpToolExecutorNode(BaseNode):
                 "terminal_output_envelope": dict(terminal_output_envelope) if isinstance(terminal_output_envelope, Mapping) else None,
             },
             metadata={
-                "contract": "message_envelope",
+                "contract": "tool_result_envelope",
                 **dict(metadata),
             },
         )
         return NodeExecutionResult(
             status="success",
-            output=message_envelope.to_dict(),
+            output=result_envelope.to_dict(),
             summary=summary,
-            metadata=message_envelope.metadata,
+            metadata=result_envelope.metadata,
             route_outputs=dict(route_outputs or {}),
         )
 
@@ -2509,7 +2667,6 @@ class McpToolExecutorNode(BaseNode):
                 )
             except ValueError as exc:
                 return self._invalid_follow_up_result(str(exc), route_outputs=route_outputs)
-            output = decision_output["message"]
             normalized_tool_calls = [
                 tool_call
                 for tool_call in list(decision_output["tool_calls"])
@@ -2521,8 +2678,8 @@ class McpToolExecutorNode(BaseNode):
                 "provider": provider.name,
                 "prompt_name": request.prompt_name,
                 "response_mode": response_mode,
-                "should_call_tools": bool(decision_output["should_call_tools"]),
-                "tool_call_count": len(response.tool_calls),
+                "should_call_tools": bool(normalized_tool_calls),
+                "tool_call_count": len(normalized_tool_calls),
                 "tool_name": normalized_payload.get("tool_name"),
                 "tool_status": normalized_payload.get("tool_status"),
                 **response.metadata,
@@ -2569,48 +2726,15 @@ class McpToolExecutorNode(BaseNode):
                 iteration_budget -= 1
                 continue
 
-            if response_mode != "message":
-                request = self._build_follow_up_request(
-                    context,
-                    normalized_payload,
-                    forbidden_tool_call_signatures=successful_tool_call_signatures,
-                    force_response_mode="message",
-                    include_available_tools=False,
-                )
-                response = provider.generate(request)
-                try:
-                    decision_output = validate_api_decision_output(
-                        normalize_api_decision_output(
-                            response.structured_output,
-                            content=response.content,
-                            tool_calls=response.tool_calls,
-                        ),
-                        callable_tool_names=None,
-                        response_mode=request.response_mode,
-                    )
-                except ValueError as exc:
-                    return self._invalid_follow_up_result(str(exc), route_outputs=route_outputs)
-                output = decision_output["message"]
-                base_metadata = {
-                    "node_kind": self.kind,
-                    "provider": provider.name,
-                    "prompt_name": request.prompt_name,
-                    "response_mode": request.response_mode,
-                    "should_call_tools": bool(decision_output["should_call_tools"]),
-                    "tool_call_count": len(response.tool_calls),
-                    "tool_name": normalized_payload.get("tool_name"),
-                    "tool_status": normalized_payload.get("tool_status"),
-                    **response.metadata,
-                }
-            return self._follow_up_message_result(
+            return self._follow_up_result(
                 normalized_payload=normalized_payload,
                 source_tool_result_envelope=source_envelope,
                 source_tool_call_envelope=source_tool_call_envelope,
                 terminal_output_envelope=terminal_output_envelope,
                 metadata=base_metadata,
-                payload=output,
                 summary=f"MCP executor '{self.label}' completed follow-up evaluation.",
                 route_outputs=route_outputs,
+                tool_calls=normalized_tool_calls,
             )
 
     def execute(self, context: NodeContext) -> NodeExecutionResult:
@@ -3019,6 +3143,11 @@ class GraphDefinition:
                             f"MCP context provider '{node.id}' references non-MCP tool '{tool_name_str}'."
                         )
             if node.kind == "mcp_tool_executor":
+                tool_target_node_ids = node.config.get("tool_target_node_ids", [])
+                if tool_target_node_ids:
+                    raise GraphValidationError(
+                        f"MCP tool executor '{node.id}' cannot declare tool_target_node_ids; configure allowed_tool_names directly."
+                    )
                 input_binding = node.config.get("input_binding")
                 if input_binding is not None:
                     if not isinstance(input_binding, Mapping):
@@ -3050,6 +3179,10 @@ class GraphDefinition:
                             raise GraphValidationError(
                                 f"MCP tool executor '{node.id}' references missing source node '{source_id}'."
                             )
+                        if isinstance(source_node, McpContextProviderNode):
+                            raise GraphValidationError(
+                                f"MCP tool executor '{node.id}' cannot bind directly to MCP context provider '{source_id}'; configure allowed_tool_names directly."
+                            )
                         if isinstance(source_node, ModelNode):
                             source_response_mode = infer_model_response_mode(self, source_node)
                             if source_response_mode == "message":
@@ -3062,8 +3195,16 @@ class GraphDefinition:
                         raise GraphValidationError(
                             f"MCP tool executor '{node.id}' must have an incoming edge or an explicit input_binding."
                         )
+                    for edge in incoming_edges:
+                        source_node = self.nodes.get(edge.source_id)
+                        if edge.kind == "binding" and isinstance(source_node, McpContextProviderNode):
+                            raise GraphValidationError(
+                                f"MCP tool executor '{node.id}' cannot receive MCP context provider binding '{edge.id}'; configure allowed_tool_names directly."
+                            )
                     valid_tool_call_routes = 0
                     for edge in incoming_edges:
+                        if edge.kind == "binding":
+                            continue
                         source_node = self.nodes.get(edge.source_id)
                         if source_node is None:
                             continue
@@ -3137,64 +3278,21 @@ class GraphDefinition:
                     allowed_tool_names = [str(tool_name) for tool_name in node.config.get("allowed_tool_names", [])]
                     for tool_name in allowed_tool_names:
                         try:
-                            services.tool_registry.require_graph_reference(str(tool_name))
+                            tool_definition = services.tool_registry.require_graph_reference(str(tool_name))
                         except (KeyError, ValueError) as exc:
                             raise GraphValidationError(str(exc)) from exc
-                    mcp_context_tool_names: list[str] = []
-                    candidate_context_nodes: list[McpContextProviderNode] = []
-                    seen_context_node_ids: set[str] = set()
-                    tool_target_node_ids = node.config.get("tool_target_node_ids", [])
-                    if tool_target_node_ids:
-                        if not isinstance(tool_target_node_ids, Sequence) or isinstance(tool_target_node_ids, (str, bytes)):
+                    for tool_name in allowed_tool_names:
+                        tool_definition = services.tool_registry.require_graph_reference(str(tool_name))
+                        if tool_definition.source_type != "mcp":
                             raise GraphValidationError(
-                                f"MCP tool executor '{node.id}' must declare tool_target_node_ids as a list of MCP context provider node ids."
+                                f"MCP tool executor '{node.id}' references non-MCP tool '{tool_name}'."
                             )
-                        for target_node_id in tool_target_node_ids:
-                            target_node = self.nodes.get(str(target_node_id))
-                            if not isinstance(target_node, McpContextProviderNode):
-                                raise GraphValidationError(
-                                    f"MCP tool executor '{node.id}' references unknown MCP context provider node '{target_node_id}'."
-                                )
-                            if target_node.id not in seen_context_node_ids:
-                                candidate_context_nodes.append(target_node)
-                                seen_context_node_ids.add(target_node.id)
-                    for edge in self.get_incoming_edges(node.id):
-                        if edge.kind != "binding":
-                            continue
-                        source_node = self.nodes.get(edge.source_id)
-                        if isinstance(source_node, McpContextProviderNode) and source_node.id not in seen_context_node_ids:
-                            candidate_context_nodes.append(source_node)
-                            seen_context_node_ids.add(source_node.id)
-                    for target_node in candidate_context_nodes:
-                        tool_names = target_node.config.get("tool_names", [])
-                        if not isinstance(tool_names, Sequence) or isinstance(tool_names, (str, bytes)):
-                            raise GraphValidationError(
-                                f"MCP context provider '{target_node.id}' must declare tool_names as a list."
-                            )
-                        for tool_name in tool_names:
-                            tool_name_str = str(tool_name).strip()
-                            if not tool_name_str:
-                                continue
-                            try:
-                                tool_definition = services.tool_registry.require_graph_reference(tool_name_str)
-                            except (KeyError, ValueError) as exc:
-                                raise GraphValidationError(str(exc)) from exc
-                            if tool_definition.source_type != "mcp":
-                                raise GraphValidationError(
-                                    f"MCP context provider '{target_node.id}' references non-MCP tool '{tool_name_str}'."
-                                )
-                            if bool(target_node.config.get("expose_mcp_tools", True)):
-                                mcp_context_tool_names.append(tool_name_str)
-                    combined_tool_names = [
-                        *allowed_tool_names,
-                        *[tool_name for tool_name in mcp_context_tool_names if tool_name not in allowed_tool_names],
-                    ]
-                    if response_mode == "tool_call" and not combined_tool_names and not isinstance(node.config.get("response_schema"), Mapping):
+                    if response_mode == "tool_call" and not allowed_tool_names and not isinstance(node.config.get("response_schema"), Mapping):
                         raise GraphValidationError(
                             f"MCP tool executor '{node.id}' uses tool_call follow-up mode but does not expose any allowed tools."
                         )
                     preferred_tool_name = str(node.config.get("preferred_tool_name", "") or "").strip()
-                    if preferred_tool_name and combined_tool_names and preferred_tool_name not in combined_tool_names:
+                    if preferred_tool_name and allowed_tool_names and preferred_tool_name not in allowed_tool_names:
                         raise GraphValidationError(
                             f"MCP tool executor '{node.id}' prefers tool '{preferred_tool_name}', but it is not exposed to the node."
                         )

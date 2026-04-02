@@ -162,6 +162,10 @@ export type McpServerStatus = {
   booted_at?: string | null;
 };
 
+export type StartRunOptions = {
+  agent_ids?: string[];
+};
+
 export type ConnectionRule = {
   source_category: string;
   target_category: string;
@@ -225,8 +229,11 @@ export type RunState = {
   current_node_id: string | null;
   current_edge_id?: string | null;
   status: string;
+  status_reason?: string | null;
   started_at: string | null;
   ended_at: string | null;
+  runtime_instance_id?: string | null;
+  last_heartbeat_at?: string | null;
   input_payload: unknown;
   node_inputs?: Record<string, unknown>;
   node_outputs: Record<string, unknown>;
