@@ -3,6 +3,7 @@ import type {
   GraphDocument,
   McpServerDraft,
   McpServerStatus,
+  McpServerTestResult,
   ProviderDiagnosticsResult,
   ProviderPreflightResult,
   RunState,
@@ -188,13 +189,7 @@ export async function deleteMcpServer(serverId: string): Promise<void> {
   }
 }
 
-export async function testMcpServer(server: McpServerDraft): Promise<{
-  ok: boolean;
-  server: McpServerStatus;
-  tool_names: string[];
-  tools: Array<Record<string, unknown>>;
-  message: string;
-}> {
+export async function testMcpServer(server: McpServerDraft): Promise<McpServerTestResult> {
   const response = await fetch(`${API_BASE_URL}/api/editor/mcp/servers/test`, {
     method: "POST",
     headers: {
@@ -205,13 +200,7 @@ export async function testMcpServer(server: McpServerDraft): Promise<{
   if (!response.ok) {
     throw new Error(await response.text());
   }
-  return (await response.json()) as {
-    ok: boolean;
-    server: McpServerStatus;
-    tool_names: string[];
-    tools: Array<Record<string, unknown>>;
-    message: string;
-  };
+  return (await response.json()) as McpServerTestResult;
 }
 
 export async function setMcpToolEnabled(toolName: string, enabled: boolean): Promise<ToolDefinition> {

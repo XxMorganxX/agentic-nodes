@@ -3403,12 +3403,13 @@ export function GraphCanvas({
     const normalizedEvents = runProjection?.normalizedEvents ?? runState?.event_history ?? [];
     const nextNodes = graph.nodes.map((node): FlowNode<GraphCanvasRuntimeNodeData> => {
       const runtimeNodeState = runProjection?.nodeStates[node.id];
-      const isActive = runState?.current_node_id === node.id;
-      const hasError = Object.prototype.hasOwnProperty.call(runState?.node_errors ?? {}, node.id);
+      const isActive = runtimeNodeState?.isActive ?? (runState?.current_node_id === node.id);
+      const hasError = runtimeNodeState?.hasError ?? Object.prototype.hasOwnProperty.call(runState?.node_errors ?? {}, node.id);
       const wasVisited =
-        (runState?.visit_counts?.[node.id] ?? 0) > 0 ||
-        Object.prototype.hasOwnProperty.call(runState?.node_outputs ?? {}, node.id) ||
-        hasError;
+        runtimeNodeState?.wasVisited ??
+        ((runState?.visit_counts?.[node.id] ?? 0) > 0 ||
+          Object.prototype.hasOwnProperty.call(runState?.node_outputs ?? {}, node.id) ||
+          hasError);
       const didLastRunFinish =
         runState?.status === "completed" ||
         runState?.status === "failed" ||

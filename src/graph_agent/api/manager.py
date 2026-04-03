@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
+from pathlib import Path
 import shutil
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -27,6 +28,8 @@ from graph_agent.tools.mcp import McpServerDefinition
 LOGGER = logging.getLogger(__name__)
 DISCORD_START_PROVIDER_ID = "start.discord_message"
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
+BUNDLED_MCP_TEMPLATE_PATH = Path(__file__).resolve().with_name("mcp_server_templates.json")
+DEFAULT_MCP_TEMPLATE_DIR = Path(__file__).resolve().parents[3] / ".graph-agent" / "mcp-server-templates"
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -51,6 +54,93 @@ def _read_interval_env(name: str, default: float) -> float:
         return max(float(raw), 0.1)
     except ValueError:
         return default
+
+
+def _load_mcp_server_template_payloads_from_file(path: Path) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return []
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        items = payload.get("templates", [])
+        return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+    return []
+
+
+def _normalize_mcp_server_template(payload: dict[str, Any], *, source: str) -> dict[str, Any] | None:
+    template_id = str(payload.get("template_id", "")).strip()
+    display_name = str(payload.get("display_name", "")).strip()
+    if not template_id or not display_name:
+        return None
+    draft_payload = payload.get("draft", payload)
+    if not isinstance(draft_payload, dict):
+        return None
+    try:
+        definition = McpServerDefinition.from_dict(
+            {
+                "server_id": draft_payload.get("server_id", ""),
+                "display_name": draft_payload.get("display_name", display_name),
+                "description": draft_payload.get("description", payload.get("description", "")),
+                "transport": draft_payload.get("transport", "stdio"),
+                "command": draft_payload.get("command", []),
+                "cwd": draft_payload.get("cwd"),
+                "env": draft_payload.get("env", {}),
+                "base_url": draft_payload.get("base_url"),
+                "timeout_seconds": draft_payload.get("timeout_seconds", 15),
+                "auto_boot": draft_payload.get("auto_boot", False),
+                "persistent": draft_payload.get("persistent", True),
+            }
+        )
+    except ValueError:
+        return None
+    capability_hints = payload.get("capability_hints", [])
+    provenance = payload.get("provenance", {})
+    return {
+        "template_id": template_id,
+        "display_name": display_name,
+        "description": str(payload.get("description", "") or definition.description),
+        "draft": {
+            "server_id": definition.server_id,
+            "display_name": definition.display_name,
+            "description": definition.description,
+            "transport": definition.transport,
+            "command": list(definition.command),
+            "cwd": definition.cwd,
+            "env": dict(definition.env),
+            "base_url": definition.base_url,
+            "timeout_seconds": definition.timeout_seconds,
+            "auto_boot": definition.auto_boot,
+            "persistent": definition.persistent,
+        },
+        "capability_hints": [str(item).strip() for item in capability_hints if str(item).strip()]
+        if isinstance(capability_hints, list)
+        else [],
+        "provenance": dict(provenance) if isinstance(provenance, dict) else {},
+        "source": source,
+    }
+
+
+def load_mcp_server_templates() -> list[dict[str, Any]]:
+    templates_by_id: dict[str, dict[str, Any]] = {}
+    for payload in _load_mcp_server_template_payloads_from_file(BUNDLED_MCP_TEMPLATE_PATH):
+        normalized = _normalize_mcp_server_template(payload, source="bundled")
+        if normalized is not None:
+            templates_by_id[normalized["template_id"]] = normalized
+    template_dir = Path(os.environ.get("GRAPH_AGENT_MCP_TEMPLATE_DIR", "")).expanduser()
+    if not str(template_dir).strip():
+        template_dir = DEFAULT_MCP_TEMPLATE_DIR
+    if template_dir.exists():
+        for path in sorted(template_dir.glob("*.json")):
+            for payload in _load_mcp_server_template_payloads_from_file(path):
+                normalized = _normalize_mcp_server_template(payload, source="directory")
+                if normalized is not None:
+                    provenance = dict(normalized.get("provenance", {}))
+                    provenance.setdefault("path", str(path))
+                    normalized["provenance"] = provenance
+                    templates_by_id[normalized["template_id"]] = normalized
+    return [templates_by_id[template_id] for template_id in sorted(templates_by_id)]
 
 
 @dataclass
@@ -123,6 +213,12 @@ class GraphRunManager:
             "mcp_servers": (
                 self._services.mcp_server_manager.list_servers() if self._services.mcp_server_manager is not None else []
             ),
+            "mcp_capabilities": (
+                self._services.mcp_server_manager.list_capabilities()
+                if self._services.mcp_server_manager is not None
+                else []
+            ),
+            "mcp_server_templates": load_mcp_server_templates(),
         }
 
     def boot_mcp_server(self, server_id: str) -> dict[str, Any]:

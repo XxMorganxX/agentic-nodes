@@ -148,6 +148,35 @@ export type McpServerDraft = {
   persistent: boolean;
 };
 
+export type McpCapabilityDefinition = {
+  canonical_name: string;
+  name: string;
+  display_name?: string;
+  title?: string;
+  aliases?: string[];
+  capability_type: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  server_id: string;
+  enabled?: boolean;
+  available?: boolean;
+  availability_error?: string;
+  schema_origin?: string;
+  schema_warning?: string;
+  managed?: boolean;
+};
+
+export type McpServerTemplate = {
+  template_id: string;
+  display_name: string;
+  description: string;
+  draft: McpServerDraft;
+  capability_hints?: string[];
+  provenance?: Record<string, unknown>;
+  source?: string;
+};
+
 export type McpServerStatus = {
   server_id: string;
   display_name: string;
@@ -164,6 +193,23 @@ export type McpServerStatus = {
   error: string;
   pid?: number | null;
   booted_at?: string | null;
+  declared_capabilities?: Record<string, unknown>;
+  server_info?: Record<string, unknown>;
+  capability_types?: string[];
+  capability_count?: number;
+};
+
+export type McpServerTestResult = {
+  ok: boolean;
+  server: McpServerStatus;
+  declared_capabilities?: Record<string, unknown>;
+  server_info?: Record<string, unknown>;
+  capability_types?: string[];
+  capability_count?: number;
+  capabilities: McpCapabilityDefinition[];
+  tool_names: string[];
+  tools: Array<Record<string, unknown>>;
+  message: string;
 };
 
 export type StartRunOptions = {
@@ -190,6 +236,8 @@ export type EditorCatalog = {
   contracts: Record<string, CategoryContract>;
   provider_statuses?: Record<string, ProviderPreflightResult>;
   mcp_servers?: McpServerStatus[];
+  mcp_capabilities?: McpCapabilityDefinition[];
+  mcp_server_templates?: McpServerTemplate[];
 };
 
 export type ProviderPreflightResult = {

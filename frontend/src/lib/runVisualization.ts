@@ -824,9 +824,6 @@ function deriveRunStatus(runState: RunState | null, normalizedEvents: RuntimeEve
 }
 
 function deriveCurrentNodeId(runState: RunState | null, normalizedEvents: RuntimeEvent[]): string | null {
-  if (runState) {
-    return runState.current_node_id ?? null;
-  }
   let currentNodeId: string | null = null;
   for (const event of normalizedEvents) {
     if (event.event_type === "node.started") {
@@ -841,7 +838,10 @@ function deriveCurrentNodeId(runState: RunState | null, normalizedEvents: Runtim
       currentNodeId = null;
     }
   }
-  return currentNodeId;
+  if (currentNodeId) {
+    return currentNodeId;
+  }
+  return runState?.current_node_id ?? null;
 }
 
 function wasNodeVisited(nodeId: string, runState: RunState | null, completedNodeIdSet: Set<string>): boolean {

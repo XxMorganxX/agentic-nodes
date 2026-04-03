@@ -1,0 +1,73 @@
+[
+  {
+    "template_id": "official.fetch",
+    "display_name": "Fetch Server",
+    "description": "Retrieve and transform remote web content through a standard MCP fetch server.",
+    "draft": {
+      "server_id": "fetch_server",
+      "display_name": "Fetch Server",
+      "description": "Retrieve remote HTTP content through MCP.",
+      "transport": "stdio",
+      "command": ["uvx", "mcp-server-fetch"],
+      "cwd": null,
+      "env": {},
+      "base_url": null,
+      "timeout_seconds": 20,
+      "auto_boot": false,
+      "persistent": true
+    },
+    "capability_hints": ["tool", "resource"],
+    "provenance": {
+      "registry": "bundled",
+      "publisher": "modelcontextprotocol"
+    }
+  },
+  {
+    "template_id": "official.filesystem",
+    "display_name": "Filesystem Server",
+    "description": "Expose local project directories to MCP clients for file browsing and document reads.",
+    "draft": {
+      "server_id": "filesystem_server",
+      "display_name": "Filesystem Server",
+      "description": "Read and traverse a local project directory through MCP.",
+      "transport": "stdio",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."],
+      "cwd": "",
+      "env": {},
+      "base_url": null,
+      "timeout_seconds": 20,
+      "auto_boot": false,
+      "persistent": true
+    },
+    "capability_hints": ["resource", "resource_template", "tool"],
+    "provenance": {
+      "registry": "bundled",
+      "publisher": "modelcontextprotocol"
+    }
+  },
+  {
+    "template_id": "official.github",
+    "display_name": "GitHub Server",
+    "description": "Connect GitHub issues, pull requests, and repository metadata through an MCP GitHub integration.",
+    "draft": {
+      "server_id": "github_server",
+      "display_name": "GitHub Server",
+      "description": "Interact with GitHub resources through MCP.",
+      "transport": "stdio",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-github"],
+      "cwd": null,
+      "env": {
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+      },
+      "base_url": null,
+      "timeout_seconds": 20,
+      "auto_boot": false,
+      "persistent": true
+    },
+    "capability_hints": ["tool", "resource", "prompt"],
+    "provenance": {
+      "registry": "bundled",
+      "publisher": "modelcontextprotocol"
+    }
+  }
+]

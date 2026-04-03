@@ -630,6 +630,12 @@ button:disabled {
   box-shadow: none;
 }
 
+.secondary-button.is-active {
+  background: #474b7d;
+  border-color: #6b72c9;
+  color: #eef0ff;
+}
+
 .danger-button {
   background: #c0392b;
 }
@@ -4269,6 +4275,80 @@ pre {
   margin: 0;
   color: #8be0b0;
   font-size: 0.82rem;
+}
+
+.mcp-template-browser,
+.mcp-test-result,
+.mcp-capability-browser-toolbar {
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.85rem;
+  border-radius: 12px;
+  border: 1px solid #2a2d49;
+  background: rgba(20, 21, 38, 0.92);
+}
+
+.mcp-template-browser-header,
+.mcp-capability-browser-toolbar {
+  align-items: center;
+}
+
+.mcp-template-browser-header span {
+  color: #8b8fb4;
+  font-size: 0.82rem;
+}
+
+.mcp-template-list,
+.mcp-capability-list {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.mcp-template-card,
+.mcp-capability-card {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.75rem;
+  border-radius: 10px;
+  border: 1px solid rgba(80, 88, 128, 0.5);
+  background: rgba(16, 17, 30, 0.9);
+}
+
+.mcp-template-card-header,
+.mcp-capability-card-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.mcp-template-card-header p,
+.mcp-capability-card-header p {
+  margin: 0.2rem 0 0;
+  color: #8b8fb4;
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.mcp-capability-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.mcp-capability-details summary {
+  cursor: pointer;
+  color: #b6bcdf;
+  font-size: 0.76rem;
+}
+
+.mcp-capability-details pre {
+  margin: 0.55rem 0 0;
+  padding: 0.65rem;
+  border-radius: 10px;
+  background: rgba(8, 10, 18, 0.95);
+  color: #b9c0e6;
+  font-size: 0.72rem;
+  overflow-x: auto;
 }
 
 .mcp-tool-option {

@@ -1161,8 +1161,7 @@ export default function App() {
           }
           onDeleteMcpServer={(serverId: string) => runMcpAction(`delete:${serverId}`, () => deleteMcpServer(serverId))}
           onTestMcpServer={async (server: McpServerDraft) => {
-            const result = await runMcpAction(`test:${server.server_id || "draft"}`, () => testMcpServer(server));
-            return result?.message ?? null;
+            return runMcpAction(`test:${server.server_id || "draft"}`, () => testMcpServer(server));
           }}
           mcpPendingKey={mcpPendingKey}
           title="Project MCP"

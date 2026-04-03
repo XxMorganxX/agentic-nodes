@@ -1,6 +1,14 @@
 import { useMemo, useState } from "react";
 
-import type { EditorCatalog, McpServerDraft, McpServerStatus, ToolDefinition } from "../lib/types";
+import type {
+  EditorCatalog,
+  McpCapabilityDefinition,
+  McpServerDraft,
+  McpServerStatus,
+  McpServerTemplate,
+  McpServerTestResult,
+  ToolDefinition,
+} from "../lib/types";
 
 type McpServerPanelProps = {
   catalog: EditorCatalog | null;
@@ -11,12 +19,14 @@ type McpServerPanelProps = {
   onCreateMcpServer: (server: McpServerDraft) => Promise<unknown>;
   onUpdateMcpServer: (serverId: string, server: McpServerDraft) => Promise<unknown>;
   onDeleteMcpServer: (serverId: string) => Promise<unknown>;
-  onTestMcpServer: (server: McpServerDraft) => Promise<string | null>;
+  onTestMcpServer: (server: McpServerDraft) => Promise<McpServerTestResult | null>;
   mcpPendingKey: string | null;
   title?: string;
   description?: string;
   className?: string;
 };
+
+type CapabilityFilter = "all" | "tool" | "resource" | "resource_template" | "prompt";
 
 type McpServerFormState = {
   server_id: string;
@@ -63,6 +73,24 @@ function formFromServer(server: McpServerStatus): McpServerFormState {
     timeout_seconds: String(server.config?.timeout_seconds ?? 15),
     auto_boot: server.auto_boot,
     persistent: server.persistent,
+  };
+}
+
+function formFromDraft(draft: McpServerDraft): McpServerFormState {
+  return {
+    server_id: draft.server_id,
+    display_name: draft.display_name,
+    description: draft.description,
+    transport: draft.transport,
+    command_text: draft.command.join("\n"),
+    cwd: draft.cwd ?? "",
+    env_text: Object.entries(draft.env ?? {})
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n"),
+    base_url: draft.base_url ?? "",
+    timeout_seconds: String(draft.timeout_seconds ?? 15),
+    auto_boot: draft.auto_boot,
+    persistent: draft.persistent,
   };
 }
 
@@ -136,6 +164,40 @@ function toolLabel(tool: ToolDefinition): string {
   return tool.display_name ?? tool.name;
 }
 
+function capabilityLabel(capability: McpCapabilityDefinition): string {
+  return capability.title || capability.display_name || capability.name;
+}
+
+function capabilityReference(capability: McpCapabilityDefinition): string {
+  if (typeof capability.metadata?.uri === "string" && capability.metadata.uri.trim()) {
+    return capability.metadata.uri;
+  }
+  if (typeof capability.metadata?.uri_template === "string" && capability.metadata.uri_template.trim()) {
+    return capability.metadata.uri_template;
+  }
+  return capability.canonical_name;
+}
+
+function capabilityStatusLabel(capability: McpCapabilityDefinition): string {
+  if (capability.available === false) {
+    return "offline";
+  }
+  if (capability.capability_type === "tool" && capability.enabled === false) {
+    return "disabled";
+  }
+  return "discovered";
+}
+
+function declaredCapabilityLabels(server: McpServerStatus): string[] {
+  return Object.keys(server.declared_capabilities ?? {}).sort();
+}
+
+function templateProvenanceLabel(template: McpServerTemplate): string {
+  const registry = typeof template.provenance?.registry === "string" ? template.provenance.registry : null;
+  const publisher = typeof template.provenance?.publisher === "string" ? template.provenance.publisher : null;
+  return [template.source, registry, publisher].filter(Boolean).join(" • ");
+}
+
 export function McpServerPanel({
   catalog,
   onBootMcpServer,
@@ -152,10 +214,13 @@ export function McpServerPanel({
   className = "",
 }: McpServerPanelProps) {
   const mcpServers = catalog?.mcp_servers ?? [];
+  const mcpCapabilities = catalog?.mcp_capabilities ?? [];
+  const mcpServerTemplates = catalog?.mcp_server_templates ?? [];
   const [editingServerId, setEditingServerId] = useState<string | null>(null);
   const [formState, setFormState] = useState<McpServerFormState>(createBlankForm);
-  const [testMessage, setTestMessage] = useState<string | null>(null);
+  const [testSnapshot, setTestSnapshot] = useState<McpServerTestResult | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [capabilityFilter, setCapabilityFilter] = useState<CapabilityFilter>("all");
 
   const editingServer = useMemo(
     () => mcpServers.find((server) => server.server_id === editingServerId) ?? null,
@@ -164,24 +229,24 @@ export function McpServerPanel({
   const isCreating = editingServerId === "__new__";
   const isEditing = Boolean(editingServerId);
 
-  function beginCreate() {
+  function beginCreate(templateDraft?: McpServerDraft) {
     setEditingServerId("__new__");
-    setFormState(createBlankForm());
-    setTestMessage(null);
+    setFormState(templateDraft ? formFromDraft(templateDraft) : createBlankForm());
+    setTestSnapshot(null);
     setLocalError(null);
   }
 
   function beginEdit(server: McpServerStatus) {
     setEditingServerId(server.server_id);
     setFormState(formFromServer(server));
-    setTestMessage(null);
+    setTestSnapshot(null);
     setLocalError(null);
   }
 
   function cancelEdit() {
     setEditingServerId(null);
     setFormState(createBlankForm());
-    setTestMessage(null);
+    setTestSnapshot(null);
     setLocalError(null);
   }
 
@@ -201,12 +266,12 @@ export function McpServerPanel({
 
   async function handleTest() {
     try {
-      const message = await onTestMcpServer(toDraft(formState));
-      setTestMessage(message);
+      const result = await onTestMcpServer(toDraft(formState));
+      setTestSnapshot(result);
       setLocalError(null);
     } catch (error) {
       setLocalError(error instanceof Error ? error.message : "Unable to test MCP server.");
-      setTestMessage(null);
+      setTestSnapshot(null);
     }
   }
 
@@ -217,7 +282,7 @@ export function McpServerPanel({
         <span>{description}</span>
         <span>Server state is project-level. Graph nodes still choose which ready MCP tools they expose or describe to models.</span>
         <div className="mcp-server-actions">
-          <button type="button" className="secondary-button" onClick={beginCreate} disabled={isCreating}>
+          <button type="button" className="secondary-button" onClick={() => beginCreate()} disabled={isCreating}>
             Add Server
           </button>
           {isEditing ? (
@@ -227,6 +292,35 @@ export function McpServerPanel({
           ) : null}
         </div>
       </div>
+      {mcpServerTemplates.length > 0 ? (
+        <div className="mcp-template-browser">
+          <div className="mcp-template-browser-header">
+            <strong>Server Templates</strong>
+            <span>Start from a curated MCP server draft instead of entering every field by hand.</span>
+          </div>
+          <div className="mcp-template-list">
+            {mcpServerTemplates.map((template) => (
+              <div key={template.template_id} className="mcp-template-card">
+                <div className="mcp-template-card-header">
+                  <div>
+                    <strong>{template.display_name}</strong>
+                    <p>{template.description}</p>
+                  </div>
+                  <button type="button" className="secondary-button" onClick={() => beginCreate(template.draft)}>
+                    Use Template
+                  </button>
+                </div>
+                <p className="mcp-server-meta">
+                  <code>{template.template_id}</code>
+                  {template.draft.transport ? <span>{template.draft.transport}</span> : null}
+                  {template.capability_hints?.map((hint) => <span key={hint}>{hint}</span>)}
+                  {templateProvenanceLabel(template) ? <span>{templateProvenanceLabel(template)}</span> : null}
+                </p>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
       {isEditing ? (
         <div className="mcp-server-card mcp-server-card--editor">
           <div className="mcp-server-card-header">
@@ -369,12 +463,59 @@ export function McpServerPanel({
                   : "Save Changes"}
             </button>
           </div>
-          {testMessage ? <p className="mcp-server-message">{testMessage}</p> : null}
+          {testSnapshot ? (
+            <div className="mcp-test-result">
+              <p className="mcp-server-message">{testSnapshot.message}</p>
+              <p className="mcp-server-meta">
+                <span>{testSnapshot.capability_count ?? testSnapshot.capabilities.length} capabilities</span>
+                {(testSnapshot.capability_types ?? []).map((item) => (
+                  <span key={item}>{item}</span>
+                ))}
+                {Object.keys(testSnapshot.declared_capabilities ?? {}).map((item) => (
+                  <span key={item}>declares {item}</span>
+                ))}
+              </p>
+              {testSnapshot.capabilities.length > 0 ? (
+                <div className="mcp-capability-list">
+                  {testSnapshot.capabilities.map((capability) => (
+                    <div key={capability.canonical_name} className="mcp-capability-card">
+                      <div className="mcp-capability-card-header">
+                        <strong>{capabilityLabel(capability)}</strong>
+                        <span className="status-pill is-muted">{capability.capability_type}</span>
+                      </div>
+                      <p className="mcp-server-meta">
+                        <code>{capabilityReference(capability)}</code>
+                        <span>{capabilityStatusLabel(capability)}</span>
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           {localError ? <p className="error-text">{localError}</p> : null}
         </div>
       ) : null}
+      <div className="mcp-capability-browser-toolbar">
+        <strong>Capability Browser</strong>
+        <div className="mcp-capability-filter-row">
+          {(["all", "tool", "resource", "resource_template", "prompt"] as CapabilityFilter[]).map((filter) => (
+            <button
+              key={filter}
+              type="button"
+              className={`secondary-button ${capabilityFilter === filter ? "is-active" : ""}`.trim()}
+              onClick={() => setCapabilityFilter(filter)}
+            >
+              {filter === "all" ? "All" : filter}
+            </button>
+          ))}
+        </div>
+      </div>
       {mcpServers.map((server) => {
         const serverTools = (catalog?.tools ?? []).filter((tool) => tool.server_id === server.server_id);
+        const serverCapabilities = mcpCapabilities
+          .filter((capability) => capability.server_id === server.server_id)
+          .filter((capability) => capabilityFilter === "all" || capability.capability_type === capabilityFilter);
         const bootPending = mcpPendingKey === `boot:${server.server_id}`;
         const stopPending = mcpPendingKey === `stop:${server.server_id}`;
         const refreshPending = mcpPendingKey === `refresh:${server.server_id}`;
@@ -390,6 +531,13 @@ export function McpServerPanel({
                   <span>{server.transport}</span>
                   {server.config_summary ? <span>{server.config_summary}</span> : null}
                   {server.source ? <span>{server.source}</span> : null}
+                  {typeof server.capability_count === "number" ? <span>{server.capability_count} capabilities</span> : null}
+                  {(server.capability_types ?? []).map((item) => (
+                    <span key={item}>{item}</span>
+                  ))}
+                  {declaredCapabilityLabels(server).map((item) => (
+                    <span key={item}>declares {item}</span>
+                  ))}
                 </p>
               </div>
               <span className={`status-pill ${server.running ? "is-ready" : "is-muted"}`}>{server.running ? "running" : "offline"}</span>
@@ -421,6 +569,34 @@ export function McpServerPanel({
               ) : null}
             </div>
             {server.error ? <p className="error-text">{server.error}</p> : null}
+            {serverCapabilities.length > 0 ? (
+              <div className="mcp-capability-list">
+                {serverCapabilities.map((capability) => (
+                  <div key={capability.canonical_name} className="mcp-capability-card">
+                    <div className="mcp-capability-card-header">
+                      <div>
+                        <strong>{capabilityLabel(capability)}</strong>
+                        {capability.description ? <p>{capability.description}</p> : null}
+                      </div>
+                      <span className="status-pill is-muted">{capability.capability_type}</span>
+                    </div>
+                    <p className="mcp-server-meta">
+                      <code>{capabilityReference(capability)}</code>
+                      <span>{capabilityStatusLabel(capability)}</span>
+                      {capability.schema_warning ? <span>{capability.schema_warning}</span> : null}
+                    </p>
+                    {capability.metadata && Object.keys(capability.metadata).length > 0 ? (
+                      <details className="mcp-capability-details">
+                        <summary>Metadata</summary>
+                        <pre>{JSON.stringify(capability.metadata, null, 2)}</pre>
+                      </details>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="inspector-hint">No {capabilityFilter === "all" ? "" : `${capabilityFilter} `}capabilities discovered for this server yet.</p>
+            )}
             {serverTools.length > 0 ? (
               <div className="mcp-tool-list">
                 {serverTools.map((tool) => {

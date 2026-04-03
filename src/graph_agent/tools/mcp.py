@@ -24,6 +24,7 @@ USER_MCP_SOURCE = "user"
 BUILTIN_MCP_SOURCE = "builtin"
 MCP_CAPABILITY_TOOL = "tool"
 MCP_CAPABILITY_RESOURCE = "resource"
+MCP_CAPABILITY_RESOURCE_TEMPLATE = "resource_template"
 MCP_CAPABILITY_PROMPT = "prompt"
 
 
@@ -44,6 +45,10 @@ def _normalize_string_map(value: Mapping[str, Any] | None) -> dict[str, str]:
     return normalized
 
 
+def _mapping_dict(value: Any) -> dict[str, Any]:
+    return dict(value) if _is_mapping(value) else {}
+
+
 def _merge_env(overrides: Mapping[str, str]) -> dict[str, str]:
     env = dict(os.environ)
     for key, value in overrides.items():
@@ -58,6 +63,15 @@ def _mcp_error(message: str, *, details: Mapping[str, Any] | None = None) -> Run
 
 def canonical_mcp_tool_name(server_id: str, tool_name: str) -> str:
     return f"{str(server_id).strip()}.{str(tool_name).strip()}"
+
+
+def canonical_mcp_capability_name(server_id: str, capability_type: str, identifier: str) -> str:
+    normalized_server_id = str(server_id).strip()
+    normalized_capability_type = str(capability_type).strip()
+    normalized_identifier = str(identifier).strip()
+    if normalized_capability_type == MCP_CAPABILITY_TOOL:
+        return canonical_mcp_tool_name(normalized_server_id, normalized_identifier)
+    return f"{normalized_server_id}.{normalized_capability_type}:{normalized_identifier}"
 
 
 @dataclass(frozen=True)
@@ -206,6 +220,11 @@ class McpServerState:
     error: str = ""
     pid: int | None = None
     booted_at: str | None = None
+    declared_capabilities: dict[str, Any] = field(default_factory=dict)
+    server_info: dict[str, Any] = field(default_factory=dict)
+    capability_types: list[str] = field(default_factory=list)
+    capability_count: int = 0
+    discovery_warnings: list[str] = field(default_factory=list)
 
     @classmethod
     def from_definition(cls, definition: McpServerDefinition) -> McpServerState:
@@ -248,6 +267,11 @@ class McpServerState:
             "error": self.error,
             "pid": self.pid,
             "booted_at": self.booted_at,
+            "declared_capabilities": dict(self.declared_capabilities),
+            "server_info": dict(self.server_info),
+            "capability_types": list(self.capability_types),
+            "capability_count": self.capability_count,
+            "discovery_warnings": list(self.discovery_warnings),
         }
 
 
@@ -259,7 +283,9 @@ class McpCapabilityDefinition:
     name: str
     description: str = ""
     display_name: str = ""
+    title: str = ""
     input_schema: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
     aliases: list[str] = field(default_factory=list)
     enabled: bool = True
     available: bool = True
@@ -283,6 +309,8 @@ class McpCapabilityDefinition:
         self.canonical_name = canonical_name
         self.name = name
         self.display_name = display_name or name or canonical_name
+        self.title = str(self.title or "").strip()
+        self.metadata = dict(self.metadata)
         self.aliases = normalized_aliases
 
     @classmethod
@@ -294,7 +322,9 @@ class McpCapabilityDefinition:
             name=tool.display_name or tool.name,
             description=tool.description,
             display_name=tool.display_name or tool.name,
+            title="",
             input_schema=dict(tool.input_schema),
+            metadata={},
             aliases=list(tool.aliases),
             enabled=tool.enabled,
             available=tool.available,
@@ -329,10 +359,12 @@ class McpCapabilityDefinition:
             "canonical_name": self.canonical_name,
             "name": self.name,
             "display_name": self.display_name,
+            "title": self.title,
             "aliases": list(self.aliases),
             "capability_type": self.capability_type,
             "description": self.description,
             "input_schema": dict(self.input_schema),
+            "metadata": dict(self.metadata),
             "server_id": self.server_id,
             "enabled": self.enabled,
             "available": self.available,
@@ -349,6 +381,8 @@ class _BaseMcpSession(ABC):
         self._lock = Lock()
         self._request_id = 0
         self._started = False
+        self._initialize_result: dict[str, Any] = {}
+        self._discovery_warnings: list[str] = []
 
     @property
     @abstractmethod
@@ -359,8 +393,9 @@ class _BaseMcpSession(ABC):
         if self._started:
             return
         self._open()
+        self._discovery_warnings = []
         try:
-            self.request(
+            self._initialize_result = self.request(
                 "initialize",
                 {
                     "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -377,15 +412,30 @@ class _BaseMcpSession(ABC):
             raise
         self._started = True
 
+    @property
+    def server_capabilities(self) -> dict[str, Any]:
+        capabilities = self._initialize_result.get("capabilities", {})
+        return dict(capabilities) if _is_mapping(capabilities) else {}
+
+    @property
+    def server_info(self) -> dict[str, Any]:
+        server_info = self._initialize_result.get("serverInfo", {})
+        return dict(server_info) if _is_mapping(server_info) else {}
+
+    @property
+    def discovery_warnings(self) -> list[str]:
+        return list(self._discovery_warnings)
+
     def close(self) -> None:
         self._started = False
         self._close()
 
     def list_tools(self) -> list[dict[str, Any]]:
-        response = self.request("tools/list", {})
-        tools = response.get("tools", [])
+        if "tools" not in self.server_capabilities:
+            return []
+        tools = self._list_collection("tools/list", "tools")
         if not isinstance(tools, list):
-            raise _mcp_error("Invalid tools/list response.", details={"response": response})
+            raise _mcp_error("Invalid tools/list response.", details={"tools": tools})
         normalized: list[dict[str, Any]] = []
         for tool in tools:
             if not _is_mapping(tool):
@@ -404,9 +454,104 @@ class _BaseMcpSession(ABC):
             )
         return normalized
 
+    def list_resources(self) -> list[dict[str, Any]]:
+        if "resources" not in self.server_capabilities:
+            return []
+        resources = self._list_collection("resources/list", "resources")
+        normalized: list[dict[str, Any]] = []
+        for resource in resources:
+            if not _is_mapping(resource):
+                continue
+            uri = str(resource.get("uri", "")).strip()
+            name = str(resource.get("name", "")).strip()
+            title = str(resource.get("title", "")).strip()
+            description = str(resource.get("description", "") or "")
+            if not uri:
+                continue
+            metadata = {
+                key: value
+                for key, value in dict(resource).items()
+                if key not in {"uri", "name", "title", "description"}
+            }
+            normalized.append(
+                {
+                    "uri": uri,
+                    "name": name,
+                    "title": title,
+                    "description": description,
+                    "metadata": metadata,
+                }
+            )
+        return normalized
+
+    def list_resource_templates(self) -> list[dict[str, Any]]:
+        resources_capability = self.server_capabilities.get("resources")
+        if not _is_mapping(resources_capability):
+            return []
+        if not any(
+            key in resources_capability
+            for key in {"templates", "listTemplates", "resourceTemplates", "resource_templates"}
+        ):
+            return []
+        templates = self._list_collection("resources/templates/list", "resourceTemplates", fallback_key="templates")
+        normalized: list[dict[str, Any]] = []
+        for template in templates:
+            if not _is_mapping(template):
+                continue
+            uri_template = str(template.get("uriTemplate", template.get("uri_template", ""))).strip()
+            name = str(template.get("name", "")).strip()
+            title = str(template.get("title", "")).strip()
+            description = str(template.get("description", "") or "")
+            if not uri_template:
+                continue
+            metadata = {
+                key: value
+                for key, value in dict(template).items()
+                if key not in {"uriTemplate", "uri_template", "name", "title", "description"}
+            }
+            normalized.append(
+                {
+                    "uri_template": uri_template,
+                    "name": name,
+                    "title": title,
+                    "description": description,
+                    "metadata": metadata,
+                }
+            )
+        return normalized
+
+    def list_prompts(self) -> list[dict[str, Any]]:
+        if "prompts" not in self.server_capabilities:
+            return []
+        prompts = self._list_collection("prompts/list", "prompts")
+        normalized: list[dict[str, Any]] = []
+        for prompt in prompts:
+            if not _is_mapping(prompt):
+                continue
+            name = str(prompt.get("name", "")).strip()
+            title = str(prompt.get("title", "")).strip()
+            description = str(prompt.get("description", "") or "")
+            arguments = prompt.get("arguments", [])
+            if not name:
+                continue
+            normalized.append(
+                {
+                    "name": name,
+                    "title": title,
+                    "description": description,
+                    "arguments": list(arguments) if isinstance(arguments, list) else [],
+                    "metadata": {
+                        key: value
+                        for key, value in dict(prompt).items()
+                        if key not in {"name", "title", "description", "arguments"}
+                    },
+                }
+            )
+        return normalized
+
     def discover_capabilities(self) -> list[McpCapabilityDefinition]:
         capabilities: list[McpCapabilityDefinition] = []
-        for tool in self.list_tools():
+        for tool in self._discover_family("tools/list", self.list_tools):
             raw_name = str(tool.get("name", "")).strip()
             if not raw_name:
                 continue
@@ -417,14 +562,146 @@ class _BaseMcpSession(ABC):
                     capability_type=MCP_CAPABILITY_TOOL,
                     name=raw_name,
                     display_name=raw_name,
+                    title="",
                     description=str(tool.get("description", "")),
                     input_schema=dict(tool.get("input_schema", {})),
+                    metadata={},
                     aliases=[raw_name],
                     schema_origin="discovered",
                     managed=True,
                 )
             )
+        for resource in self._discover_family("resources/list", self.list_resources):
+            uri = str(resource.get("uri", "")).strip()
+            if not uri:
+                continue
+            display_name = (
+                str(resource.get("title", "")).strip()
+                or str(resource.get("name", "")).strip()
+                or uri
+            )
+            capabilities.append(
+                McpCapabilityDefinition(
+                    canonical_name=canonical_mcp_capability_name(
+                        self.definition.server_id,
+                        MCP_CAPABILITY_RESOURCE,
+                        uri,
+                    ),
+                    server_id=self.definition.server_id,
+                    capability_type=MCP_CAPABILITY_RESOURCE,
+                    name=str(resource.get("name", "")).strip() or uri,
+                    display_name=display_name,
+                    title=str(resource.get("title", "")).strip(),
+                    description=str(resource.get("description", "") or ""),
+                    input_schema={},
+                    metadata={
+                        "uri": uri,
+                        **_mapping_dict(resource.get("metadata", {})),
+                    },
+                    schema_origin="discovered",
+                    managed=True,
+                )
+            )
+        for template in self._discover_family("resources/templates/list", self.list_resource_templates):
+            uri_template = str(template.get("uri_template", "")).strip()
+            if not uri_template:
+                continue
+            display_name = (
+                str(template.get("title", "")).strip()
+                or str(template.get("name", "")).strip()
+                or uri_template
+            )
+            capabilities.append(
+                McpCapabilityDefinition(
+                    canonical_name=canonical_mcp_capability_name(
+                        self.definition.server_id,
+                        MCP_CAPABILITY_RESOURCE_TEMPLATE,
+                        uri_template,
+                    ),
+                    server_id=self.definition.server_id,
+                    capability_type=MCP_CAPABILITY_RESOURCE_TEMPLATE,
+                    name=str(template.get("name", "")).strip() or uri_template,
+                    display_name=display_name,
+                    title=str(template.get("title", "")).strip(),
+                    description=str(template.get("description", "") or ""),
+                    input_schema={},
+                    metadata={
+                        "uri_template": uri_template,
+                        **_mapping_dict(template.get("metadata", {})),
+                    },
+                    schema_origin="discovered",
+                    managed=True,
+                )
+            )
+        for prompt in self._discover_family("prompts/list", self.list_prompts):
+            raw_name = str(prompt.get("name", "")).strip()
+            if not raw_name:
+                continue
+            display_name = str(prompt.get("title", "")).strip() or raw_name
+            capabilities.append(
+                McpCapabilityDefinition(
+                    canonical_name=canonical_mcp_capability_name(
+                        self.definition.server_id,
+                        MCP_CAPABILITY_PROMPT,
+                        raw_name,
+                    ),
+                    server_id=self.definition.server_id,
+                    capability_type=MCP_CAPABILITY_PROMPT,
+                    name=raw_name,
+                    display_name=display_name,
+                    title=str(prompt.get("title", "")).strip(),
+                    description=str(prompt.get("description", "") or ""),
+                    input_schema={},
+                    metadata={
+                        "arguments": list(prompt.get("arguments", [])),
+                        **_mapping_dict(prompt.get("metadata", {})),
+                    },
+                    schema_origin="discovered",
+                    managed=True,
+                )
+            )
         return capabilities
+
+    def _discover_family(self, label: str, loader: Any) -> list[dict[str, Any]]:
+        try:
+            results = loader()
+        except Exception as exc:
+            self._discovery_warnings.append(f"{label} failed: {exc}")
+            return []
+        return list(results)
+
+    def _list_collection(
+        self,
+        method: str,
+        result_key: str,
+        *,
+        fallback_key: str | None = None,
+    ) -> list[Any]:
+        items: list[Any] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            params: dict[str, Any] = {}
+            if cursor:
+                params["cursor"] = cursor
+            response = self.request(method, params)
+            batch = response.get(result_key)
+            if batch is None and fallback_key is not None:
+                batch = response.get(fallback_key)
+            if not isinstance(batch, list):
+                raise _mcp_error(
+                    f"Invalid {method} response.",
+                    details={"response": response},
+                )
+            items.extend(batch)
+            next_cursor = response.get("nextCursor", response.get("next_cursor"))
+            if not isinstance(next_cursor, str) or not next_cursor.strip():
+                break
+            if next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        return items
 
     def call_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> ToolResult:
         diagnostics_cursor = self._before_tool_call()
@@ -791,6 +1068,11 @@ class McpServerManager:
             state.pid = None
             state.error = ""
             state.tool_names = []
+            state.declared_capabilities = {}
+            state.server_info = {}
+            state.capability_types = []
+            state.capability_count = 0
+            state.discovery_warnings = []
             self._write_store()
         if should_restart:
             return self.boot_server(server_id)
@@ -816,10 +1098,17 @@ class McpServerManager:
         session = self._create_session(definition)
         try:
             session.start()
-            tools = session.discover_capabilities()
+            capabilities = session.discover_capabilities()
+            tools = [item for item in capabilities if item.capability_type == MCP_CAPABILITY_TOOL]
             return {
                 "ok": True,
                 "server": definition.to_dict(),
+                "declared_capabilities": session.server_capabilities,
+                "server_info": session.server_info,
+                "capability_types": sorted({item.capability_type for item in capabilities}),
+                "capability_count": len(capabilities),
+                "discovery_warnings": session.discovery_warnings,
+                "capabilities": [item.to_dict() for item in capabilities],
                 "tool_names": [tool.canonical_name for tool in tools],
                 "tools": [tool.to_dict() for tool in tools],
                 "message": f"Connected to MCP server '{definition.display_name}'.",
@@ -863,6 +1152,12 @@ class McpServerManager:
             try:
                 session.start()
                 self._sync_server_capabilities(server_id, session.discover_capabilities())
+                self._sync_server_state_metadata(
+                    server_id,
+                    declared_capabilities=session.server_capabilities,
+                    server_info=session.server_info,
+                    discovery_warnings=session.discovery_warnings,
+                )
                 state.running = True
                 state.pid = session.pid
                 state.error = ""
@@ -874,6 +1169,12 @@ class McpServerManager:
                 state.error = str(exc)
                 self._tool_registry.mark_server_tools_unavailable(server_id, str(exc))
                 self._sync_capability_catalog_for_server(server_id)
+                self._sync_server_state_metadata(
+                    server_id,
+                    declared_capabilities=session.server_capabilities,
+                    server_info=session.server_info,
+                    discovery_warnings=session.discovery_warnings,
+                )
                 self._set_desired_running(server_id, False)
                 session.close()
                 self._sessions.pop(server_id, None)
@@ -893,6 +1194,27 @@ class McpServerManager:
             state.pid = None
             state.error = ""
             self._tool_registry.mark_server_tools_unavailable(server_id, "MCP server is offline.")
+            for canonical_name, capability in list(self._capabilities.items()):
+                if capability.server_id != server_id or capability.capability_type == MCP_CAPABILITY_TOOL:
+                    continue
+                self._capabilities[canonical_name] = McpCapabilityDefinition(
+                    canonical_name=capability.canonical_name,
+                    server_id=capability.server_id,
+                    capability_type=capability.capability_type,
+                    name=capability.name,
+                    display_name=capability.display_name,
+                    title=capability.title,
+                    description=capability.description,
+                    input_schema=dict(capability.input_schema),
+                    metadata=dict(capability.metadata),
+                    aliases=list(capability.aliases),
+                    enabled=capability.enabled,
+                    available=False,
+                    availability_error="MCP server is offline.",
+                    schema_origin=capability.schema_origin,
+                    schema_warning=capability.schema_warning,
+                    managed=capability.managed,
+                )
             self._sync_capability_catalog_for_server(server_id)
             if not preserve_desired_running:
                 self._set_desired_running(server_id, False)
@@ -907,6 +1229,12 @@ class McpServerManager:
                 raise RuntimeError(f"MCP server '{server_id}' is not running.")
             state = self._states[server_id]
             self._sync_server_capabilities(server_id, session.discover_capabilities())
+            self._sync_server_state_metadata(
+                server_id,
+                declared_capabilities=session.server_capabilities,
+                server_info=session.server_info,
+                discovery_warnings=session.discovery_warnings,
+            )
             state.running = True
             state.pid = session.pid
             state.error = ""
@@ -948,14 +1276,25 @@ class McpServerManager:
         server_id: str,
         discovered_capabilities: Sequence[McpCapabilityDefinition],
     ) -> None:
+        server_capabilities = {
+            canonical_name: capability
+            for canonical_name, capability in self._capabilities.items()
+            if capability.server_id == server_id
+        }
+        next_capabilities: dict[str, McpCapabilityDefinition] = {
+            canonical_name: capability
+            for canonical_name, capability in server_capabilities.items()
+            if capability.capability_type != MCP_CAPABILITY_TOOL
+        }
         discovered_names: set[str] = set()
         for discovered in discovered_capabilities:
             canonical_name = discovered.canonical_name
             if not canonical_name:
                 continue
             discovered_names.add(canonical_name)
-            existing = self._tool_registry.get_optional(canonical_name)
-            schema_warning = ""
+            existing = self._tool_registry.get_optional(canonical_name) if discovered.capability_type == MCP_CAPABILITY_TOOL else None
+            prior_capability = server_capabilities.get(canonical_name)
+            schema_warning = str(prior_capability.schema_warning) if prior_capability is not None else ""
             if existing is not None and (
                 dict(existing.input_schema) != dict(discovered.input_schema)
                 or str(existing.description) != str(discovered.description)
@@ -967,8 +1306,10 @@ class McpServerManager:
                 capability_type=discovered.capability_type,
                 name=discovered.name,
                 display_name=discovered.display_name,
+                title=discovered.title,
                 description=discovered.description,
                 input_schema=dict(discovered.input_schema),
+                metadata=dict(discovered.metadata),
                 aliases=list(existing.aliases) if existing is not None and existing.aliases else list(discovered.aliases),
                 enabled=existing.enabled if existing is not None else discovered.enabled,
                 available=True,
@@ -977,11 +1318,18 @@ class McpServerManager:
                 schema_warning=schema_warning,
                 managed=True,
             )
-            self._tool_registry.upsert(capability.to_tool_definition(self._executor_for(server_id, canonical_name)))
+            next_capabilities[canonical_name] = capability
+            if capability.capability_type == MCP_CAPABILITY_TOOL:
+                self._tool_registry.upsert(capability.to_tool_definition(self._executor_for(server_id, canonical_name)))
         for tool_name in self._tool_registry.list_server_tool_names(server_id):
             if tool_name not in discovered_names:
                 self._tool_registry.mark_tool_unavailable(tool_name, "Tool was not reported by the running MCP server.")
-        self._sync_capability_catalog_for_server(server_id)
+                next_capabilities[tool_name] = McpCapabilityDefinition.from_tool_definition(self._tool_registry.get(tool_name))
+        for canonical_name in list(self._capabilities):
+            if self._capabilities[canonical_name].server_id == server_id:
+                self._capabilities.pop(canonical_name, None)
+        self._capabilities.update(next_capabilities)
+        self._sync_server_state_capability_summary(server_id)
 
     def _executor_for(self, server_id: str, tool_name: str):
         def _execute(payload: Mapping[str, Any], _context: ToolContext) -> ToolResult:
@@ -1010,13 +1358,44 @@ class McpServerManager:
                 self._capabilities.pop(canonical_name, None)
 
     def _sync_capability_catalog_for_server(self, server_id: str) -> None:
+        retained_capabilities = {
+            canonical_name: capability
+            for canonical_name, capability in self._capabilities.items()
+            if capability.server_id == server_id and capability.capability_type != MCP_CAPABILITY_TOOL
+        }
         for canonical_name in list(self._capabilities):
             if self._capabilities[canonical_name].server_id == server_id:
                 self._capabilities.pop(canonical_name, None)
+        self._capabilities.update(retained_capabilities)
         for tool in self._tool_registry.list_definitions():
             if tool.source_type != "mcp" or tool.server_id != server_id:
                 continue
             self._capabilities[tool.canonical_name] = McpCapabilityDefinition.from_tool_definition(tool)
+        self._sync_server_state_capability_summary(server_id)
+
+    def _sync_server_state_metadata(
+        self,
+        server_id: str,
+        *,
+        declared_capabilities: Mapping[str, Any],
+        server_info: Mapping[str, Any],
+        discovery_warnings: Sequence[str] = (),
+    ) -> None:
+        state = self._states.get(server_id)
+        if state is None:
+            return
+        state.declared_capabilities = _mapping_dict(declared_capabilities)
+        state.server_info = _mapping_dict(server_info)
+        state.discovery_warnings = [str(item).strip() for item in discovery_warnings if str(item).strip()]
+        self._sync_server_state_capability_summary(server_id)
+
+    def _sync_server_state_capability_summary(self, server_id: str) -> None:
+        state = self._states.get(server_id)
+        if state is None:
+            return
+        server_capabilities = [item for item in self._capabilities.values() if item.server_id == server_id]
+        state.capability_types = sorted({item.capability_type for item in server_capabilities})
+        state.capability_count = len(server_capabilities)
 
     def _load_store_payload(self) -> dict[str, Any]:
         try:
