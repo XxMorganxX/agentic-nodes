@@ -30,7 +30,13 @@ from graph_agent.runtime.node_providers import (
     is_valid_category_connection,
 )
 from graph_agent.runtime.run_documents import normalize_run_documents
-from graph_agent.runtime.spreadsheets import SpreadsheetParseError, parse_spreadsheet
+from graph_agent.runtime.spreadsheets import (
+    SPREADSHEET_FIRST_DATA_ROW_INDEX,
+    SPREADSHEET_HEADER_ROW_INDEX,
+    SpreadsheetParseError,
+    parse_spreadsheet,
+    resolve_spreadsheet_path_from_run_documents,
+)
 from graph_agent.tools.base import ToolContext, ToolRegistry
 from graph_agent.tools.mcp import McpServerManager
 
@@ -94,6 +100,38 @@ def _render_chatgpt_style_messages(prompt_blocks: Sequence[Mapping[str, Any]]) -
             message_payload["name"] = name
         rendered_messages.append(message_payload)
     return rendered_messages
+
+
+def _is_spreadsheet_row_payload(value: Any) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and isinstance(value.get("row_data"), Mapping)
+        and ("row_index" in value or "row_number" in value)
+    )
+
+
+def _render_spreadsheet_row_text(value: Mapping[str, Any]) -> str:
+    row_index = value.get("row_index")
+    header = "Spreadsheet record"
+    if isinstance(row_index, int):
+        header += f" {row_index}"
+    sheet_name = str(value.get("sheet_name", "") or "").strip()
+    row_data = value.get("row_data")
+    lines = [header]
+    if sheet_name:
+        lines.append(f"Sheet: {sheet_name}")
+    if isinstance(row_data, Mapping):
+        for key, cell_value in row_data.items():
+            label = str(key or "").strip() or "column"
+            rendered_cell = "" if cell_value is None else str(cell_value)
+            lines.append(f"{label}: {rendered_cell}")
+    return "\n".join(lines)
+
+
+def _render_context_builder_value(value: Any) -> Any:
+    if _is_spreadsheet_row_payload(value):
+        return _render_spreadsheet_row_text(value)
+    return value
 
 
 def _is_chat_message_payload(value: Any) -> bool:
@@ -1441,7 +1479,7 @@ class DataNode(BaseNode):
             if prompt_like_value:
                 rendered_value = "\n\n".join(_render_prompt_block_text(payload) for payload in prompt_like_value)
             else:
-                rendered_value = value
+                rendered_value = _render_context_builder_value(value)
             if placeholder:
                 resolved_variables[placeholder] = rendered_value
             if prompt_like_value:
@@ -1527,16 +1565,20 @@ class DataNode(BaseNode):
         resolved = context.resolve_graph_env_value(dict(self.config))
         file_format = str(resolved.get("file_format", "auto") or "auto").strip().lower() or "auto"
         file_path = str(resolved.get("file_path", "") or "").strip()
+        if not file_path:
+            file_path = resolve_spreadsheet_path_from_run_documents(
+                context.state.documents,
+                run_document_id=str(resolved.get("run_document_id", "") or ""),
+                run_document_name=str(resolved.get("run_document_name", "") or ""),
+            )
         sheet_name = str(resolved.get("sheet_name", "") or "").strip()
-        header_row_index = int(resolved.get("header_row_index", 1) or 1)
-        start_row_index = int(resolved.get("start_row_index", header_row_index + 1) or (header_row_index + 1))
         empty_row_policy = str(resolved.get("empty_row_policy", "skip") or "skip").strip().lower() or "skip"
         return {
             "file_format": file_format,
             "file_path": file_path,
             "sheet_name": sheet_name,
-            "header_row_index": header_row_index,
-            "start_row_index": start_row_index,
+            "header_row_index": SPREADSHEET_HEADER_ROW_INDEX,
+            "start_row_index": SPREADSHEET_FIRST_DATA_ROW_INDEX,
             "empty_row_policy": empty_row_policy,
         }
 

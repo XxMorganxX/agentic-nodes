@@ -12,7 +12,7 @@ from uuid import uuid4
 
 DEFAULT_RUN_DOCUMENT_UPLOAD_DIR = Path(__file__).resolve().parents[3] / ".graph-agent" / "uploads"
 DOCUMENT_EXCERPT_LIMIT = 1200
-SUPPORTED_DOCUMENT_EXTENSIONS = {".csv", ".json", ".md", ".markdown", ".pdf", ".txt"}
+SUPPORTED_DOCUMENT_EXTENSIONS = {".csv", ".json", ".md", ".markdown", ".pdf", ".txt", ".xlsx"}
 SAFE_FILENAME_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -99,10 +99,48 @@ def _ingest_single_document(document: Mapping[str, Any], storage_root: Path) -> 
     content_type = str(document.get("content_type") or "").strip() or "application/octet-stream"
     document_id = uuid4().hex
     safe_name = _safe_filename(name)
+    raw_bytes = bytes(raw_bytes)
+    extension = Path(name).suffix.strip().lower()
+
+    if extension == ".xlsx":
+        stored_name = f"{Path(name).stem or 'spreadsheet'}.csv"
+        try:
+            workbook = _load_xlsx_workbook(raw_bytes)
+            csv_bytes = _xlsx_first_sheet_to_csv_bytes(workbook)
+            text_content = _xlsx_workbook_to_prompt_text(workbook)
+        except RunDocumentIngestionError as exc:
+            excerpt = _excerpt_for_document("", str(exc))
+            return RunDocumentRecord(
+                document_id=document_id,
+                name=name,
+                mime_type=content_type,
+                size_bytes=len(raw_bytes),
+                storage_path="",
+                text_content="",
+                text_excerpt=excerpt,
+                status="failed",
+                error=str(exc),
+            )
+        csv_safe = _safe_filename(stored_name)
+        storage_path = storage_root / f"{document_id}-{csv_safe}"
+        storage_path.write_bytes(csv_bytes)
+        excerpt = _excerpt_for_document(text_content, None)
+        return RunDocumentRecord(
+            document_id=document_id,
+            name=stored_name,
+            mime_type="text/csv",
+            size_bytes=len(csv_bytes),
+            storage_path=str(storage_path),
+            text_content=text_content,
+            text_excerpt=excerpt,
+            status="ready",
+            error=None,
+        )
+
     storage_path = storage_root / f"{document_id}-{safe_name}"
-    storage_path.write_bytes(bytes(raw_bytes))
+    storage_path.write_bytes(raw_bytes)
     try:
-        text_content = _extract_document_text(name, bytes(raw_bytes))
+        text_content = _extract_document_text(name, raw_bytes)
         status = "ready"
         error = None
     except RunDocumentIngestionError as exc:
@@ -127,7 +165,7 @@ def _extract_document_text(name: str, raw_bytes: bytes) -> str:
     extension = Path(name).suffix.strip().lower()
     if extension not in SUPPORTED_DOCUMENT_EXTENSIONS:
         raise RunDocumentIngestionError(
-            "Unsupported document type. Upload .txt, .md, .markdown, .json, .csv, or .pdf files."
+            "Unsupported document type. Upload .txt, .md, .markdown, .json, .csv, .xlsx, or .pdf files."
         )
     if extension in {".txt", ".md", ".markdown"}:
         return raw_bytes.decode("utf-8-sig", errors="replace").strip()
@@ -135,6 +173,8 @@ def _extract_document_text(name: str, raw_bytes: bytes) -> str:
         return _normalize_json_text(raw_bytes)
     if extension == ".csv":
         return _normalize_csv_text(raw_bytes)
+    if extension == ".xlsx":
+        return _extract_xlsx_text(raw_bytes)
     if extension == ".pdf":
         return _extract_pdf_text(raw_bytes)
     raise RunDocumentIngestionError(f"Unsupported document type '{extension}'.")
@@ -155,6 +195,54 @@ def _normalize_csv_text(raw_bytes: bytes) -> str:
     rows = [[cell.strip() for cell in row] for row in reader]
     rendered_rows = [", ".join(cell for cell in row if cell) for row in rows if any(cell for cell in row)]
     return "\n".join(rendered_rows).strip()
+
+
+def _load_xlsx_workbook(raw_bytes: bytes):
+    try:
+        import openpyxl
+    except ImportError as exc:
+        raise RunDocumentIngestionError("XLSX support requires the 'openpyxl' package.") from exc
+    try:
+        return openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+    except Exception as exc:  # noqa: BLE001
+        raise RunDocumentIngestionError(f"Unable to read XLSX file: {exc}") from exc
+
+
+def _xlsx_workbook_to_prompt_text(workbook) -> str:
+    sheet_texts: list[str] = []
+    for sheet in workbook.worksheets:
+        rows: list[str] = []
+        for row in sheet.iter_rows(values_only=True):
+            cells = [str(cell).strip() if cell is not None else "" for cell in row]
+            if any(cells):
+                rows.append(", ".join(cells))
+        if rows:
+            sheet_texts.append(f"Sheet: {sheet.title}\n" + "\n".join(rows))
+    rendered = "\n\n".join(sheet_texts).strip()
+    if not rendered:
+        raise RunDocumentIngestionError("Uploaded XLSX file contained no readable data.")
+    return rendered
+
+
+def _xlsx_first_sheet_to_csv_bytes(workbook) -> bytes:
+    worksheets = workbook.worksheets
+    if not worksheets:
+        raise RunDocumentIngestionError("Uploaded XLSX file has no worksheets.")
+    for sheet in worksheets:
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        row_count = 0
+        for row in sheet.iter_rows(values_only=True):
+            writer.writerow(["" if cell is None else str(cell) for cell in row])
+            row_count += 1
+        if row_count > 0:
+            return buffer.getvalue().encode("utf-8-sig")
+    raise RunDocumentIngestionError("Uploaded XLSX contained no rows to export as CSV.")
+
+
+def _extract_xlsx_text(raw_bytes: bytes) -> str:
+    workbook = _load_xlsx_workbook(raw_bytes)
+    return _xlsx_workbook_to_prompt_text(workbook)
 
 
 def _extract_pdf_text(raw_bytes: bytes) -> str:

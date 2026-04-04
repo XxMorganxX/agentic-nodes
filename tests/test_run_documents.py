@@ -173,6 +173,56 @@ class RunDocumentTests(unittest.TestCase):
             for agent_state in recovered_state["agent_runs"].values():
                 self.assertEqual(agent_state["documents"][0]["document_id"], "doc-1")
 
+    def test_upload_xlsx_stores_derived_csv(self) -> None:
+        import io
+
+        import openpyxl
+
+        buf = io.BytesIO()
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.append(["name", "qty"])
+        sheet.append(["alpha", "10"])
+        workbook.save(buf)
+        xlsx_bytes = buf.getvalue()
+
+        app_module = importlib.import_module("graph_agent.api.app")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            bundled_path = temp_path / "bundled_graphs.json"
+            bundled_path.write_text(json.dumps({"graphs": []}), encoding="utf-8")
+            services = build_example_services()
+            manager = GraphRunManager(
+                services=services,
+                store=GraphStore(services, path=temp_path / "graphs.json", bundled_path=bundled_path),
+                run_log_store=RunLogStore(temp_path / ".logs" / "runs"),
+            )
+            original_manager = app_module.manager
+            app_module.manager = manager
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_UPLOAD_DIR": str(temp_path / ".graph-agent" / "uploads")}, clear=False):
+                    with TestClient(app_module.app) as client:
+                        response = client.post(
+                            "/api/editor/documents/upload",
+                            files=[("files", ("grid.xlsx", xlsx_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))],
+                        )
+                self.assertEqual(response.status_code, 200, msg=response.text)
+                payload = response.json()
+                document = payload["documents"][0]
+                self.assertEqual(document["status"], "ready")
+                self.assertEqual(document["name"], "grid.csv")
+                self.assertEqual(document["mime_type"], "text/csv")
+                stored = Path(document["storage_path"])
+                self.assertTrue(stored.exists())
+                self.assertEqual(stored.suffix.lower(), ".csv")
+                csv_body = stored.read_text(encoding="utf-8-sig")
+                self.assertIn("name", csv_body)
+                self.assertIn("alpha", csv_body)
+                self.assertIn("Sheet: Sheet", document["text_content"])
+            finally:
+                app_module.manager = original_manager
+                manager.stop_background_services()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -41,6 +41,7 @@ import { useGraphHistory } from "./lib/useGraphHistory";
 const DEFAULT_INPUT = "Find graph-agent references for a schema repair workflow.";
 const DEFAULT_TEST_ENVIRONMENT_ID = "test-environment";
 const ENVIRONMENT_AGENT_SELECTION_STORAGE_KEY = "agentic-nodes-environment-agent-selection";
+const SELECTED_AGENT_ID_STORAGE_KEY = "agentic-nodes-selected-agent-id";
 
 function isTerminalRunStatus(status: string | null | undefined): boolean {
   return status === "completed" || status === "failed" || status === "cancelled" || status === "interrupted";
@@ -166,6 +167,55 @@ function saveEnvironmentAgentSelection(graphId: string, selection: Record<string
     const storedSelections = loadPersistedEnvironmentAgentSelections();
     storedSelections[graphId] = selection;
     localStorage.setItem(ENVIRONMENT_AGENT_SELECTION_STORAGE_KEY, JSON.stringify(storedSelections));
+  } catch {
+    // Ignore local persistence failures and keep the in-memory selection.
+  }
+}
+
+function loadPersistedSelectedAgentIds(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(SELECTED_AGENT_ID_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return Object.fromEntries(
+      Object.entries(parsed as Record<string, unknown>)
+        .map(([graphId, agentId]) => [graphId, typeof agentId === "string" ? agentId.trim() : ""])
+        .filter(([, agentId]) => agentId.length > 0),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function loadSelectedAgentId(graph: GraphDocument | null | undefined): string | null {
+  if (!isTestEnvironment(graph) || !graph.graph_id) {
+    return null;
+  }
+  const persistedAgentId = loadPersistedSelectedAgentIds()[graph.graph_id];
+  if (persistedAgentId && graph.agents.some((agent) => agent.agent_id === persistedAgentId)) {
+    return persistedAgentId;
+  }
+  return getDefaultAgentId(graph);
+}
+
+function saveSelectedAgentId(graph: GraphDocument | null | undefined, selectedAgentId: string | null | undefined): void {
+  if (!isTestEnvironment(graph) || !graph.graph_id) {
+    return;
+  }
+  try {
+    const storedSelections = loadPersistedSelectedAgentIds();
+    const normalizedAgentId = typeof selectedAgentId === "string" ? selectedAgentId.trim() : "";
+    if (normalizedAgentId) {
+      storedSelections[graph.graph_id] = normalizedAgentId;
+    } else {
+      delete storedSelections[graph.graph_id];
+    }
+    localStorage.setItem(SELECTED_AGENT_ID_STORAGE_KEY, JSON.stringify(storedSelections));
   } catch {
     // Ignore local persistence failures and keep the in-memory selection.
   }
@@ -776,7 +826,7 @@ export default function App() {
         const nextInput = getSavedInputPrompt(nextGraph);
         setInput(nextInput);
         setSavedInputPrompt(nextInput);
-        setSelectedAgentId(getDefaultAgentId(nextGraph));
+        setSelectedAgentId(loadSelectedAgentId(nextGraph));
         setSelectedNodeId(null);
         setSelectedEdgeId(null);
         void restorePersistedRunSnapshot(nextGraph.graph_id);
@@ -800,6 +850,21 @@ export default function App() {
     }
     saveEnvironmentAgentSelection(draftGraph.graph_id, buildEnvironmentAgentSelection(draftGraph, environmentAgentSelection));
   }, [draftGraph, environmentAgentSelection]);
+
+  useEffect(() => {
+    if (!isTestEnvironment(draftGraph) || !draftGraph.graph_id) {
+      return;
+    }
+    const normalizedAgentId =
+      selectedAgentId && draftGraph.agents.some((agent) => agent.agent_id === selectedAgentId)
+        ? selectedAgentId
+        : getDefaultAgentId(draftGraph);
+    if (normalizedAgentId !== selectedAgentId) {
+      setSelectedAgentId(normalizedAgentId);
+      return;
+    }
+    saveSelectedAgentId(draftGraph, normalizedAgentId);
+  }, [draftGraph, selectedAgentId]);
 
   useEffect(() => {
     setSelectedNodeId(null);
@@ -1152,7 +1217,7 @@ export default function App() {
                     <span>{isUploadingDocuments ? "Uploading..." : "Add Documents"}</span>
                     <input
                       type="file"
-                      accept=".txt,.md,.markdown,.json,.csv,.pdf,text/plain,text/markdown,text/csv,application/json,application/pdf"
+                      accept=".txt,.md,.markdown,.json,.csv,.xlsx,.pdf,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                       multiple
                       disabled={isRunning || isSaving || isResettingRuntime || isUploadingDocuments}
                       onChange={(event) => {

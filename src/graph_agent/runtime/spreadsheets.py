@@ -7,6 +7,8 @@ import csv
 from pathlib import Path
 from typing import Any
 
+from graph_agent.runtime.run_documents import normalize_run_documents
+
 try:
     from openpyxl import load_workbook
 except ImportError:  # pragma: no cover - dependency guard
@@ -14,11 +16,52 @@ except ImportError:  # pragma: no cover - dependency guard
 
 
 SUPPORTED_SPREADSHEET_FORMATS = {"csv", "xlsx"}
+SPREADSHEET_STORAGE_SUFFIXES = {".csv", ".xlsx"}
 DEFAULT_SAMPLE_ROW_LIMIT = 5
+SPREADSHEET_HEADER_ROW_INDEX = 1
+SPREADSHEET_FIRST_DATA_ROW_INDEX = 2
 
 
 class SpreadsheetParseError(ValueError):
     """Raised when a spreadsheet file cannot be parsed with the current config."""
+
+
+def resolve_spreadsheet_path_from_run_documents(
+    documents: Any,
+    *,
+    run_document_id: str = "",
+    run_document_name: str = "",
+) -> str:
+    """Pick storage_path from run-attached documents when file_path is unset."""
+    normalized = normalize_run_documents(documents)
+    ready: list[dict[str, Any]] = []
+    for doc in normalized:
+        if str(doc.get("status") or "") != "ready":
+            continue
+        path = str(doc.get("storage_path") or "").strip()
+        if not path:
+            continue
+        if Path(path).suffix.lower() not in SPREADSHEET_STORAGE_SUFFIXES:
+            continue
+        ready.append(doc)
+    if not ready:
+        return ""
+    doc_id = str(run_document_id or "").strip()
+    if doc_id:
+        for doc in ready:
+            if str(doc.get("document_id") or "") == doc_id:
+                return str(doc.get("storage_path") or "").strip()
+        return ""
+    name = str(run_document_name or "").strip()
+    if name:
+        for doc in ready:
+            doc_name = str(doc.get("name") or "")
+            if doc_name == name or doc_name.lower() == name.lower():
+                return str(doc.get("storage_path") or "").strip()
+        return ""
+    if len(ready) == 1:
+        return str(ready[0].get("storage_path") or "").strip()
+    return ""
 
 
 @dataclass(frozen=True)
@@ -81,19 +124,20 @@ def parse_spreadsheet(
 ) -> SpreadsheetParseResult:
     normalized_path = str(file_path).strip()
     if not normalized_path:
-        raise SpreadsheetParseError("Spreadsheet file path is required.")
+        raise SpreadsheetParseError(
+            "Spreadsheet file path is required. Set file_path on the Spreadsheet Rows node, or attach exactly one "
+            "ready CSV/XLSX run document, or set run_document_id / run_document_name to choose among several."
+        )
     path = Path(normalized_path).expanduser()
     if not path.exists() or not path.is_file():
         raise SpreadsheetParseError(f"Spreadsheet file not found: {normalized_path}")
 
     resolved_format = infer_spreadsheet_format(normalized_path, file_format)
-    if header_row_index < 1:
-        raise SpreadsheetParseError("Header row index must be 1 or greater.")
-    if start_row_index is not None and start_row_index < 1:
-        raise SpreadsheetParseError("First data row index must be 1 or greater.")
     normalized_empty_policy = str(empty_row_policy or "skip").strip().lower()
     if normalized_empty_policy not in {"skip", "include"}:
         raise SpreadsheetParseError("Empty row policy must be either 'skip' or 'include'.")
+    header_row_index = SPREADSHEET_HEADER_ROW_INDEX
+    start_row_index = SPREADSHEET_FIRST_DATA_ROW_INDEX
 
     if resolved_format == "csv":
         return _parse_csv(

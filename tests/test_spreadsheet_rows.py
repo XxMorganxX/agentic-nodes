@@ -19,7 +19,7 @@ from graph_agent.providers.base import ModelRequest, ModelResponse, ProviderPref
 from graph_agent.runtime.core import GraphDefinition
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.event_contract import normalize_runtime_state_snapshot
-from graph_agent.runtime.spreadsheets import parse_spreadsheet
+from graph_agent.runtime.spreadsheets import parse_spreadsheet, resolve_spreadsheet_path_from_run_documents
 
 
 class SpreadsheetEchoProvider:
@@ -50,6 +50,135 @@ class SpreadsheetEchoProvider:
 
 
 class SpreadsheetRowTests(unittest.TestCase):
+    def test_resolve_spreadsheet_path_from_run_documents(self) -> None:
+        path = "/data/rows.csv"
+        docs = [
+            {
+                "document_id": "d1",
+                "name": "rows.csv",
+                "status": "ready",
+                "storage_path": path,
+            }
+        ]
+        self.assertEqual(resolve_spreadsheet_path_from_run_documents(docs), path)
+        two = [
+            docs[0],
+            {**docs[0], "document_id": "d2", "name": "b.csv", "storage_path": "/other.csv"},
+        ]
+        self.assertEqual(resolve_spreadsheet_path_from_run_documents(two), "")
+
+    def test_runtime_uses_run_document_when_file_path_empty(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "rows.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["city", "temperature"])
+                writer.writerow(["Seattle", "58"])
+
+            services = build_example_services()
+            provider = SpreadsheetEchoProvider()
+            services.model_providers["spreadsheet_echo"] = provider
+            runtime = GraphRuntime(
+                services=services,
+                max_steps=services.config["max_steps"],
+                max_visits_per_node=services.config["max_visits_per_node"],
+            )
+            graph_payload = {
+                "graph_id": "spreadsheet-row-docs-graph",
+                "name": "Spreadsheet Row Docs Graph",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "sheet",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Spreadsheet Rows",
+                        "provider_id": "core.spreadsheet_rows",
+                        "provider_label": "Spreadsheet Rows",
+                        "config": {
+                            "mode": "spreadsheet_rows",
+                            "file_format": "csv",
+                            "file_path": "",
+                            "sheet_name": "",
+                            "header_row_index": 1,
+                            "start_row_index": 2,
+                            "empty_row_policy": "skip",
+                        },
+                        "position": {"x": 100, "y": 0},
+                    },
+                    {
+                        "id": "model",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "spreadsheet_echo",
+                        "prompt_name": "spreadsheet_prompt",
+                        "config": {
+                            "provider_name": "spreadsheet_echo",
+                            "prompt_name": "spreadsheet_prompt",
+                            "system_prompt": "Process the current spreadsheet row.",
+                            "user_message_template": "{input_payload}",
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 220, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "model"}},
+                        "position": {"x": 340, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "e1", "source_id": "start", "target_id": "sheet", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "e2", "source_id": "sheet", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "e3", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+            graph = GraphDefinition.from_dict(graph_payload)
+            graph.validate_against_services(services)
+            run_docs = [
+                {
+                    "document_id": "doc-1",
+                    "name": "rows.csv",
+                    "mime_type": "text/csv",
+                    "size_bytes": 1,
+                    "storage_path": str(csv_path),
+                    "text_content": "",
+                    "text_excerpt": "",
+                    "status": "ready",
+                    "error": None,
+                }
+            ]
+            state = runtime.run(
+                graph,
+                {"request": "Process spreadsheet rows"},
+                run_id="spreadsheet-row-runtime-docs",
+                documents=run_docs,
+            )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(len(provider.user_messages), 1)
+        self.assertIn('"city": "Seattle"', provider.user_messages[0])
+
     def test_parse_csv_normalizes_headers_and_skips_empty_rows(self) -> None:
         with TemporaryDirectory() as temp_dir:
             csv_path = Path(temp_dir) / "people.csv"
@@ -70,6 +199,26 @@ class SpreadsheetRowTests(unittest.TestCase):
             {"Name": "Alice", "Name_2": "Engineer", "column_3": "Seattle"},
         )
         self.assertEqual(parsed.rows[1].row_number, 4)
+
+    def test_parse_spreadsheet_always_uses_first_row_as_headers(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "people.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["city", "temperature"])
+                writer.writerow(["Seattle", "58"])
+                writer.writerow(["Portland", "62"])
+
+            parsed = parse_spreadsheet(
+                file_path=str(csv_path),
+                file_format="csv",
+                header_row_index=9,
+                start_row_index=10,
+            )
+
+        self.assertEqual(parsed.headers, ["city", "temperature"])
+        self.assertEqual(parsed.rows[0].row_number, 2)
+        self.assertEqual(parsed.rows[0].row_data, {"city": "Seattle", "temperature": "58"})
 
     def test_parse_xlsx_uses_selected_sheet(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -200,6 +349,94 @@ class SpreadsheetRowTests(unittest.TestCase):
         self.assertEqual(state.iterator_states["sheet"]["total_rows"], 2)
         self.assertIsInstance(state.final_output, str)
         self.assertIn("Portland", state.final_output)
+
+    def test_context_builder_renders_spreadsheet_rows_as_llm_friendly_text(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "jobs.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["Company", "CEO", "Summer_2026_Internships?"])
+                writer.writerow(["Scale AI", "Alexandr Wang", "YES"])
+
+            services = build_example_services()
+            runtime = GraphRuntime(
+                services=services,
+                max_steps=services.config["max_steps"],
+                max_visits_per_node=services.config["max_visits_per_node"],
+            )
+            graph_payload = {
+                "graph_id": "spreadsheet-row-context-builder-graph",
+                "name": "Spreadsheet Row Context Builder Graph",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "sheet",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Spreadsheet Rows",
+                        "provider_id": "core.spreadsheet_rows",
+                        "provider_label": "Spreadsheet Rows",
+                        "config": {
+                            "mode": "spreadsheet_rows",
+                            "file_format": "csv",
+                            "file_path": str(csv_path),
+                            "sheet_name": "",
+                            "empty_row_policy": "skip",
+                        },
+                        "position": {"x": 100, "y": 0},
+                    },
+                    {
+                        "id": "compose",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Compose",
+                        "provider_id": "core.context_builder",
+                        "provider_label": "Context Builder",
+                        "config": {"mode": "context_builder", "template": "", "input_bindings": [], "joiner": "\n\n"},
+                        "position": {"x": 220, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "compose"}},
+                        "position": {"x": 340, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "e1", "source_id": "start", "target_id": "sheet", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "e2", "source_id": "sheet", "target_id": "compose", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "e3", "source_id": "compose", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+            graph = GraphDefinition.from_dict(graph_payload)
+            graph.validate_against_services(services)
+
+            state = runtime.run(graph, {"request": "Process spreadsheet rows"}, run_id="spreadsheet-row-context-builder")
+
+        self.assertEqual(state.status, "completed")
+        self.assertIsInstance(state.final_output, str)
+        assert isinstance(state.final_output, str)
+        self.assertIn("Spreadsheet record 1", state.final_output)
+        self.assertIn("Company: Scale AI", state.final_output)
+        self.assertIn("CEO: Alexandr Wang", state.final_output)
+        self.assertIn("Summer_2026_Internships?: YES", state.final_output)
+        self.assertNotIn('"row_data"', state.final_output)
 
     def test_run_state_reducer_tracks_iterator_updates(self) -> None:
         state = build_run_state("run-iterator", "graph-1", None, execution_node_ids=["sheet"])

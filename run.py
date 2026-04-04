@@ -90,7 +90,8 @@ def main() -> int:
     backend_env["GRAPH_AGENT_PORT"] = str(backend_port)
 
     frontend_env = os.environ.copy()
-    frontend_env["VITE_API_BASE_URL"] = api_base_url
+    frontend_env.pop("VITE_API_BASE_URL", None)
+    frontend_env["GRAPH_AGENT_API_PROXY"] = api_base_url
 
     backend_command = [
         backend_python,

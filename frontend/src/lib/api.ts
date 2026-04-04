@@ -14,7 +14,44 @@ import type {
 } from "./types";
 import { normalizeRunState } from "./runtimeEvents";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
+function resolveApiBaseUrl(): string {
+  const configured = import.meta.env.VITE_API_BASE_URL;
+  if (typeof configured === "string" && configured.trim().length > 0) {
+    return configured.trim().replace(/\/$/, "");
+  }
+  if (import.meta.env.DEV) {
+    return "";
+  }
+  return "http://127.0.0.1:8000";
+}
+
+const API_BASE_URL = resolveApiBaseUrl();
+
+async function readFetchErrorMessage(response: Response, fallback: string): Promise<string> {
+  const raw = await response.text();
+  if (!raw.trim()) {
+    return fallback;
+  }
+  try {
+    const parsed = JSON.parse(raw) as { detail?: unknown };
+    if (typeof parsed.detail === "string") {
+      return parsed.detail;
+    }
+    if (Array.isArray(parsed.detail)) {
+      const parts = parsed.detail.map((item) => {
+        if (item && typeof item === "object" && "msg" in item) {
+          return String((item as { msg: unknown }).msg);
+        }
+        return JSON.stringify(item);
+      });
+      const joined = parts.filter(Boolean).join("; ");
+      return joined || fallback;
+    }
+  } catch {
+    // not JSON
+  }
+  return raw.trim();
+}
 
 export async function fetchGraphs(): Promise<GraphDocument[]> {
   const response = await fetch(`${API_BASE_URL}/api/graphs`);
@@ -153,7 +190,7 @@ export async function uploadRunDocuments(files: File[]): Promise<RunDocument[]> 
     body: formData,
   });
   if (!response.ok) {
-    throw new Error("Failed to upload documents.");
+    throw new Error(await readFetchErrorMessage(response, "Failed to upload documents."));
   }
   const payload = (await response.json()) as { documents?: RunDocument[] };
   return Array.isArray(payload.documents) ? payload.documents : [];

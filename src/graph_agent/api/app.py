@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from queue import Empty
 from typing import Any, Optional
@@ -82,7 +83,7 @@ class McpServerPayload(BaseModel):
 app = FastAPI(title="Graph Agent API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1|\[::1\]):\d+$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -187,7 +188,11 @@ async def upload_run_documents(request: Request) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=503,
-            detail="Document uploads require multipart form support in the backend environment.",
+            detail=(
+                "Document uploads require multipart support. Install the `python-multipart` package "
+                "in the same environment as the API server, then restart. "
+                f"({type(exc).__name__}: {exc})"
+            ),
         ) from exc
     files = form.getlist("files")
     if not files:
@@ -209,7 +214,12 @@ async def upload_run_documents(request: Request) -> dict[str, Any]:
             )
         finally:
             if callable(close):
-                await close()
+                try:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:  # noqa: BLE001
+                    pass
     if not payloads:
         raise HTTPException(status_code=400, detail="Select at least one document to upload.")
     try:

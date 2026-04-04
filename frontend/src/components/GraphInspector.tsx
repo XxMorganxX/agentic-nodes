@@ -1939,7 +1939,7 @@ export function GraphInspector({
                     File Path
                     <input
                       value={String(selectedNode.config.file_path ?? "")}
-                      placeholder="/absolute/path/to/file.xlsx or {GRAPH_ENV_VAR}"
+                      placeholder="Path, env var, or leave empty if exactly one CSV/XLSX is attached to the run"
                       onChange={(event) =>
                         onGraphChange(
                           updateNode(graph, selectedNode.id, (node) => ({
@@ -1967,46 +1967,6 @@ export function GraphInspector({
                   </label>
                   <div className="checkbox-grid">
                     <label>
-                      Header Row
-                      <input
-                        type="number"
-                        min={1}
-                        value={String(selectedNode.config.header_row_index ?? 1)}
-                        onChange={(event) =>
-                          onGraphChange(
-                            updateNode(graph, selectedNode.id, (node) => ({
-                              ...node,
-                              config: {
-                                ...node.config,
-                                header_row_index: event.target.value === "" ? "" : Number(event.target.value),
-                                mode: "spreadsheet_rows",
-                              },
-                            })),
-                          )
-                        }
-                      />
-                    </label>
-                    <label>
-                      First Data Row
-                      <input
-                        type="number"
-                        min={1}
-                        value={String(selectedNode.config.start_row_index ?? 2)}
-                        onChange={(event) =>
-                          onGraphChange(
-                            updateNode(graph, selectedNode.id, (node) => ({
-                              ...node,
-                              config: {
-                                ...node.config,
-                                start_row_index: event.target.value === "" ? "" : Number(event.target.value),
-                                mode: "spreadsheet_rows",
-                              },
-                            })),
-                          )
-                        }
-                      />
-                    </label>
-                    <label>
                       Empty Row Policy
                       <select
                         value={String(selectedNode.config.empty_row_policy ?? "skip")}
@@ -2024,6 +1984,10 @@ export function GraphInspector({
                       </select>
                     </label>
                   </div>
+                  <p className="node-help-text">
+                    Row 1 is always treated as the header row. Each later row is emitted as one iteration using those
+                    header titles as the parsed row keys.
+                  </p>
                   <div className="context-builder-binding-actions">
                     <button
                       type="button"
